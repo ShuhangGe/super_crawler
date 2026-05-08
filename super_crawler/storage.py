@@ -147,6 +147,18 @@ class Storage:
                 retry_count INTEGER NOT NULL,
                 cost_estimate REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                pipeline_run_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result TEXT NOT NULL,
+                requirement_snapshot TEXT NOT NULL,
+                queue_snapshot TEXT NOT NULL,
+                agent_log_snapshot TEXT NOT NULL,
+                summary TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -331,12 +343,13 @@ class Storage:
             "queued": self._count("research_queue"),
             "research_runs": self._count("research_runs"),
             "activity_logs": self._count("agent_activity_logs"),
+            "pipeline_runs": self._count("pipeline_runs"),
         }
 
     def list_activity_logs(self, limit: int = 25) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
-            SELECT agent_id, agent_role, task_id, status, started_at, completed_at,
+            SELECT id, agent_id, agent_role, task_id, status, started_at, completed_at,
                    input_refs, output_refs, error, retry_count, cost_estimate
             FROM agent_activity_logs
             ORDER BY id DESC
@@ -351,6 +364,106 @@ class Storage:
             item["output_refs"] = json.loads(item["output_refs"])
             result.append(item)
         return result
+
+    def list_agent_logs(self, agent_role: str | None = None, agent_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if agent_role:
+            clauses.append("agent_role = ?")
+            params.append(agent_role)
+        if agent_id:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT id, agent_id, agent_role, task_id, status, started_at, completed_at,
+                   input_refs, output_refs, error, retry_count, cost_estimate
+            FROM agent_activity_logs
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["input_refs"] = json.loads(item["input_refs"])
+            item["output_refs"] = json.loads(item["output_refs"])
+            result.append(item)
+        return result
+
+    def save_pipeline_run(
+        self,
+        pipeline_run_id: str,
+        started_at: str,
+        completed_at: str,
+        status: str,
+        result: dict[str, Any],
+        summary: str,
+    ) -> None:
+        requirements = [asdict(item) for item in self.list_requirements()]
+        queue = self.list_queue()
+        logs = self.list_activity_logs(50)
+        self.conn.execute(
+            """
+            INSERT INTO pipeline_runs (
+                pipeline_run_id, started_at, completed_at, status, result,
+                requirement_snapshot, queue_snapshot, agent_log_snapshot, summary
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pipeline_run_id) DO UPDATE SET
+                completed_at=excluded.completed_at,
+                status=excluded.status,
+                result=excluded.result,
+                requirement_snapshot=excluded.requirement_snapshot,
+                queue_snapshot=excluded.queue_snapshot,
+                agent_log_snapshot=excluded.agent_log_snapshot,
+                summary=excluded.summary
+            """,
+            (
+                pipeline_run_id,
+                started_at,
+                completed_at,
+                status,
+                json.dumps(result, sort_keys=True),
+                json.dumps(requirements, default=str, sort_keys=True),
+                json.dumps(queue, default=str, sort_keys=True),
+                json.dumps(logs, default=str, sort_keys=True),
+                summary,
+            ),
+        )
+        self.conn.commit()
+
+    def list_pipeline_runs(self, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT pipeline_run_id, started_at, completed_at, status, result, summary
+            FROM pipeline_runs
+            ORDER BY completed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["result"] = json.loads(item["result"])
+            result.append(item)
+        return result
+
+    def get_pipeline_run(self, pipeline_run_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM pipeline_runs WHERE pipeline_run_id=?",
+            (pipeline_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        for key in ["result", "requirement_snapshot", "queue_snapshot", "agent_log_snapshot"]:
+            item[key] = json.loads(item[key])
+        return item
 
     def _count(self, table: str) -> int:
         return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])

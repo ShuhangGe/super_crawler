@@ -54,6 +54,7 @@ class SystemTests(unittest.TestCase):
                     "queued",
                     "research_runs",
                     "activity_logs",
+                    "pipeline_runs",
                 },
             )
 
@@ -69,6 +70,25 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Agent Runtime", html)
             self.assertIn("Start", html)
             self.assertIn("Stop", html)
+
+    def test_runtime_saves_pipeline_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(SAMPLE_REDDIT_ITEMS)
+            PoolManagerAgent(storage, "pool-test").reconcile_candidates()
+            storage.close()
+
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=1)
+            result = controller.run_once()
+
+            storage = Storage(db_path)
+            self.assertIn("pipeline_run_id", result)
+            self.assertEqual(len(storage.list_pipeline_runs()), 1)
+            snapshot = storage.get_pipeline_run(result["pipeline_run_id"])
+            self.assertIsNotNone(snapshot)
+            self.assertTrue(snapshot["requirement_snapshot"])
 
 
 if __name__ == "__main__":

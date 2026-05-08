@@ -49,13 +49,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 storage.migrate()
                 if parsed.path == "/":
                     self._html(home_page(storage, self.app_controller))
-                elif parsed.path == "/pool":
-                    self._html(pool_page(storage, parse_qs(parsed.query)))
+                elif parsed.path == "/possible":
+                    self._html(requirement_list_page(storage, "Possible Requirements", possible_requirements(storage)))
+                elif parsed.path == "/rejected":
+                    self._html(requirement_list_page(storage, "Rejected Requirements", rejected_requirements(storage)))
                 elif parsed.path == "/queue":
                     self._html(queue_page(storage))
                 elif parsed.path == "/requirement":
                     requirement_id = parse_qs(parsed.query).get("id", [""])[0]
                     self._html(detail_page(storage, requirement_id))
+                elif parsed.path == "/agent-log":
+                    query = parse_qs(parsed.query)
+                    self._html(agent_log_page(storage, query.get("role", [""])[0], query.get("agent_id", [""])[0]))
+                elif parsed.path == "/pipeline":
+                    pipeline_run_id = parse_qs(parsed.query).get("id", [""])[0]
+                    self._html(pipeline_page(storage, pipeline_run_id))
                 elif parsed.path == "/reports":
                     self._html(reports_page(storage))
                 elif parsed.path == "/api/requirements":
@@ -139,14 +147,21 @@ def layout(content: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Requirement Discovery</title>
   <style>
-    body {{ margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1f2933; background: #f7f8fa; }}
-    header {{ display: flex; align-items: center; gap: 20px; padding: 14px 22px; background: #12343b; color: white; }}
+    body {{ margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1f2933; background: #f5f7f9; }}
+    header {{ display: flex; align-items: center; gap: 20px; padding: 14px 22px; background: #12343b; color: white; position: sticky; top: 0; z-index: 2; }}
     header a {{ color: white; text-decoration: none; opacity: .9; }}
-    main {{ max-width: 1180px; margin: 0 auto; padding: 22px; }}
+    main {{ max-width: 1420px; margin: 0 auto; padding: 22px; }}
     h1 {{ margin: 0 0 18px; font-size: 26px; }}
     h2 {{ margin-top: 28px; font-size: 18px; }}
+    h3 {{ margin: 0 0 10px; font-size: 15px; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
     .card {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; }}
+    .board {{ display: grid; grid-template-columns: minmax(240px, 1fr) minmax(420px, 1.7fr) minmax(300px, 1.2fr); gap: 14px; align-items: start; }}
+    .panel {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; min-height: 260px; }}
+    .item {{ display: block; padding: 10px; border: 1px solid #e4e9ee; border-radius: 7px; margin-bottom: 8px; color: inherit; text-decoration: none; background: #fbfcfd; }}
+    .item:hover {{ border-color: #9eb8c4; background: #f1f6f8; }}
+    .title {{ font-weight: 700; }}
+    .summary {{ color: #52616b; font-size: 13px; margin-top: 4px; }}
     .controlbar {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; margin-bottom: 18px; }}
     .actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
     .button {{ border: 0; border-radius: 6px; padding: 9px 14px; color: white; background: #0d5c75; cursor: pointer; font-weight: 650; }}
@@ -157,6 +172,10 @@ def layout(content: str) -> str:
     th, td {{ padding: 10px; border-bottom: 1px solid #e6ebf0; text-align: left; vertical-align: top; }}
     th {{ background: #eef3f6; font-weight: 650; }}
     .status {{ display: inline-block; padding: 2px 7px; border-radius: 999px; background: #e8f2ff; }}
+    .status.rejected {{ background: #fde8e6; }}
+    .status.running {{ background: #dff7ea; }}
+    .linkbar {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }}
+    .linkbar a {{ background: #eef3f6; padding: 4px 8px; border-radius: 6px; text-decoration: none; }}
     .muted {{ color: #687782; }}
     a {{ color: #0d5c75; }}
     pre {{ white-space: pre-wrap; background: white; border: 1px solid #dce2e8; padding: 14px; border-radius: 8px; }}
@@ -165,10 +184,9 @@ def layout(content: str) -> str:
 <body>
   <header>
     <strong>Requirement Discovery</strong>
-    <a href="/">Home</a>
-    <a href="/pool">Pool</a>
-    <a href="/queue">Research Queue</a>
-    <a href="/reports">Reports</a>
+    <a href="/">Running Status</a>
+    <a href="/possible">Possible Requirements</a>
+    <a href="/rejected">Rejected Requirements</a>
   </header>
   <main>{content}</main>
 </body>
@@ -179,13 +197,17 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     counts = storage.dashboard_counts()
     runtime = controller.status()
     requirements = storage.list_requirements()
-    activity = storage.list_activity_logs(12)
     by_status = {status.value: 0 for status in RequirementStatus}
     for requirement in requirements:
         by_status[requirement.status.value] = by_status.get(requirement.status.value, 0) + 1
-    rising = sorted(requirements, key=lambda item: item.current_scores.get("velocity_score", 0), reverse=True)[:5]
+    active = [
+        item
+        for item in requirements
+        if item.status in {RequirementStatus.QUEUED_FOR_RESEARCH, RequirementStatus.RESEARCHING, RequirementStatus.REOPENED}
+    ]
+    pipelines = storage.list_pipeline_runs(8)
     cards = [
-        ("New candidate requirements", by_status.get("new_candidate", 0)),
+        ("Possible requirements", len(possible_requirements(storage))),
         ("Queued for research", counts["queued"]),
         ("Currently researching", by_status.get("researching", 0)),
         ("Validated requirements", by_status.get("validated", 0)),
@@ -193,17 +215,16 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
         ("Rejected/noisy", by_status.get("rejected", 0)),
     ]
     return (
-        "<h1>System Health</h1>"
+        "<h1>Running Status</h1>"
         + runtime_controls(runtime)
         + "<section class='grid'>"
         + "".join(f"<div class='card'><div class='muted'>{label}</div><div class='metric'>{value}</div></div>" for label, value in cards)
         + "</section>"
-        + runtime_monitor(runtime)
-        + "<h2>Top Rising Requirements</h2>"
-        + requirement_table(rising)
-        + "<h2>Agent Activity</h2>"
-        + f"<p>{counts['activity_logs']} logged agent events. {counts['evidence']} raw evidence items preserved.</p>"
-        + activity_table(activity)
+        + "<section class='board'>"
+        + running_agents_panel(storage)
+        + active_requirements_panel(active)
+        + pipeline_history_panel(pipelines)
+        + "</section>"
     )
 
 
@@ -214,6 +235,7 @@ def runtime_controls(runtime: dict[str, object]) -> str:
       <div>
         <strong>Agent Runtime</strong>
         <div class="muted">State: {state} | Cycles: {runtime["cycle_count"]} | Input: {html.escape(str(runtime["input_dir"]))}</div>
+        <div class="muted">Last result: {html.escape(json.dumps(runtime.get("last_result")))}</div>
       </div>
       <div class="actions">
         <form action="/runtime"><input type="hidden" name="action" value="start"><button class="button">Start</button></form>
@@ -224,54 +246,129 @@ def runtime_controls(runtime: dict[str, object]) -> str:
     """
 
 
-def runtime_monitor(runtime: dict[str, object]) -> str:
-    last_result = runtime.get("last_result")
-    last_error = runtime.get("last_error")
-    events = runtime.get("events", [])
-    rows = "".join(
-        f"<tr><td>{html.escape(str(event['at']))}</td><td>{html.escape(str(event['event']))}</td><td><code>{html.escape(json.dumps(event['detail']))}</code></td></tr>"
-        for event in events[:8]
+def running_agents_panel(storage: Storage) -> str:
+    logs = storage.list_activity_logs(200)
+    roles = ["discovery", "pool_manager", "change_detection", "deep_research", "report"]
+    runtime_agents = []
+    for role in roles:
+        role_logs = [item for item in logs if item["agent_role"] == role]
+        latest = role_logs[0] if role_logs else None
+        runtime_agents.append(
+            {
+                "role": role,
+                "count": len(role_logs),
+                "latest_status": latest["status"] if latest else "waiting",
+                "latest_task": latest["task_id"] if latest else "no task yet",
+                "latest_time": latest["completed_at"] if latest else "",
+            }
+        )
+    items = "".join(
+        f"""
+        <a class="item" href="/agent-log?role={html.escape(agent['role'])}">
+          <div class="title">{html.escape(agent['role'].replace('_', ' ').title())}</div>
+          <div><span class="status running">{html.escape(agent['latest_status'])}</span></div>
+          <div class="summary">{html.escape(agent['latest_task'])}</div>
+          <div class="summary">{agent['count']} log event(s) {html.escape(str(agent['latest_time'] or ''))}</div>
+        </a>
+        """
+        for agent in runtime_agents
     )
     return (
-        "<h2>Runtime Monitor</h2>"
-        f"<p>Last result: <code>{html.escape(json.dumps(last_result))}</code></p>"
-        f"<p>Last error: <code>{html.escape(str(last_error or 'none'))}</code></p>"
-        "<table><thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table>"
+        "<section class='panel'><h2>Running Agents</h2>"
+        "<p class='muted'>Click an agent to inspect its full log.</p>"
+        + items
+        + "</section>"
     )
 
 
-def activity_table(activity: list[dict[str, object]]) -> str:
-    rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(item['completed_at'] or item['started_at']))}</td>"
-        f"<td>{html.escape(str(item['agent_role']))}</td>"
-        f"<td>{html.escape(str(item['agent_id']))}</td>"
-        f"<td>{html.escape(str(item['task_id']))}</td>"
-        f"<td>{html.escape(str(item['status']))}</td>"
-        f"<td>{html.escape(str(item['error'] or ''))}</td>"
-        "</tr>"
-        for item in activity
-    )
+def active_requirements_panel(requirements: list[object]) -> str:
+    items = "".join(requirement_card(item) for item in requirements[:12]) or "<p class='muted'>No requirement is currently queued or consumed by deep research.</p>"
     return (
-        "<table><thead><tr><th>Time</th><th>Role</th><th>Agent</th><th>Task</th><th>Status</th><th>Error</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table>"
+        "<section class='panel'><h2>Requirements In Pipeline</h2>"
+        "<p class='muted'>Requirements queued, reopened, or consumed by deep research.</p>"
+        + items
+        + "</section>"
     )
 
 
-def pool_page(storage: Storage, query: dict[str, list[str]]) -> str:
-    requirements = storage.list_requirements()
-    status = query.get("status", [""])[0]
-    if status:
-        requirements = [item for item in requirements if item.status.value == status]
-    options = "".join(f"<option value='{s.value}'>{s.value}</option>" for s in RequirementStatus)
+def pipeline_history_panel(pipelines: list[dict[str, object]]) -> str:
+    items = "".join(
+        f"""
+        <a class="item" href="/pipeline?id={html.escape(str(item['pipeline_run_id']))}">
+          <div class="title">{html.escape(str(item['pipeline_run_id']))}</div>
+          <div><span class="status">{html.escape(str(item['status']))}</span></div>
+          <div class="summary">{html.escape(str(item['summary']))}</div>
+          <div class="summary">{html.escape(str(item['completed_at']))}</div>
+        </a>
+        """
+        for item in pipelines
+    ) or "<p class='muted'>No completed pipeline snapshot yet. Click Run Once to create one.</p>"
     return (
-        "<h1>Requirement Pool</h1>"
-        "<form><label>Status <select name='status'><option value=''>all</option>"
-        + options
-        + "</select></label> <button>Filter</button></form>"
-        + requirement_table(requirements)
+        "<section class='panel'><h2>Finished Pipelines</h2>"
+        "<p class='muted'>Each finished cycle is saved as one reviewable snapshot.</p>"
+        + items
+        + "</section>"
     )
+
+
+def possible_requirements(storage: Storage) -> list[object]:
+    rejected_statuses = {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}
+    return [item for item in storage.list_requirements() if item.status not in rejected_statuses]
+
+
+def rejected_requirements(storage: Storage) -> list[object]:
+    return [item for item in storage.list_requirements() if item.status in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}]
+
+
+def requirement_list_page(storage: Storage, title: str, requirements: list[object]) -> str:
+    search_logs = storage.list_agent_logs(agent_role="discovery", limit=8)
+    research_logs = storage.list_agent_logs(agent_role="deep_research", limit=8)
+    return (
+        f"<h1>{html.escape(title)}</h1>"
+        "<section class='board'>"
+        + log_summary_panel("Requirement Search Agent Log", "/agent-log?role=discovery", search_logs)
+        + requirement_index_panel(title, requirements)
+        + log_summary_panel("Deep Research Agent Log", "/agent-log?role=deep_research", research_logs)
+        + "</section>"
+    )
+
+
+def requirement_index_panel(title: str, requirements: list[object]) -> str:
+    items = "".join(requirement_card(item) for item in requirements) or f"<p class='muted'>No {html.escape(title.lower())} yet.</p>"
+    return (
+        "<section class='panel'><h2>Requirements Found</h2>"
+        "<p class='muted'>Click a requirement to open full evidence, research history, decision history, and actions.</p>"
+        + items
+        + "</section>"
+    )
+
+
+def log_summary_panel(title: str, href: str, logs: list[dict[str, object]]) -> str:
+    items = "".join(
+        f"""
+        <a class="item" href="{href}">
+          <div class="title">{html.escape(str(item['task_id']))}</div>
+          <div><span class="status">{html.escape(str(item['status']))}</span></div>
+          <div class="summary">{html.escape(str(item['agent_id']))} | {html.escape(str(item['completed_at'] or item['started_at']))}</div>
+        </a>
+        """
+        for item in logs
+    ) or "<p class='muted'>No logs yet.</p>"
+    return f"<section class='panel'><h2>{html.escape(title)}</h2><p class='muted'>Click for full log.</p>{items}</section>"
+
+
+def requirement_card(requirement: object) -> str:
+    status_class = " rejected" if requirement.status == RequirementStatus.REJECTED else ""
+    score = requirement.current_scores.get("overall_score", 0)
+    summary = requirement.description[:140] + ("..." if len(requirement.description) > 140 else "")
+    return f"""
+    <a class="item" href="/requirement?id={html.escape(requirement.requirement_id)}">
+      <div class="title">{html.escape(requirement.canonical_requirement)}</div>
+      <div><span class="status{status_class}">{html.escape(requirement.status.value)}</span> Score {score}</div>
+      <div class="summary">{html.escape(summary)}</div>
+      <div class="summary">Evidence {requirement.evidence_count} | Subreddits {requirement.subreddit_count} | Last seen {html.escape(requirement.last_seen)}</div>
+    </a>
+    """
 
 
 def queue_page(storage: Storage) -> str:
@@ -303,6 +400,17 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
         for item in evidence
     )
     latest = runs[0] if runs else None
+    run_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(run.research_run_id)}</td>
+          <td>{html.escape(run.agent_id)}</td>
+          <td>{html.escape(str(run.completed_at or run.started_at))}</td>
+          <td>{html.escape(run.recommendation)}</td>
+        </tr>
+        """
+        for run in runs
+    )
     report = ""
     if latest:
         findings = latest.findings
@@ -316,6 +424,12 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
     return f"""
     <h1>{html.escape(requirement.canonical_requirement)}</h1>
     <p><span class="status">{requirement.status.value}</span> Score: {requirement.current_scores.get('overall_score', 0)}</p>
+    <div class="linkbar">
+      <a href="/agent-log?role=discovery">Requirement Search Agent Log</a>
+      <a href="/agent-log?role=deep_research">Deep Research Agent Log</a>
+      <a href="/possible">Back to Possible Requirements</a>
+      <a href="/rejected">Back to Rejected Requirements</a>
+    </div>
     <h2>Executive Summary</h2>
     <p>
       <a href="/action?type=approve&id={html.escape(requirement.requirement_id)}">Approve research</a> |
@@ -333,9 +447,84 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
     <ul>{evidence_rows}</ul>
     <h2>Decision History</h2>
     <pre>{html.escape(json.dumps(requirement.decision_history, indent=2))}</pre>
+    <h2>Research History</h2>
+    <table><thead><tr><th>Run</th><th>Agent</th><th>Completed</th><th>Recommendation</th></tr></thead><tbody>{run_rows}</tbody></table>
     <h2>Change Since Last Research</h2>
     <pre>{html.escape(json.dumps(requirement.reopen_events, indent=2))}</pre>
     {report}
+    """
+
+
+def agent_log_page(storage: Storage, role: str, agent_id: str) -> str:
+    logs = storage.list_agent_logs(agent_role=role or None, agent_id=agent_id or None, limit=200)
+    title = role.replace("_", " ").title() if role else agent_id or "Agent"
+    rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item['id']))}</td>
+          <td>{html.escape(str(item['completed_at'] or item['started_at']))}</td>
+          <td>{html.escape(str(item['agent_role']))}</td>
+          <td>{html.escape(str(item['agent_id']))}</td>
+          <td>{html.escape(str(item['task_id']))}</td>
+          <td>{html.escape(str(item['status']))}</td>
+          <td>{html.escape(str(item['error'] or ''))}</td>
+        </tr>
+        """
+        for item in logs
+    )
+    full_logs = html.escape(json.dumps(logs, indent=2, default=str))
+    summary = f"{len(logs)} log event(s). Latest status: {logs[0]['status'] if logs else 'none'}."
+    return f"""
+    <h1>{html.escape(title)} Log</h1>
+    <p class="muted">{html.escape(summary)}</p>
+    <div class="linkbar"><a href="/">Running Status</a><a href="/possible">Possible Requirements</a><a href="/rejected">Rejected Requirements</a></div>
+    <table><thead><tr><th>ID</th><th>Time</th><th>Role</th><th>Agent</th><th>Task</th><th>Status</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>
+    <h2>Full Log Payload</h2>
+    <pre>{full_logs}</pre>
+    """
+
+
+def pipeline_page(storage: Storage, pipeline_run_id: str) -> str:
+    pipeline = storage.get_pipeline_run(pipeline_run_id)
+    if pipeline is None:
+        return "<h1>Pipeline not found</h1>"
+    requirements = pipeline["requirement_snapshot"]
+    logs = pipeline["agent_log_snapshot"]
+    req_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item['requirement_id']))}</td>
+          <td>{html.escape(str(item['canonical_requirement']))}</td>
+          <td>{html.escape(str(item['status']))}</td>
+          <td>{html.escape(str(item['evidence_count']))}</td>
+        </tr>
+        """
+        for item in requirements
+    )
+    log_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item['completed_at'] or item['started_at']))}</td>
+          <td>{html.escape(str(item['agent_role']))}</td>
+          <td>{html.escape(str(item['task_id']))}</td>
+          <td>{html.escape(str(item['status']))}</td>
+        </tr>
+        """
+        for item in logs[:30]
+    )
+    return f"""
+    <h1>Pipeline Snapshot</h1>
+    <p><span class="status">{html.escape(str(pipeline['status']))}</span> {html.escape(str(pipeline['pipeline_run_id']))}</p>
+    <p>{html.escape(str(pipeline['summary']))}</p>
+    <div class="linkbar"><a href="/">Running Status</a><a href="/possible">Possible Requirements</a><a href="/rejected">Rejected Requirements</a></div>
+    <h2>Cycle Result</h2>
+    <pre>{html.escape(json.dumps(pipeline['result'], indent=2, default=str))}</pre>
+    <h2>Requirement Snapshot</h2>
+    <table><thead><tr><th>ID</th><th>Requirement</th><th>Status</th><th>Evidence</th></tr></thead><tbody>{req_rows}</tbody></table>
+    <h2>Agent Log Snapshot</h2>
+    <table><thead><tr><th>Time</th><th>Role</th><th>Task</th><th>Status</th></tr></thead><tbody>{log_rows}</tbody></table>
+    <h2>Full Snapshot</h2>
+    <pre>{html.escape(json.dumps(pipeline, indent=2, default=str))}</pre>
     """
 
 

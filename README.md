@@ -23,7 +23,13 @@ python3 -m super_crawler.cli serve --port 8000
 
 Open `http://127.0.0.1:8000` for the dashboard.
 
-The dashboard has Start, Stop, and Run Once controls on the Home page. Start runs the agent loop in the background, Stop halts it after the current cycle, and Run Once executes a single cycle immediately. The same page shows runtime events, latest cycle results, recent agent activity, queue counts, and top requirements.
+The dashboard has three main pages:
+
+- Running Status: Start, Stop, Run Once, running agents, requirements currently in the pipeline, and finished pipeline snapshots.
+- Possible Requirements: all non-rejected requirements, requirement search agent logs, requirement detail links, and deep research agent logs.
+- Rejected Requirements: rejected or archived requirements with the same log/detail structure as the possible requirements page.
+
+Start runs the agent loop in the background, Stop halts it after the current cycle, and Run Once executes a single cycle immediately. Each finished cycle is saved as a pipeline snapshot that can be opened from the Running Status page.
 
 ## Ingest Custom Reddit Data
 

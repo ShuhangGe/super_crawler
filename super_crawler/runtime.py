@@ -6,6 +6,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from .models import utc_now
 from .runner import AlwaysOnRunner
 from .storage import Storage
 
@@ -58,9 +59,21 @@ class RuntimeController:
             }
 
     def run_once(self) -> dict[str, Any]:
+        started_at = utc_now()
         with Storage(self.db_path) as storage:
             storage.migrate()
             result = AlwaysOnRunner(storage, self.input_dir, self.interval_seconds).run_once()
+            completed_at = utc_now()
+            pipeline_run_id = f"pipe_{self._safe_time_id(completed_at)}_{self._cycle_count + 1}"
+            storage.save_pipeline_run(
+                pipeline_run_id=pipeline_run_id,
+                started_at=started_at,
+                completed_at=completed_at,
+                status="completed",
+                result=result,
+                summary=self._summary(result),
+            )
+            result = {**result, "pipeline_run_id": pipeline_run_id}
         with self._lock:
             self._cycle_count += 1
             self._last_result = result
@@ -73,6 +86,21 @@ class RuntimeController:
             try:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001 - visible runtime monitor should capture all failures.
+                completed_at = utc_now()
+                result = {"error": str(exc)}
+                try:
+                    with Storage(self.db_path) as storage:
+                        storage.migrate()
+                        storage.save_pipeline_run(
+                            pipeline_run_id=f"pipe_failed_{self._safe_time_id(completed_at)}_{self._cycle_count + 1}",
+                            started_at=completed_at,
+                            completed_at=completed_at,
+                            status="failed",
+                            result=result,
+                            summary=str(exc),
+                        )
+                except Exception:
+                    pass
                 with self._lock:
                     self._last_error = str(exc)
                     self._record("cycle_failed", {"error": str(exc)})
@@ -82,3 +110,18 @@ class RuntimeController:
 
     def _record(self, event: str, detail: dict[str, Any]) -> None:
         self._events.appendleft({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event, "detail": detail})
+
+    def _summary(self, result: dict[str, Any]) -> str:
+        return (
+            f"Loaded {result.get('items_loaded', 0)} item(s), created {result.get('candidates', 0)} candidate(s), "
+            f"changed {result.get('requirements_changed', 0)} requirement(s), reopened {result.get('reopened', 0)}, "
+            f"research run {result.get('research_run') or 'none'}."
+        )
+
+    def _safe_time_id(self, value: str) -> str:
+        return (
+            value.replace("-", "")
+            .replace(":", "")
+            .replace("+", "Z")
+            .replace(".", "")
+        )
