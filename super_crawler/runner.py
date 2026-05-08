@@ -23,21 +23,23 @@ class AlwaysOnRunner:
             time.sleep(self.interval_seconds)
 
     def run_once(self) -> dict[str, int | str | None]:
+        resources = self.storage.get_resource_config()
         groups = self.storage.list_task_groups([TaskGroupStatus.RUNNING.value])
         if groups:
-            return self.run_task_groups(groups)
+            return self.run_task_groups(groups[: resources.get("max_search_agents", 3)])
 
         items = load_json_items(self.input_dir)
         candidates = DiscoveryAgent(self.storage, "discovery-daemon").ingest_reddit_items(items) if items else []
         changed = PoolManagerAgent(self.storage, "pool-manager").reconcile_candidates()
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
-        run = DeepResearchAgent(self.storage, "research-agent-1").run_next()
+        research_runs = self._run_deep_research_slots(resources.get("max_deep_research_agents", 1))
         return {
             "items_loaded": len(items),
             "candidates": len(candidates),
             "requirements_changed": len(changed),
             "reopened": len(reopened),
-            "research_run": run.research_run_id if run else None,
+            "research_run": research_runs[0] if research_runs else None,
+            "research_runs": ",".join(research_runs),
         }
 
     def run_task_group(self, task_group_id: str) -> dict[str, int | str | None]:
@@ -59,16 +61,27 @@ class AlwaysOnRunner:
             task_runs.append(str(result["task_group_run_id"]))
 
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
-        research_run = DeepResearchAgent(self.storage, "research-agent-1").run_next()
+        resources = self.storage.get_resource_config()
+        research_runs = self._run_deep_research_slots(resources.get("max_deep_research_agents", 1))
         return {
             "items_loaded": total_items,
             "candidates": total_candidates,
             "requirements_changed": total_changed,
             "reopened": len(reopened),
-            "research_run": research_run.research_run_id if research_run else None,
+            "research_run": research_runs[0] if research_runs else None,
+            "research_runs": ",".join(research_runs),
             "task_group_runs": len(task_runs),
             "task_group_run_ids": ",".join(task_runs),
         }
+
+    def _run_deep_research_slots(self, limit: int) -> list[str]:
+        run_ids: list[str] = []
+        for index in range(max(limit, 0)):
+            run = DeepResearchAgent(self.storage, f"research-agent-{index + 1}").run_next()
+            if run is None:
+                break
+            run_ids.append(run.research_run_id)
+        return run_ids
 
     def _run_search_task_group(self, task_group: TaskGroup) -> dict[str, int | str | None]:
         started_at = utc_now()

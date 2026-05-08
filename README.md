@@ -25,11 +25,17 @@ Open `http://127.0.0.1:8000` for the dashboard.
 
 The dashboard has three main pages:
 
-- Running Status: Start, Stop, Run Once, create general/domain task groups, search task groups on the left, found requirements waiting for verification in the middle, and running deep research agents on the right.
+- Running Status: Start, Stop, Run Once, frontend-editable resource limits, create general/domain task groups, and one separate three-column board per task group.
 - Possible Requirements: all non-rejected requirements as lineage rows from task group/search agents to queue/pool, deep research agents, conclusion, and saved pipeline snapshot.
 - Rejected Requirements: rejected or archived requirements using the same lineage-row structure.
 
-Start runs the agent loop in the background, Stop halts it after the current cycle, and Run Once executes a single cycle immediately. Each finished cycle is saved as a pipeline snapshot that can be opened from the Running Status page.
+Start runs the agent loop in the background, Stop halts it after the current cycle, and Run Once executes a single cycle immediately. Finished search/research lines are reviewed from the Possible Requirements and Rejected Requirements pages.
+
+Resource limits can be changed directly on the Running Status page:
+
+- Search slots control how many running task groups are searched in one cycle.
+- Deep research slots control how many queued requirements can be consumed by deep research in one cycle.
+- Report slots are persisted for the report-agent pool and ready for future parallel report workers.
 
 ## Task Groups
 

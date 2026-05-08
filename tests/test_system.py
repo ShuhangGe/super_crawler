@@ -71,11 +71,10 @@ class SystemTests(unittest.TestCase):
             html = home_page(storage, controller)
 
             self.assertIn("Agent Runtime", html)
+            self.assertIn("Global Resource Allocation", html)
             self.assertIn("Start", html)
             self.assertIn("Stop", html)
-            self.assertIn("Search Task Groups", html)
-            self.assertIn("Found Requirements Waiting To Verify", html)
-            self.assertIn("Running Deep Research Agents", html)
+            self.assertIn("Create Task Group", html)
 
     def test_runtime_saves_pipeline_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

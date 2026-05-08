@@ -79,6 +79,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._handle_action(storage, parse_qs(parsed.query))
                 elif parsed.path == "/task":
                     self._handle_task(storage, parse_qs(parsed.query))
+                elif parsed.path == "/resources":
+                    self._handle_resources(storage, parse_qs(parsed.query))
                 else:
                     self.send_error(404)
 
@@ -178,6 +180,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.end_headers()
 
+    def _handle_resources(self, storage: Storage, query: dict[str, list[str]]) -> None:
+        storage.update_resource_config(
+            {
+                "max_search_agents": parse_int(query.get("max_search_agents", ["3"])[0], 3),
+                "max_deep_research_agents": parse_int(query.get("max_deep_research_agents", ["1"])[0], 1),
+                "max_report_agents": parse_int(query.get("max_report_agents", ["1"])[0], 1),
+            }
+        )
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
 
 def layout(content: str) -> str:
     return f"""<!doctype html>
@@ -205,6 +219,8 @@ def layout(content: str) -> str:
     .summary {{ color: #52616b; font-size: 13px; margin-top: 4px; }}
     .controlbar {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; margin-bottom: 18px; }}
     .actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    input, select {{ border: 1px solid #cfd8df; border-radius: 6px; padding: 8px; min-height: 20px; }}
+    input[type="number"] {{ width: 80px; }}
     .button {{ border: 0; border-radius: 6px; padding: 9px 14px; color: white; background: #0d5c75; cursor: pointer; font-weight: 650; }}
     .button.stop {{ background: #b42318; }}
     .button.secondary {{ background: #52616b; }}
@@ -244,18 +260,7 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     by_status = {status.value: 0 for status in RequirementStatus}
     for requirement in requirements:
         by_status[requirement.status.value] = by_status.get(requirement.status.value, 0) + 1
-    waiting = [
-        item
-        for item in requirements
-        if item.status
-        in {
-            RequirementStatus.NEW_CANDIDATE,
-            RequirementStatus.NEEDS_MORE_EVIDENCE,
-            RequirementStatus.QUEUED_FOR_RESEARCH,
-            RequirementStatus.WATCHING,
-            RequirementStatus.REOPENED,
-        }
-    ]
+    task_groups = storage.list_task_groups()
     cards = [
         ("Possible requirements", len(possible_requirements(storage))),
         ("Queued for research", counts["queued"]),
@@ -267,16 +272,12 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     return (
         "<h1>Running Status</h1>"
         + runtime_controls(runtime)
+        + resource_allocation_panel(storage)
         + "<section class='grid'>"
         + "".join(f"<div class='card'><div class='muted'>{label}</div><div class='metric'>{value}</div></div>" for label, value in cards)
         + "</section>"
         + task_create_panel()
-        + "<section class='workbench'>"
-        + research_search_agents_panel(storage)
-        + waiting_requirements_panel(waiting)
-        + deep_research_agents_panel(storage)
-        + "</section>"
-        + pipeline_history_compact(storage.list_pipeline_runs(5))
+        + task_group_boards(storage, task_groups, requirements)
     )
 
 
@@ -298,7 +299,28 @@ def runtime_controls(runtime: dict[str, object]) -> str:
     """
 
 
-def agent_cards(storage: Storage, roles: list[str]) -> str:
+def resource_allocation_panel(storage: Storage) -> str:
+    resources = storage.get_resource_config()
+    running_search = len(storage.list_task_groups([TaskGroupStatus.RUNNING.value]))
+    queue = storage.list_queue()
+    locked_research = len([item for item in queue if item.get("locked_by")])
+    return f"""
+    <section class="controlbar">
+      <div>
+        <strong>Global Resource Allocation</strong>
+        <div class="muted">Search slots: {running_search}/{resources["max_search_agents"]} | Deep research slots: {locked_research}/{resources["max_deep_research_agents"]} | Report slots: 0/{resources["max_report_agents"]} | Queue: {len(queue)}</div>
+      </div>
+      <form action="/resources" class="actions">
+        <label>Search <input type="number" min="0" name="max_search_agents" value="{resources["max_search_agents"]}"></label>
+        <label>Deep <input type="number" min="0" name="max_deep_research_agents" value="{resources["max_deep_research_agents"]}"></label>
+        <label>Report <input type="number" min="0" name="max_report_agents" value="{resources["max_report_agents"]}"></label>
+        <button class="button secondary">Save Limits</button>
+      </form>
+    </section>
+    """
+
+
+def agent_cards(storage: Storage, roles: list[str], ref: str | None = None) -> str:
     logs = storage.list_activity_logs(200)
     runtime_agents = []
     for role in roles:
@@ -315,7 +337,7 @@ def agent_cards(storage: Storage, roles: list[str]) -> str:
         )
     return "".join(
         f"""
-        <a class="item" href="/agent-log?role={html.escape(agent['role'])}">
+        <a class="item" href="/agent-log?role={html.escape(agent['role'])}{'&ref=' + html.escape(ref) if ref else ''}">
           <div class="title">{html.escape(agent['role'].replace('_', ' ').title())}</div>
           <div><span class="status running">{html.escape(agent['latest_status'])}</span></div>
           <div class="summary">{html.escape(agent['latest_task'])}</div>
@@ -326,16 +348,31 @@ def agent_cards(storage: Storage, roles: list[str]) -> str:
     )
 
 
-def research_search_agents_panel(storage: Storage) -> str:
-    tasks = storage.list_task_groups()
-    task_items = "".join(task_group_card(task) for task in tasks) or "<p class='muted'>No task group yet. Create a general or domain task above.</p>"
-    agent_items = agent_cards(storage, ["discovery", "pool_manager", "change_detection"])
+def task_group_boards(storage: Storage, task_groups: list[object], requirements: list[object]) -> str:
+    if not task_groups:
+        return "<section class='card'><p class='muted'>No task group yet. Create a general or domain task above.</p></section>"
+    return "".join(task_group_board(storage, task_group, requirements) for task_group in task_groups)
+
+
+def task_group_board(storage: Storage, task_group: object, requirements: list[object]) -> str:
+    group_requirements = [item for item in requirements if task_group.task_group_id in item.task_group_ids]
+    waiting = [item for item in group_requirements if item.status in waiting_statuses()]
     return (
-        "<section class='panel'><h2>Search Task Groups</h2>"
-        "<p class='muted'>Create general or domain search tasks. Running tasks feed found requirements into the middle queue.</p>"
-        + task_items
-        + "<h3>Agent Logs</h3>"
-        + agent_items
+        f"<h2>{html.escape(task_group.name)}</h2>"
+        "<section class='workbench'>"
+        + task_group_search_panel(storage, task_group)
+        + waiting_requirements_panel(waiting)
+        + task_group_deep_research_panel(storage, task_group, group_requirements)
+        + "</section>"
+    )
+
+
+def task_group_search_panel(storage: Storage, task_group: object) -> str:
+    return (
+        "<section class='panel'><h2>Search Task Group</h2>"
+        + task_group_card(task_group)
+        + "<h3>Search Agent Logs</h3>"
+        + agent_cards(storage, ["discovery", "pool_manager", "change_detection"], task_group.task_group_id)
         + "</section>"
     )
 
@@ -361,6 +398,22 @@ def deep_research_agents_panel(storage: Storage) -> str:
         "<section class='panel'><h2>Running Deep Research Agents</h2>"
         "<p class='muted'>Deep research agents consume requirements from the queue and produce conclusions.</p>"
         + items
+        + queue_text
+        + "</section>"
+    )
+
+
+def task_group_deep_research_panel(storage: Storage, task_group: object, requirements: list[object]) -> str:
+    requirement_ids = {item.requirement_id for item in requirements}
+    queue = [row for row in storage.list_queue() if row["requirement_id"] in requirement_ids]
+    queue_text = "".join(
+        f"<div class='summary'>Consuming queue: {html.escape(row['requirement_id'])} priority {row['priority']}</div>"
+        for row in queue[:5]
+    ) or "<p class='muted'>No deep research queue item for this task group.</p>"
+    return (
+        "<section class='panel'><h2>Running Deep Research Agents</h2>"
+        "<p class='muted'>Deep research agents consuming this task group's requirement queue.</p>"
+        + agent_cards(storage, ["deep_research", "report"], task_group.task_group_id)
         + queue_text
         + "</section>"
     )
@@ -402,8 +455,28 @@ def requirement_list_page(storage: Storage, title: str, requirements: list[objec
     return (
         f"<h1>{html.escape(title)}</h1>"
         "<p class='muted'>Each row preserves the whole line from requirement search to conclusion so it can be evaluated later.</p>"
-        + requirement_lineage_table(storage, requirements)
+        + grouped_requirement_lineage(storage, requirements)
     )
+
+
+def grouped_requirement_lineage(storage: Storage, requirements: list[object]) -> str:
+    task_groups = storage.list_task_groups()
+    sections = []
+    used_ids: set[str] = set()
+    for task_group in task_groups:
+        group_requirements = [item for item in requirements if task_group.task_group_id in item.task_group_ids]
+        if not group_requirements:
+            continue
+        used_ids.update(item.requirement_id for item in group_requirements)
+        sections.append(
+            f"<h2>{html.escape(task_group.name)}</h2>"
+            f"<p class='muted'>{html.escape(task_group.task_type.value)} | {html.escape(task_group.domain or 'general')} | Input {html.escape(task_group.input_dir)}</p>"
+            + requirement_lineage_table(storage, group_requirements)
+        )
+    ungrouped = [item for item in requirements if item.requirement_id not in used_ids]
+    if ungrouped:
+        sections.append("<h2>Ungrouped / Legacy</h2>" + requirement_lineage_table(storage, ungrouped))
+    return "".join(sections) if sections else requirement_lineage_table(storage, [])
 
 
 def requirement_lineage_table(storage: Storage, requirements: list[object]) -> str:
@@ -502,6 +575,23 @@ def task_group_labels(storage: Storage, requirement: object) -> str:
 
 def split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_int(value: str, default: int) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def waiting_statuses() -> set[RequirementStatus]:
+    return {
+        RequirementStatus.NEW_CANDIDATE,
+        RequirementStatus.NEEDS_MORE_EVIDENCE,
+        RequirementStatus.QUEUED_FOR_RESEARCH,
+        RequirementStatus.WATCHING,
+        RequirementStatus.REOPENED,
+    }
 
 
 def agent_links_for_requirement(storage: Storage, requirement: object, roles: list[str]) -> str:
@@ -656,8 +746,7 @@ def agent_log_page(storage: Storage, role: str, agent_id: str, ref: str = "") ->
             refs = {str(value) for value in item["input_refs"] + item["output_refs"]}
             if ref in refs:
                 filtered.append(item)
-        if filtered:
-            logs = filtered
+        logs = filtered
     title = role.replace("_", " ").title() if role else agent_id or "Agent"
     rows = "".join(
         f"""

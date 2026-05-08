@@ -192,6 +192,12 @@ class Storage:
                 summary TEXT NOT NULL,
                 FOREIGN KEY(task_group_id) REFERENCES task_groups(task_group_id)
             );
+
+            CREATE TABLE IF NOT EXISTS resource_config (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         self._ensure_column("raw_evidence", "task_group_id", "TEXT")
@@ -200,6 +206,7 @@ class Storage:
         self._ensure_column("candidate_requirements", "task_group_run_id", "TEXT")
         self._ensure_column("requirements", "task_group_ids", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column("requirements", "task_group_run_ids", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_default_resource_config()
         self.conn.commit()
 
     def upsert_evidence(self, evidence: RawEvidence) -> None:
@@ -393,6 +400,27 @@ class Storage:
             "task_group_runs": self._count("task_group_runs"),
         }
 
+    def get_resource_config(self) -> dict[str, int]:
+        self._ensure_default_resource_config()
+        rows = self.conn.execute("SELECT key, value FROM resource_config").fetchall()
+        return {row["key"]: int(row["value"]) for row in rows}
+
+    def update_resource_config(self, values: dict[str, int]) -> None:
+        allowed = {"max_search_agents", "max_deep_research_agents", "max_report_agents"}
+        now = utc_now()
+        for key, value in values.items():
+            if key not in allowed:
+                continue
+            self.conn.execute(
+                """
+                INSERT INTO resource_config (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, max(int(value), 0), now),
+            )
+        self.conn.commit()
+
     def list_task_groups(self, statuses: Iterable[str] | None = None) -> list[TaskGroup]:
         if statuses:
             values = list(statuses)
@@ -582,6 +610,22 @@ class Storage:
         columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _ensure_default_resource_config(self) -> None:
+        now = utc_now()
+        defaults = {
+            "max_search_agents": 3,
+            "max_deep_research_agents": 1,
+            "max_report_agents": 1,
+        }
+        for key, value in defaults.items():
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO resource_config (key, value, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (key, value, now),
+            )
 
     def _upsert(self, table: str, pk: str, item: Any) -> None:
         data = self._to_row(item)
