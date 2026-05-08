@@ -18,10 +18,12 @@ def serve_dashboard(
     input_dir: str = "data/reddit_inbox",
     interval_seconds: int = 60,
 ) -> None:
+    db_path = storage.db_path
     controller = RuntimeController(storage.db_path, input_dir=input_dir, interval_seconds=interval_seconds)
+    storage.close()
 
     class Handler(DashboardHandler):
-        app_storage = storage
+        app_db_path = db_path
         app_controller = controller
 
     server = ThreadingHTTPServer((host, port), Handler)
@@ -29,36 +31,39 @@ def serve_dashboard(
     try:
         server.serve_forever()
     finally:
-        storage.close()
+        controller.stop()
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    app_storage: Storage
+    app_db_path: object
     app_controller: RuntimeController
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/":
-            self._html(home_page(self.app_storage, self.app_controller))
-        elif parsed.path == "/pool":
-            self._html(pool_page(self.app_storage, parse_qs(parsed.query)))
-        elif parsed.path == "/queue":
-            self._html(queue_page(self.app_storage))
-        elif parsed.path == "/requirement":
-            requirement_id = parse_qs(parsed.query).get("id", [""])[0]
-            self._html(detail_page(self.app_storage, requirement_id))
-        elif parsed.path == "/reports":
-            self._html(reports_page(self.app_storage))
-        elif parsed.path == "/api/requirements":
-            self._json([asdict(requirement) for requirement in self.app_storage.list_requirements()])
-        elif parsed.path == "/action":
-            self._handle_action(parse_qs(parsed.query))
+        if parsed.path == "/api/runtime":
+            self._json(self.app_controller.status())
         elif parsed.path == "/runtime":
             self._handle_runtime(parse_qs(parsed.query))
-        elif parsed.path == "/api/runtime":
-            self._json(self.app_controller.status())
         else:
-            self.send_error(404)
+            with self._request_storage() as storage:
+                storage.migrate()
+                if parsed.path == "/":
+                    self._html(home_page(storage, self.app_controller))
+                elif parsed.path == "/pool":
+                    self._html(pool_page(storage, parse_qs(parsed.query)))
+                elif parsed.path == "/queue":
+                    self._html(queue_page(storage))
+                elif parsed.path == "/requirement":
+                    requirement_id = parse_qs(parsed.query).get("id", [""])[0]
+                    self._html(detail_page(storage, requirement_id))
+                elif parsed.path == "/reports":
+                    self._html(reports_page(storage))
+                elif parsed.path == "/api/requirements":
+                    self._json([asdict(requirement) for requirement in storage.list_requirements()])
+                elif parsed.path == "/action":
+                    self._handle_action(storage, parse_qs(parsed.query))
+                else:
+                    self.send_error(404)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -79,27 +84,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def _handle_action(self, query: dict[str, list[str]]) -> None:
+    def _request_storage(self) -> Storage:
+        return Storage(self.app_db_path)
+
+    def _handle_action(self, storage: Storage, query: dict[str, list[str]]) -> None:
         action = query.get("type", [""])[0]
         requirement_id = query.get("id", [""])[0]
         target_id = query.get("target", [""])[0]
         priority = int(query.get("priority", ["75"])[0])
         if action == "approve":
-            self.app_storage.update_requirement_status(requirement_id, RequirementStatus.QUEUED_FOR_RESEARCH, "human approved deep research")
-            self.app_storage.enqueue_research(requirement_id, priority, "human approved deep research", 0, None)
+            storage.update_requirement_status(requirement_id, RequirementStatus.QUEUED_FOR_RESEARCH, "human approved deep research")
+            storage.enqueue_research(requirement_id, priority, "human approved deep research", 0, None)
         elif action == "pause":
-            self.app_storage.dequeue_research(requirement_id)
-            self.app_storage.update_requirement_status(requirement_id, RequirementStatus.WATCHING, "human paused research")
+            storage.dequeue_research(requirement_id)
+            storage.update_requirement_status(requirement_id, RequirementStatus.WATCHING, "human paused research")
         elif action == "reject":
-            self.app_storage.dequeue_research(requirement_id)
-            self.app_storage.update_requirement_status(requirement_id, RequirementStatus.REJECTED, "human rejected as noise")
+            storage.dequeue_research(requirement_id)
+            storage.update_requirement_status(requirement_id, RequirementStatus.REJECTED, "human rejected as noise")
         elif action == "force-reopen":
-            self.app_storage.update_requirement_status(requirement_id, RequirementStatus.REOPENED, "human forced reopen")
-            self.app_storage.enqueue_research(requirement_id, priority, "human forced reopen", 0, None)
+            storage.update_requirement_status(requirement_id, RequirementStatus.REOPENED, "human forced reopen")
+            storage.enqueue_research(requirement_id, priority, "human forced reopen", 0, None)
         elif action == "priority":
-            self.app_storage.update_queue_priority(requirement_id, priority)
+            storage.update_queue_priority(requirement_id, priority)
         elif action == "merge" and target_id:
-            self.app_storage.merge_requirements(requirement_id, target_id)
+            storage.merge_requirements(requirement_id, target_id)
         else:
             self.send_error(400)
             return
