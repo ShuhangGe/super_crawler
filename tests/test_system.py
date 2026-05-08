@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 
 from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
+from super_crawler.dashboard import home_page
 from super_crawler.models import RequirementStatus
+from super_crawler.runtime import RuntimeController
 from super_crawler.seed import SAMPLE_REDDIT_ITEMS
 from super_crawler.storage import Storage
 
@@ -54,6 +56,19 @@ class SystemTests(unittest.TestCase):
                     "activity_logs",
                 },
             )
+
+    def test_home_page_includes_runtime_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=1)
+
+            html = home_page(storage, controller)
+
+            self.assertIn("Agent Runtime", html)
+            self.assertIn("Start", html)
+            self.assertIn("Stop", html)
 
 
 if __name__ == "__main__":

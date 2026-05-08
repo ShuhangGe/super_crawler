@@ -7,12 +7,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .models import RequirementStatus
+from .runtime import RuntimeController
 from .storage import Storage
 
 
-def serve_dashboard(storage: Storage, host: str = "127.0.0.1", port: int = 8000) -> None:
+def serve_dashboard(
+    storage: Storage,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    input_dir: str = "data/reddit_inbox",
+    interval_seconds: int = 60,
+) -> None:
+    controller = RuntimeController(storage.db_path, input_dir=input_dir, interval_seconds=interval_seconds)
+
     class Handler(DashboardHandler):
         app_storage = storage
+        app_controller = controller
 
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Dashboard listening on http://{host}:{port}")
@@ -24,11 +34,12 @@ def serve_dashboard(storage: Storage, host: str = "127.0.0.1", port: int = 8000)
 
 class DashboardHandler(BaseHTTPRequestHandler):
     app_storage: Storage
+    app_controller: RuntimeController
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            self._html(home_page(self.app_storage))
+            self._html(home_page(self.app_storage, self.app_controller))
         elif parsed.path == "/pool":
             self._html(pool_page(self.app_storage, parse_qs(parsed.query)))
         elif parsed.path == "/queue":
@@ -42,6 +53,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json([asdict(requirement) for requirement in self.app_storage.list_requirements()])
         elif parsed.path == "/action":
             self._handle_action(parse_qs(parsed.query))
+        elif parsed.path == "/runtime":
+            self._handle_runtime(parse_qs(parsed.query))
+        elif parsed.path == "/api/runtime":
+            self._json(self.app_controller.status())
         else:
             self.send_error(404)
 
@@ -92,6 +107,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Location", f"/requirement?id={requirement_id}")
         self.end_headers()
 
+    def _handle_runtime(self, query: dict[str, list[str]]) -> None:
+        action = query.get("action", [""])[0]
+        if action == "start":
+            self.app_controller.start()
+        elif action == "stop":
+            self.app_controller.stop()
+        elif action == "run-once":
+            self.app_controller.run_once()
+        else:
+            self.send_error(400)
+            return
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
 
 def layout(content: str) -> str:
     return f"""<!doctype html>
@@ -109,6 +139,11 @@ def layout(content: str) -> str:
     h2 {{ margin-top: 28px; font-size: 18px; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
     .card {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; }}
+    .controlbar {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; margin-bottom: 18px; }}
+    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .button {{ border: 0; border-radius: 6px; padding: 9px 14px; color: white; background: #0d5c75; cursor: pointer; font-weight: 650; }}
+    .button.stop {{ background: #b42318; }}
+    .button.secondary {{ background: #52616b; }}
     .metric {{ font-size: 28px; font-weight: 700; }}
     table {{ width: 100%; border-collapse: collapse; background: white; border: 1px solid #dce2e8; }}
     th, td {{ padding: 10px; border-bottom: 1px solid #e6ebf0; text-align: left; vertical-align: top; }}
@@ -132,9 +167,11 @@ def layout(content: str) -> str:
 </html>"""
 
 
-def home_page(storage: Storage) -> str:
+def home_page(storage: Storage, controller: RuntimeController) -> str:
     counts = storage.dashboard_counts()
+    runtime = controller.status()
     requirements = storage.list_requirements()
+    activity = storage.list_activity_logs(12)
     by_status = {status.value: 0 for status in RequirementStatus}
     for requirement in requirements:
         by_status[requirement.status.value] = by_status.get(requirement.status.value, 0) + 1
@@ -149,13 +186,68 @@ def home_page(storage: Storage) -> str:
     ]
     return (
         "<h1>System Health</h1>"
-        "<section class='grid'>"
+        + runtime_controls(runtime)
+        + "<section class='grid'>"
         + "".join(f"<div class='card'><div class='muted'>{label}</div><div class='metric'>{value}</div></div>" for label, value in cards)
         + "</section>"
+        + runtime_monitor(runtime)
         + "<h2>Top Rising Requirements</h2>"
         + requirement_table(rising)
         + "<h2>Agent Activity</h2>"
         + f"<p>{counts['activity_logs']} logged agent events. {counts['evidence']} raw evidence items preserved.</p>"
+        + activity_table(activity)
+    )
+
+
+def runtime_controls(runtime: dict[str, object]) -> str:
+    state = "Stopping" if runtime["stopping"] else "Running" if runtime["running"] else "Stopped"
+    return f"""
+    <section class="controlbar">
+      <div>
+        <strong>Agent Runtime</strong>
+        <div class="muted">State: {state} | Cycles: {runtime["cycle_count"]} | Input: {html.escape(str(runtime["input_dir"]))}</div>
+      </div>
+      <div class="actions">
+        <form action="/runtime"><input type="hidden" name="action" value="start"><button class="button">Start</button></form>
+        <form action="/runtime"><input type="hidden" name="action" value="stop"><button class="button stop">Stop</button></form>
+        <form action="/runtime"><input type="hidden" name="action" value="run-once"><button class="button secondary">Run Once</button></form>
+      </div>
+    </section>
+    """
+
+
+def runtime_monitor(runtime: dict[str, object]) -> str:
+    last_result = runtime.get("last_result")
+    last_error = runtime.get("last_error")
+    events = runtime.get("events", [])
+    rows = "".join(
+        f"<tr><td>{html.escape(str(event['at']))}</td><td>{html.escape(str(event['event']))}</td><td><code>{html.escape(json.dumps(event['detail']))}</code></td></tr>"
+        for event in events[:8]
+    )
+    return (
+        "<h2>Runtime Monitor</h2>"
+        f"<p>Last result: <code>{html.escape(json.dumps(last_result))}</code></p>"
+        f"<p>Last error: <code>{html.escape(str(last_error or 'none'))}</code></p>"
+        "<table><thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
+    )
+
+
+def activity_table(activity: list[dict[str, object]]) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(item['completed_at'] or item['started_at']))}</td>"
+        f"<td>{html.escape(str(item['agent_role']))}</td>"
+        f"<td>{html.escape(str(item['agent_id']))}</td>"
+        f"<td>{html.escape(str(item['task_id']))}</td>"
+        f"<td>{html.escape(str(item['status']))}</td>"
+        f"<td>{html.escape(str(item['error'] or ''))}</td>"
+        "</tr>"
+        for item in activity
+    )
+    return (
+        "<table><thead><tr><th>Time</th><th>Role</th><th>Agent</th><th>Task</th><th>Status</th><th>Error</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
     )
 
 

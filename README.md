@@ -23,6 +23,8 @@ python3 -m super_crawler.cli serve --port 8000
 
 Open `http://127.0.0.1:8000` for the dashboard.
 
+The dashboard has Start, Stop, and Run Once controls on the Home page. Start runs the agent loop in the background, Stop halts it after the current cycle, and Run Once executes a single cycle immediately. The same page shows runtime events, latest cycle results, recent agent activity, queue counts, and top requirements.
+
 ## Ingest Custom Reddit Data
 
 ```bash

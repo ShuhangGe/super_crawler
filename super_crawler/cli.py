@@ -42,6 +42,8 @@ def main() -> None:
     serve = subcommands.add_parser("serve", help="Serve the local dashboard")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--input-dir", default="data/reddit_inbox", help="Dashboard Start button input directory")
+    serve.add_argument("--interval-seconds", type=int, default=60, help="Seconds between dashboard-controlled cycles")
 
     args = parser.parse_args()
     storage = Storage(args.db)
@@ -97,7 +99,13 @@ def main() -> None:
             output.write_text(ReportAgent(storage, "report-agent").daily_report())
             print(f"Wrote {output}")
         elif args.command == "serve":
-            serve_dashboard(storage, host=args.host, port=args.port)
+            serve_dashboard(
+                storage,
+                host=args.host,
+                port=args.port,
+                input_dir=args.input_dir,
+                interval_seconds=args.interval_seconds,
+            )
     finally:
         if args.command != "serve":
             storage.close()

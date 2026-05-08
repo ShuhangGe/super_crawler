@@ -29,6 +29,12 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
 
+    def __enter__(self) -> Storage:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
     def close(self) -> None:
         self.conn.close()
 
@@ -326,6 +332,25 @@ class Storage:
             "research_runs": self._count("research_runs"),
             "activity_logs": self._count("agent_activity_logs"),
         }
+
+    def list_activity_logs(self, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT agent_id, agent_role, task_id, status, started_at, completed_at,
+                   input_refs, output_refs, error, retry_count, cost_estimate
+            FROM agent_activity_logs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["input_refs"] = json.loads(item["input_refs"])
+            item["output_refs"] = json.loads(item["output_refs"])
+            result.append(item)
+        return result
 
     def _count(self, table: str) -> int:
         return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
