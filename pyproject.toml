@@ -1,0 +1,12 @@
+[project]
+name = "super-crawler"
+version = "0.1.0"
+description = "Always-on Reddit requirement discovery system MVP"
+requires-python = ">=3.11"
+
+[project.scripts]
+super-crawler = "super_crawler.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
