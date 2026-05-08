@@ -60,7 +60,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._html(detail_page(storage, requirement_id))
                 elif parsed.path == "/agent-log":
                     query = parse_qs(parsed.query)
-                    self._html(agent_log_page(storage, query.get("role", [""])[0], query.get("agent_id", [""])[0]))
+                    self._html(
+                        agent_log_page(
+                            storage,
+                            query.get("role", [""])[0],
+                            query.get("agent_id", [""])[0],
+                            query.get("ref", [""])[0],
+                        )
+                    )
                 elif parsed.path == "/pipeline":
                     pipeline_run_id = parse_qs(parsed.query).get("id", [""])[0]
                     self._html(pipeline_page(storage, pipeline_run_id))
@@ -157,6 +164,7 @@ def layout(content: str) -> str:
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
     .card {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; }}
     .board {{ display: grid; grid-template-columns: minmax(240px, 1fr) minmax(420px, 1.7fr) minmax(300px, 1.2fr); gap: 14px; align-items: start; }}
+    .workbench {{ display: grid; grid-template-columns: minmax(260px, 1fr) minmax(420px, 1.5fr) minmax(260px, 1fr); gap: 14px; align-items: start; }}
     .panel {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; min-height: 260px; }}
     .item {{ display: block; padding: 10px; border: 1px solid #e4e9ee; border-radius: 7px; margin-bottom: 8px; color: inherit; text-decoration: none; background: #fbfcfd; }}
     .item:hover {{ border-color: #9eb8c4; background: #f1f6f8; }}
@@ -176,6 +184,9 @@ def layout(content: str) -> str:
     .status.running {{ background: #dff7ea; }}
     .linkbar {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }}
     .linkbar a {{ background: #eef3f6; padding: 4px 8px; border-radius: 6px; text-decoration: none; }}
+    .agent-chip {{ display: inline-block; margin: 2px 4px 2px 0; padding: 4px 8px; border-radius: 6px; background: #eef3f6; text-decoration: none; }}
+    .lineage td:first-child {{ min-width: 220px; }}
+    .lineage td {{ font-size: 13px; }}
     .muted {{ color: #687782; }}
     a {{ color: #0d5c75; }}
     pre {{ white-space: pre-wrap; background: white; border: 1px solid #dce2e8; padding: 14px; border-radius: 8px; }}
@@ -200,12 +211,18 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     by_status = {status.value: 0 for status in RequirementStatus}
     for requirement in requirements:
         by_status[requirement.status.value] = by_status.get(requirement.status.value, 0) + 1
-    active = [
+    waiting = [
         item
         for item in requirements
-        if item.status in {RequirementStatus.QUEUED_FOR_RESEARCH, RequirementStatus.RESEARCHING, RequirementStatus.REOPENED}
+        if item.status
+        in {
+            RequirementStatus.NEW_CANDIDATE,
+            RequirementStatus.NEEDS_MORE_EVIDENCE,
+            RequirementStatus.QUEUED_FOR_RESEARCH,
+            RequirementStatus.WATCHING,
+            RequirementStatus.REOPENED,
+        }
     ]
-    pipelines = storage.list_pipeline_runs(8)
     cards = [
         ("Possible requirements", len(possible_requirements(storage))),
         ("Queued for research", counts["queued"]),
@@ -220,11 +237,12 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
         + "<section class='grid'>"
         + "".join(f"<div class='card'><div class='muted'>{label}</div><div class='metric'>{value}</div></div>" for label, value in cards)
         + "</section>"
-        + "<section class='board'>"
-        + running_agents_panel(storage)
-        + active_requirements_panel(active)
-        + pipeline_history_panel(pipelines)
+        + "<section class='workbench'>"
+        + research_search_agents_panel(storage)
+        + waiting_requirements_panel(waiting)
+        + deep_research_agents_panel(storage)
         + "</section>"
+        + pipeline_history_compact(storage.list_pipeline_runs(5))
     )
 
 
@@ -246,9 +264,8 @@ def runtime_controls(runtime: dict[str, object]) -> str:
     """
 
 
-def running_agents_panel(storage: Storage) -> str:
+def agent_cards(storage: Storage, roles: list[str]) -> str:
     logs = storage.list_activity_logs(200)
-    roles = ["discovery", "pool_manager", "change_detection", "deep_research", "report"]
     runtime_agents = []
     for role in roles:
         role_logs = [item for item in logs if item["agent_role"] == role]
@@ -262,7 +279,7 @@ def running_agents_panel(storage: Storage) -> str:
                 "latest_time": latest["completed_at"] if latest else "",
             }
         )
-    items = "".join(
+    return "".join(
         f"""
         <a class="item" href="/agent-log?role={html.escape(agent['role'])}">
           <div class="title">{html.escape(agent['role'].replace('_', ' ').title())}</div>
@@ -273,41 +290,64 @@ def running_agents_panel(storage: Storage) -> str:
         """
         for agent in runtime_agents
     )
+
+
+def research_search_agents_panel(storage: Storage) -> str:
+    items = agent_cards(storage, ["discovery", "pool_manager", "change_detection"])
     return (
-        "<section class='panel'><h2>Running Agents</h2>"
-        "<p class='muted'>Click an agent to inspect its full log.</p>"
+        "<section class='panel'><h2>Running Research Agents</h2>"
+        "<p class='muted'>Agents that search, extract, deduplicate, and decide what should wait for verification.</p>"
         + items
         + "</section>"
     )
 
 
-def active_requirements_panel(requirements: list[object]) -> str:
-    items = "".join(requirement_card(item) for item in requirements[:12]) or "<p class='muted'>No requirement is currently queued or consumed by deep research.</p>"
+def waiting_requirements_panel(requirements: list[object]) -> str:
+    items = "".join(requirement_card(item) for item in requirements[:12]) or "<p class='muted'>No found requirement is waiting for verification.</p>"
     return (
-        "<section class='panel'><h2>Requirements In Pipeline</h2>"
-        "<p class='muted'>Requirements queued, reopened, or consumed by deep research.</p>"
+        "<section class='panel'><h2>Found Requirements Waiting To Verify</h2>"
+        "<p class='muted'>These are the requirements found by search agents before, or while, deep research verifies them.</p>"
         + items
         + "</section>"
     )
 
 
-def pipeline_history_panel(pipelines: list[dict[str, object]]) -> str:
+def deep_research_agents_panel(storage: Storage) -> str:
+    items = agent_cards(storage, ["deep_research", "report"])
+    queue = storage.list_queue()
+    queue_text = "".join(
+        f"<div class='summary'>Consuming queue: {html.escape(row['requirement_id'])} priority {row['priority']}</div>"
+        for row in queue[:5]
+    )
+    return (
+        "<section class='panel'><h2>Running Deep Research Agents</h2>"
+        "<p class='muted'>Deep research agents consume requirements from the queue and produce conclusions.</p>"
+        + items
+        + queue_text
+        + "</section>"
+    )
+
+
+def pipeline_history_compact(pipelines: list[dict[str, object]]) -> str:
     items = "".join(
         f"""
-        <a class="item" href="/pipeline?id={html.escape(str(item['pipeline_run_id']))}">
-          <div class="title">{html.escape(str(item['pipeline_run_id']))}</div>
-          <div><span class="status">{html.escape(str(item['status']))}</span></div>
-          <div class="summary">{html.escape(str(item['summary']))}</div>
-          <div class="summary">{html.escape(str(item['completed_at']))}</div>
-        </a>
+        <tr>
+          <td><a href="/pipeline?id={html.escape(str(item['pipeline_run_id']))}">{html.escape(str(item['pipeline_run_id']))}</a></td>
+          <td>{html.escape(str(item['status']))}</td>
+          <td>{html.escape(str(item['summary']))}</td>
+          <td>{html.escape(str(item['completed_at']))}</td>
+        </tr>
         """
         for item in pipelines
-    ) or "<p class='muted'>No completed pipeline snapshot yet. Click Run Once to create one.</p>"
+    )
+    if not items:
+        items = "<tr><td colspan='4' class='muted'>No completed pipeline snapshot yet. Click Run Once to create one.</td></tr>"
     return (
-        "<section class='panel'><h2>Finished Pipelines</h2>"
-        "<p class='muted'>Each finished cycle is saved as one reviewable snapshot.</p>"
+        "<h2>Saved Pipeline Snapshots</h2>"
+        "<p class='muted'>Each finished cycle is saved for future evaluation.</p>"
+        "<table><thead><tr><th>Pipeline</th><th>Status</th><th>Summary</th><th>Completed</th></tr></thead><tbody>"
         + items
-        + "</section>"
+        + "</tbody></table>"
     )
 
 
@@ -321,26 +361,81 @@ def rejected_requirements(storage: Storage) -> list[object]:
 
 
 def requirement_list_page(storage: Storage, title: str, requirements: list[object]) -> str:
-    search_logs = storage.list_agent_logs(agent_role="discovery", limit=8)
-    research_logs = storage.list_agent_logs(agent_role="deep_research", limit=8)
     return (
         f"<h1>{html.escape(title)}</h1>"
-        "<section class='board'>"
-        + log_summary_panel("Requirement Search Agent Log", "/agent-log?role=discovery", search_logs)
-        + requirement_index_panel(title, requirements)
-        + log_summary_panel("Deep Research Agent Log", "/agent-log?role=deep_research", research_logs)
-        + "</section>"
+        "<p class='muted'>Each row preserves the whole line from requirement search to conclusion so it can be evaluated later.</p>"
+        + requirement_lineage_table(storage, requirements)
     )
 
 
-def requirement_index_panel(title: str, requirements: list[object]) -> str:
-    items = "".join(requirement_card(item) for item in requirements) or f"<p class='muted'>No {html.escape(title.lower())} yet.</p>"
+def requirement_lineage_table(storage: Storage, requirements: list[object]) -> str:
+    rows = "".join(requirement_lineage_row(storage, item) for item in requirements)
+    if not rows:
+        rows = "<tr><td colspan='6' class='muted'>No requirements in this page yet.</td></tr>"
     return (
-        "<section class='panel'><h2>Requirements Found</h2>"
-        "<p class='muted'>Click a requirement to open full evidence, research history, decision history, and actions.</p>"
-        + items
-        + "</section>"
+        "<table class='lineage'><thead><tr>"
+        "<th>Requirement</th><th>Search Agents</th><th>Queue / Pool</th><th>Deep Research Agents</th><th>Conclusion</th><th>Saved Line</th>"
+        "</tr></thead><tbody>"
+        + rows
+        + "</tbody></table>"
     )
+
+
+def requirement_lineage_row(storage: Storage, requirement: object) -> str:
+    runs = storage.list_research_runs(requirement.requirement_id)
+    latest_run = runs[0] if runs else None
+    conclusion = latest_run.recommendation if latest_run else requirement.latest_recommendation or "Waiting for deep research conclusion"
+    search_agents = agent_links_for_requirement(storage, requirement, ["discovery"])
+    pool_agents = agent_links_for_requirement(storage, requirement, ["pool_manager", "change_detection"])
+    deep_agents = agent_links_for_requirement(storage, requirement, ["deep_research", "report"])
+    saved_line = latest_pipeline_for_requirement(storage, requirement.requirement_id)
+    status_class = " rejected" if requirement.status == RequirementStatus.REJECTED else ""
+    return f"""
+    <tr>
+      <td>
+        <a href="/requirement?id={html.escape(requirement.requirement_id)}"><strong>{html.escape(requirement.canonical_requirement)}</strong></a>
+        <div class="summary"><span class="status{status_class}">{html.escape(requirement.status.value)}</span> Score {requirement.current_scores.get("overall_score", 0)}</div>
+        <div class="summary">Evidence {requirement.evidence_count} | Subreddits {requirement.subreddit_count}</div>
+      </td>
+      <td>{search_agents}</td>
+      <td>{pool_agents}<div class="summary">Times detected {requirement.times_detected}</div></td>
+      <td>{deep_agents}<div class="summary">{len(runs)} research run(s)</div></td>
+      <td>{html.escape(conclusion)}</td>
+      <td>{saved_line}</td>
+    </tr>
+    """
+
+
+def agent_links_for_requirement(storage: Storage, requirement: object, roles: list[str]) -> str:
+    links = []
+    for role in roles:
+        related = related_log_count(storage, requirement, role)
+        href = f"/agent-log?role={html.escape(role)}&ref={html.escape(requirement.requirement_id)}"
+        links.append(f"<a class='agent-chip' href='{href}'>{html.escape(role.replace('_', ' ').title())} ({related})</a>")
+    return "".join(links)
+
+
+def related_log_count(storage: Storage, requirement: object, role: str) -> int:
+    logs = storage.list_agent_logs(agent_role=role, limit=500)
+    refs = {requirement.requirement_id, *requirement.research_history, *requirement.evidence_ids}
+    count = 0
+    for item in logs:
+        log_refs = {str(ref) for ref in item["input_refs"] + item["output_refs"]}
+        if refs & log_refs:
+            count += 1
+    if count == 0 and role == "discovery" and requirement.evidence_ids:
+        return len(logs)
+    return count
+
+
+def latest_pipeline_for_requirement(storage: Storage, requirement_id: str) -> str:
+    for pipeline in storage.list_pipeline_runs(30):
+        snapshot = storage.get_pipeline_run(str(pipeline["pipeline_run_id"]))
+        if not snapshot:
+            continue
+        if any(item.get("requirement_id") == requirement_id for item in snapshot["requirement_snapshot"]):
+            return f"<a class='agent-chip' href='/pipeline?id={html.escape(str(pipeline['pipeline_run_id']))}'>Pipeline Snapshot</a>"
+    return "<span class='muted'>No saved snapshot yet</span>"
 
 
 def log_summary_panel(title: str, href: str, logs: list[dict[str, object]]) -> str:
@@ -455,8 +550,16 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
     """
 
 
-def agent_log_page(storage: Storage, role: str, agent_id: str) -> str:
+def agent_log_page(storage: Storage, role: str, agent_id: str, ref: str = "") -> str:
     logs = storage.list_agent_logs(agent_role=role or None, agent_id=agent_id or None, limit=200)
+    if ref:
+        filtered = []
+        for item in logs:
+            refs = {str(value) for value in item["input_refs"] + item["output_refs"]}
+            if ref in refs:
+                filtered.append(item)
+        if filtered:
+            logs = filtered
     title = role.replace("_", " ").title() if role else agent_id or "Agent"
     rows = "".join(
         f"""
@@ -473,7 +576,8 @@ def agent_log_page(storage: Storage, role: str, agent_id: str) -> str:
         for item in logs
     )
     full_logs = html.escape(json.dumps(logs, indent=2, default=str))
-    summary = f"{len(logs)} log event(s). Latest status: {logs[0]['status'] if logs else 'none'}."
+    ref_text = f" Related to {ref}." if ref else ""
+    summary = f"{len(logs)} log event(s). Latest status: {logs[0]['status'] if logs else 'none'}.{ref_text}"
     return f"""
     <h1>{html.escape(title)} Log</h1>
     <p class="muted">{html.escape(summary)}</p>

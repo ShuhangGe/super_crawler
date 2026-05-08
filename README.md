@@ -25,9 +25,9 @@ Open `http://127.0.0.1:8000` for the dashboard.
 
 The dashboard has three main pages:
 
-- Running Status: Start, Stop, Run Once, running agents, requirements currently in the pipeline, and finished pipeline snapshots.
-- Possible Requirements: all non-rejected requirements, requirement search agent logs, requirement detail links, and deep research agent logs.
-- Rejected Requirements: rejected or archived requirements with the same log/detail structure as the possible requirements page.
+- Running Status: Start, Stop, Run Once, running research agents on the left, found requirements waiting for verification in the middle, and running deep research agents on the right.
+- Possible Requirements: all non-rejected requirements as lineage rows from search agents to queue/pool, deep research agents, conclusion, and saved pipeline snapshot.
+- Rejected Requirements: rejected or archived requirements using the same lineage-row structure.
 
 Start runs the agent loop in the background, Stop halts it after the current cycle, and Run Once executes a single cycle immediately. Each finished cycle is saved as a pipeline snapshot that can be opened from the Running Status page.
 
