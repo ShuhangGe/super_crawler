@@ -31,6 +31,19 @@ class SignalLabel(StrEnum):
     HIGH_PRIORITY = "high_priority_signal"
 
 
+class TaskGroupStatus(StrEnum):
+    DRAFT = "draft"
+    RUNNING = "running"
+    STOPPED = "stopped"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class TaskGroupType(StrEnum):
+    GENERAL = "general_search"
+    DOMAIN = "domain_search"
+
+
 @dataclass(slots=True)
 class RawEvidence:
     evidence_id: str
@@ -50,6 +63,8 @@ class RawEvidence:
     geo_hints: list[str] = field(default_factory=list)
     matched_patterns: list[str] = field(default_factory=list)
     raw_payload: dict[str, Any] = field(default_factory=dict)
+    task_group_id: str | None = None
+    task_group_run_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -66,6 +81,8 @@ class CandidateRequirement:
     status: RequirementStatus
     created_at: str
     updated_at: str
+    task_group_id: str | None = None
+    task_group_run_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -90,6 +107,8 @@ class RequirementRecord:
     assigned_to: str | None = None
     aliases: list[str] = field(default_factory=list)
     evidence_ids: list[str] = field(default_factory=list)
+    task_group_ids: list[str] = field(default_factory=list)
+    task_group_run_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -124,3 +143,33 @@ class AgentActivityLog:
     error: str | None
     retry_count: int
     cost_estimate: float
+
+
+@dataclass(slots=True)
+class TaskGroup:
+    task_group_id: str
+    name: str
+    task_type: TaskGroupType
+    status: TaskGroupStatus
+    domain: str | None
+    input_dir: str
+    subreddits: list[str]
+    keywords: list[str]
+    negative_keywords: list[str]
+    created_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class TaskGroupRun:
+    task_group_run_id: str
+    task_group_id: str
+    started_at: str
+    completed_at: str | None
+    status: TaskGroupStatus
+    items_collected: int
+    candidates_created: int
+    requirements_found: int
+    requirements_queued: int
+    requirements_rejected: int
+    summary: str

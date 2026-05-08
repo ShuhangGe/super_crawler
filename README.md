@@ -25,11 +25,25 @@ Open `http://127.0.0.1:8000` for the dashboard.
 
 The dashboard has three main pages:
 
-- Running Status: Start, Stop, Run Once, running research agents on the left, found requirements waiting for verification in the middle, and running deep research agents on the right.
-- Possible Requirements: all non-rejected requirements as lineage rows from search agents to queue/pool, deep research agents, conclusion, and saved pipeline snapshot.
+- Running Status: Start, Stop, Run Once, create general/domain task groups, search task groups on the left, found requirements waiting for verification in the middle, and running deep research agents on the right.
+- Possible Requirements: all non-rejected requirements as lineage rows from task group/search agents to queue/pool, deep research agents, conclusion, and saved pipeline snapshot.
 - Rejected Requirements: rejected or archived requirements using the same lineage-row structure.
 
 Start runs the agent loop in the background, Stop halts it after the current cycle, and Run Once executes a single cycle immediately. Each finished cycle is saved as a pipeline snapshot that can be opened from the Running Status page.
+
+## Task Groups
+
+Task groups are the starting point for requirement search. A task can be a broad general search or a focused domain search.
+
+```bash
+python3 -m super_crawler.cli task create general "General Requirement Search" --input-dir data/task_inbox/general
+python3 -m super_crawler.cli task create domain "Pet Care Search" --domain "pet care" --input-dir data/task_inbox/pet_care --subreddits r/dogs,r/AskVet --keywords medication,insurance
+python3 -m super_crawler.cli task start tg_pet_care_search_0001
+python3 -m super_crawler.cli task run tg_pet_care_search_0001
+python3 -m super_crawler.cli task stop tg_pet_care_search_0001
+```
+
+Put Reddit-like JSON arrays into each task group's input folder. Running task groups tag evidence, candidates, and requirements so the possible/rejected pages preserve the line from task group to final conclusion.
 
 ## Ingest Custom Reddit Data
 

@@ -13,6 +13,10 @@ from .models import (
     RequirementRecord,
     RequirementStatus,
     ResearchRun,
+    TaskGroup,
+    TaskGroupRun,
+    TaskGroupStatus,
+    TaskGroupType,
     utc_now,
 )
 
@@ -159,8 +163,43 @@ class Storage:
                 agent_log_snapshot TEXT NOT NULL,
                 summary TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS task_groups (
+                task_group_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                domain TEXT,
+                input_dir TEXT NOT NULL,
+                subreddits TEXT NOT NULL,
+                keywords TEXT NOT NULL,
+                negative_keywords TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS task_group_runs (
+                task_group_run_id TEXT PRIMARY KEY,
+                task_group_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT NOT NULL,
+                items_collected INTEGER NOT NULL,
+                candidates_created INTEGER NOT NULL,
+                requirements_found INTEGER NOT NULL,
+                requirements_queued INTEGER NOT NULL,
+                requirements_rejected INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                FOREIGN KEY(task_group_id) REFERENCES task_groups(task_group_id)
+            );
             """
         )
+        self._ensure_column("raw_evidence", "task_group_id", "TEXT")
+        self._ensure_column("raw_evidence", "task_group_run_id", "TEXT")
+        self._ensure_column("candidate_requirements", "task_group_id", "TEXT")
+        self._ensure_column("candidate_requirements", "task_group_run_id", "TEXT")
+        self._ensure_column("requirements", "task_group_ids", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("requirements", "task_group_run_ids", "TEXT NOT NULL DEFAULT '[]'")
         self.conn.commit()
 
     def upsert_evidence(self, evidence: RawEvidence) -> None:
@@ -174,6 +213,12 @@ class Storage:
 
     def upsert_research_run(self, run: ResearchRun) -> None:
         self._upsert("research_runs", "research_run_id", run)
+
+    def upsert_task_group(self, task_group: TaskGroup) -> None:
+        self._upsert("task_groups", "task_group_id", task_group)
+
+    def upsert_task_group_run(self, run: TaskGroupRun) -> None:
+        self._upsert("task_group_runs", "task_group_run_id", run)
 
     def log_activity(self, log: AgentActivityLog) -> None:
         data = self._to_row(log)
@@ -344,7 +389,72 @@ class Storage:
             "research_runs": self._count("research_runs"),
             "activity_logs": self._count("agent_activity_logs"),
             "pipeline_runs": self._count("pipeline_runs"),
+            "task_groups": self._count("task_groups"),
+            "task_group_runs": self._count("task_group_runs"),
         }
+
+    def list_task_groups(self, statuses: Iterable[str] | None = None) -> list[TaskGroup]:
+        if statuses:
+            values = list(statuses)
+            placeholders = ", ".join("?" for _ in values)
+            rows = self.conn.execute(
+                f"SELECT * FROM task_groups WHERE status IN ({placeholders}) ORDER BY updated_at DESC",
+                values,
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM task_groups ORDER BY updated_at DESC").fetchall()
+        return [self._from_row(TaskGroup, row) for row in rows]
+
+    def get_task_group(self, task_group_id: str) -> TaskGroup | None:
+        row = self.conn.execute("SELECT * FROM task_groups WHERE task_group_id=?", (task_group_id,)).fetchone()
+        return None if row is None else self._from_row(TaskGroup, row)
+
+    def create_task_group(
+        self,
+        name: str,
+        task_type: TaskGroupType,
+        domain: str | None,
+        input_dir: str,
+        subreddits: list[str] | None = None,
+        keywords: list[str] | None = None,
+        negative_keywords: list[str] | None = None,
+    ) -> TaskGroup:
+        now = utc_now()
+        slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")[:36] or "task"
+        task_group_id = f"tg_{slug}_{self._count('task_groups') + 1:04d}"
+        task_group = TaskGroup(
+            task_group_id=task_group_id,
+            name=name,
+            task_type=task_type,
+            status=TaskGroupStatus.STOPPED,
+            domain=domain,
+            input_dir=input_dir,
+            subreddits=subreddits or [],
+            keywords=keywords or [],
+            negative_keywords=negative_keywords or [],
+            created_at=now,
+            updated_at=now,
+        )
+        self.upsert_task_group(task_group)
+        return task_group
+
+    def update_task_group_status(self, task_group_id: str, status: TaskGroupStatus) -> None:
+        task_group = self.get_task_group(task_group_id)
+        if task_group is None:
+            raise ValueError(f"Unknown task group: {task_group_id}")
+        task_group.status = status
+        task_group.updated_at = utc_now()
+        self.upsert_task_group(task_group)
+
+    def list_task_group_runs(self, task_group_id: str | None = None, limit: int = 50) -> list[TaskGroupRun]:
+        if task_group_id:
+            rows = self.conn.execute(
+                "SELECT * FROM task_group_runs WHERE task_group_id=? ORDER BY started_at DESC LIMIT ?",
+                (task_group_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM task_group_runs ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
+        return [self._from_row(TaskGroupRun, row) for row in rows]
 
     def list_activity_logs(self, limit: int = 25) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -468,6 +578,11 @@ class Storage:
     def _count(self, table: str) -> int:
         return int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def _upsert(self, table: str, pk: str, item: Any) -> None:
         data = self._to_row(item)
         columns = list(data)
@@ -490,6 +605,8 @@ class Storage:
         for key, value in list(row.items()):
             if isinstance(value, RequirementStatus):
                 row[key] = value.value
+            elif isinstance(value, (TaskGroupStatus, TaskGroupType)):
+                row[key] = value.value
             elif isinstance(value, (list, dict)):
                 row[key] = json.dumps(value, sort_keys=True)
             elif isinstance(value, bool):
@@ -503,6 +620,8 @@ class Storage:
             "matched_patterns",
             "raw_payload",
             "evidence_ids",
+            "task_group_ids",
+            "task_group_run_ids",
             "detected_audience",
             "duplicate_candidate_ids",
             "geo_distribution",
@@ -524,6 +643,9 @@ class Storage:
             "changed_since_last_run",
             "input_refs",
             "output_refs",
+            "subreddits",
+            "keywords",
+            "negative_keywords",
         }
         for field in fields(model):
             if field.name in json_fields and isinstance(data.get(field.name), str):
@@ -531,5 +653,10 @@ class Storage:
             if field.name == "author_metadata_allowed":
                 data[field.name] = bool(data[field.name])
             if field.name == "status" and data.get(field.name) is not None:
-                data[field.name] = RequirementStatus(data[field.name])
+                if model is TaskGroup or model is TaskGroupRun:
+                    data[field.name] = TaskGroupStatus(data[field.name])
+                else:
+                    data[field.name] = RequirementStatus(data[field.name])
+            if field.name == "task_type" and data.get(field.name) is not None:
+                data[field.name] = TaskGroupType(data[field.name])
         return model(**{field.name: data[field.name] for field in fields(model)})

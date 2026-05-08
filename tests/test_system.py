@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
 from super_crawler.dashboard import home_page
-from super_crawler.models import RequirementStatus
+from super_crawler.models import RequirementStatus, TaskGroupStatus, TaskGroupType
 from super_crawler.runtime import RuntimeController
 from super_crawler.seed import SAMPLE_REDDIT_ITEMS
 from super_crawler.storage import Storage
@@ -55,6 +56,8 @@ class SystemTests(unittest.TestCase):
                     "research_runs",
                     "activity_logs",
                     "pipeline_runs",
+                    "task_groups",
+                    "task_group_runs",
                 },
             )
 
@@ -70,7 +73,7 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Agent Runtime", html)
             self.assertIn("Start", html)
             self.assertIn("Stop", html)
-            self.assertIn("Running Research Agents", html)
+            self.assertIn("Search Task Groups", html)
             self.assertIn("Found Requirements Waiting To Verify", html)
             self.assertIn("Running Deep Research Agents", html)
 
@@ -92,6 +95,33 @@ class SystemTests(unittest.TestCase):
             snapshot = storage.get_pipeline_run(result["pipeline_run_id"])
             self.assertIsNotNone(snapshot)
             self.assertTrue(snapshot["requirement_snapshot"])
+
+    def test_task_group_runs_and_tags_requirement_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            inbox = Path(directory) / "pet_care"
+            inbox.mkdir()
+            (inbox / "items.json").write_text(json.dumps(SAMPLE_REDDIT_ITEMS[:2]))
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Pet Care Search",
+                task_type=TaskGroupType.DOMAIN,
+                domain="pet care",
+                input_dir=str(inbox),
+                subreddits=["r/dogs", "r/AskVet"],
+                keywords=["medication"],
+                negative_keywords=[],
+            )
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "unused", interval_seconds=1)
+            result = controller.run_once()
+            requirements = Storage(db_path).list_requirements()
+
+            self.assertEqual(result["task_group_runs"], 1)
+            self.assertTrue(requirements)
+            self.assertTrue(any(task_group.task_group_id in requirement.task_group_ids for requirement in requirements))
 
 
 if __name__ == "__main__":

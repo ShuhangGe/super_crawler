@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
 from .dashboard import serve_dashboard
-from .models import RequirementStatus
+from .models import RequirementStatus, TaskGroupStatus, TaskGroupType
 from .runner import AlwaysOnRunner
 from .seed import SAMPLE_REDDIT_ITEMS
 from .storage import DEFAULT_DB_PATH, Storage
@@ -29,6 +29,24 @@ def main() -> None:
     daemon = subcommands.add_parser("daemon", help="Run the controlled-source discovery loop forever")
     daemon.add_argument("--input-dir", default="data/reddit_inbox", help="Directory containing Reddit JSON arrays")
     daemon.add_argument("--interval-seconds", type=int, default=10_800, help="Delay between scans")
+
+    task = subcommands.add_parser("task", help="Manage general/domain search task groups")
+    task_subcommands = task.add_subparsers(dest="task_command", required=True)
+    task_create = task_subcommands.add_parser("create")
+    task_create.add_argument("type", choices=[TaskGroupType.GENERAL.value, TaskGroupType.DOMAIN.value, "general", "domain"])
+    task_create.add_argument("name")
+    task_create.add_argument("--domain")
+    task_create.add_argument("--input-dir")
+    task_create.add_argument("--subreddits", default="")
+    task_create.add_argument("--keywords", default="")
+    task_create.add_argument("--negative-keywords", default="")
+    task_subcommands.add_parser("list")
+    task_start = task_subcommands.add_parser("start")
+    task_start.add_argument("task_group_id")
+    task_stop = task_subcommands.add_parser("stop")
+    task_stop.add_argument("task_group_id")
+    task_run = task_subcommands.add_parser("run")
+    task_run.add_argument("task_group_id")
 
     action = subcommands.add_parser("action", help="Human review action for a requirement")
     action.add_argument("type", choices=["approve", "pause", "priority", "reject", "force-reopen", "merge"])
@@ -73,6 +91,32 @@ def main() -> None:
             print(run.research_run_id if run else "No queued research tasks")
         elif args.command == "daemon":
             AlwaysOnRunner(storage, args.input_dir, args.interval_seconds).run_forever()
+        elif args.command == "task":
+            if args.task_command == "create":
+                task_type = parse_task_type(args.type)
+                input_dir = args.input_dir or f"data/task_inbox/{slugify(args.domain or args.name)}"
+                task_group = storage.create_task_group(
+                    name=args.name,
+                    task_type=task_type,
+                    domain=args.domain,
+                    input_dir=input_dir,
+                    subreddits=split_csv(args.subreddits),
+                    keywords=split_csv(args.keywords),
+                    negative_keywords=split_csv(args.negative_keywords),
+                )
+                print(f"Created {task_group.task_group_id} at {task_group.input_dir}")
+            elif args.task_command == "list":
+                for task_group in storage.list_task_groups():
+                    print(f"{task_group.task_group_id}\t{task_group.status.value}\t{task_group.task_type.value}\t{task_group.name}\t{task_group.input_dir}")
+            elif args.task_command == "start":
+                storage.update_task_group_status(args.task_group_id, TaskGroupStatus.RUNNING)
+                print(f"Started {args.task_group_id}")
+            elif args.task_command == "stop":
+                storage.update_task_group_status(args.task_group_id, TaskGroupStatus.STOPPED)
+                print(f"Stopped {args.task_group_id}")
+            elif args.task_command == "run":
+                result = AlwaysOnRunner(storage, "data/reddit_inbox").run_task_group(args.task_group_id)
+                print(json.dumps(result, indent=2))
         elif args.command == "action":
             if args.type == "approve":
                 storage.update_requirement_status(args.requirement_id, RequirementStatus.QUEUED_FOR_RESEARCH, "human approved deep research")
@@ -109,6 +153,22 @@ def main() -> None:
     finally:
         if args.command != "serve":
             storage.close()
+
+
+def split_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def slugify(value: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_") or "task"
+
+
+def parse_task_type(value: str) -> TaskGroupType:
+    if value == "general":
+        return TaskGroupType.GENERAL
+    if value == "domain":
+        return TaskGroupType.DOMAIN
+    return TaskGroupType(value)
 
 
 if __name__ == "__main__":

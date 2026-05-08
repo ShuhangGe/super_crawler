@@ -66,7 +66,12 @@ class BaseAgent:
 class DiscoveryAgent(BaseAgent):
     role = "discovery"
 
-    def ingest_reddit_items(self, items: list[dict[str, Any]]) -> list[CandidateRequirement]:
+    def ingest_reddit_items(
+        self,
+        items: list[dict[str, Any]],
+        task_group_id: str | None = None,
+        task_group_run_id: str | None = None,
+    ) -> list[CandidateRequirement]:
         candidates: list[CandidateRequirement] = []
         for item in items:
             text = f"{item.get('title', '')}\n{item.get('body', '')}"
@@ -94,6 +99,8 @@ class DiscoveryAgent(BaseAgent):
                 geo_hints=infer_geo(text, item.get("subreddit", "")),
                 matched_patterns=matched,
                 raw_payload=item,
+                task_group_id=task_group_id or item.get("task_group_id"),
+                task_group_run_id=task_group_run_id or item.get("task_group_run_id"),
             )
             self.storage.upsert_evidence(evidence)
 
@@ -110,11 +117,13 @@ class DiscoveryAgent(BaseAgent):
                 status=RequirementStatus.NEW_CANDIDATE,
                 created_at=fetched_at,
                 updated_at=fetched_at,
+                task_group_id=task_group_id or item.get("task_group_id"),
+                task_group_run_id=task_group_run_id or item.get("task_group_run_id"),
             )
             self.storage.upsert_candidate(candidate)
             candidates.append(candidate)
 
-        self.log("ingest_reddit_items", "completed", [], [candidate.candidate_id for candidate in candidates])
+        self.log("ingest_reddit_items", "completed", [ref for ref in [task_group_id, task_group_run_id] if ref], [candidate.candidate_id for candidate in candidates])
         return candidates
 
     def _confidence(self, evidence: RawEvidence, matched: list[str]) -> float:
@@ -206,6 +215,8 @@ class PoolManagerAgent(BaseAgent):
             latest_recommendation=None,
             aliases=[],
             evidence_ids=list(candidate.evidence_ids),
+            task_group_ids=[candidate.task_group_id] if candidate.task_group_id else [],
+            task_group_run_ids=[candidate.task_group_run_id] if candidate.task_group_run_id else [],
         )
 
     def _merge_candidate(self, requirement: RequirementRecord, candidate: CandidateRequirement) -> RequirementRecord:
@@ -221,6 +232,10 @@ class PoolManagerAgent(BaseAgent):
         requirement.geo_distribution = self._geo_distribution(evidence)
         requirement.audience_segments = sorted(set(requirement.audience_segments + candidate.detected_audience))
         requirement.aliases = sorted(set(requirement.aliases + [candidate.requirement_title]))
+        if candidate.task_group_id:
+            requirement.task_group_ids = sorted(set(requirement.task_group_ids + [candidate.task_group_id]))
+        if candidate.task_group_run_id:
+            requirement.task_group_run_ids = sorted(set(requirement.task_group_run_ids + [candidate.task_group_run_id]))
         requirement.decision_history.append({"at": now, "decision": "merged_candidate", "source_candidate": candidate.candidate_id})
         return requirement
 

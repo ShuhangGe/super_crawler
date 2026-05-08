@@ -6,7 +6,7 @@ from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .models import RequirementStatus
+from .models import RequirementStatus, TaskGroupStatus, TaskGroupType
 from .runtime import RuntimeController
 from .storage import Storage
 
@@ -77,6 +77,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._json([asdict(requirement) for requirement in storage.list_requirements()])
                 elif parsed.path == "/action":
                     self._handle_action(storage, parse_qs(parsed.query))
+                elif parsed.path == "/task":
+                    self._handle_task(storage, parse_qs(parsed.query))
                 else:
                     self.send_error(404)
 
@@ -138,6 +140,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.app_controller.stop()
         elif action == "run-once":
             self.app_controller.run_once()
+        else:
+            self.send_error(400)
+            return
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+    def _handle_task(self, storage: Storage, query: dict[str, list[str]]) -> None:
+        action = query.get("action", [""])[0]
+        task_group_id = query.get("id", [""])[0]
+        if action == "create":
+            task_type = TaskGroupType(query.get("type", [TaskGroupType.GENERAL.value])[0])
+            name = query.get("name", [""])[0].strip() or ("General Search" if task_type == TaskGroupType.GENERAL else "Domain Search")
+            domain = query.get("domain", [""])[0].strip() or None
+            input_dir = query.get("input_dir", [""])[0].strip()
+            if not input_dir:
+                folder = domain or name
+                slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in folder).strip("_")
+                input_dir = f"data/task_inbox/{slug or 'general'}"
+            subreddits = split_csv(query.get("subreddits", [""])[0])
+            keywords = split_csv(query.get("keywords", [""])[0])
+            negative_keywords = split_csv(query.get("negative_keywords", [""])[0])
+            storage.create_task_group(name, task_type, domain, input_dir, subreddits, keywords, negative_keywords)
+        elif action == "start":
+            storage.update_task_group_status(task_group_id, TaskGroupStatus.RUNNING)
+        elif action == "stop":
+            storage.update_task_group_status(task_group_id, TaskGroupStatus.STOPPED)
+        elif action == "run-once":
+            from .runner import AlwaysOnRunner
+
+            AlwaysOnRunner(storage, "data/reddit_inbox").run_task_group(task_group_id)
         else:
             self.send_error(400)
             return
@@ -237,6 +270,7 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
         + "<section class='grid'>"
         + "".join(f"<div class='card'><div class='muted'>{label}</div><div class='metric'>{value}</div></div>" for label, value in cards)
         + "</section>"
+        + task_create_panel()
         + "<section class='workbench'>"
         + research_search_agents_panel(storage)
         + waiting_requirements_panel(waiting)
@@ -293,11 +327,15 @@ def agent_cards(storage: Storage, roles: list[str]) -> str:
 
 
 def research_search_agents_panel(storage: Storage) -> str:
-    items = agent_cards(storage, ["discovery", "pool_manager", "change_detection"])
+    tasks = storage.list_task_groups()
+    task_items = "".join(task_group_card(task) for task in tasks) or "<p class='muted'>No task group yet. Create a general or domain task above.</p>"
+    agent_items = agent_cards(storage, ["discovery", "pool_manager", "change_detection"])
     return (
-        "<section class='panel'><h2>Running Research Agents</h2>"
-        "<p class='muted'>Agents that search, extract, deduplicate, and decide what should wait for verification.</p>"
-        + items
+        "<section class='panel'><h2>Search Task Groups</h2>"
+        "<p class='muted'>Create general or domain search tasks. Running tasks feed found requirements into the middle queue.</p>"
+        + task_items
+        + "<h3>Agent Logs</h3>"
+        + agent_items
         + "</section>"
     )
 
@@ -395,6 +433,7 @@ def requirement_lineage_row(storage: Storage, requirement: object) -> str:
       <td>
         <a href="/requirement?id={html.escape(requirement.requirement_id)}"><strong>{html.escape(requirement.canonical_requirement)}</strong></a>
         <div class="summary"><span class="status{status_class}">{html.escape(requirement.status.value)}</span> Score {requirement.current_scores.get("overall_score", 0)}</div>
+        <div class="summary">{task_group_labels(storage, requirement)}</div>
         <div class="summary">Evidence {requirement.evidence_count} | Subreddits {requirement.subreddit_count}</div>
       </td>
       <td>{search_agents}</td>
@@ -404,6 +443,65 @@ def requirement_lineage_row(storage: Storage, requirement: object) -> str:
       <td>{saved_line}</td>
     </tr>
     """
+
+
+def task_create_panel() -> str:
+    return """
+    <section class="card">
+      <h2>Create Task Group</h2>
+      <form action="/task" class="actions">
+        <input type="hidden" name="action" value="create">
+        <select name="type">
+          <option value="general_search">General Search Task</option>
+          <option value="domain_search">Domain Search Task</option>
+        </select>
+        <input name="name" placeholder="Task name">
+        <input name="domain" placeholder="Domain, e.g. pet care">
+        <input name="subreddits" placeholder="Subreddits comma-separated">
+        <input name="keywords" placeholder="Keywords comma-separated">
+        <input name="negative_keywords" placeholder="Negative keywords">
+        <input name="input_dir" placeholder="Input folder, optional">
+        <button class="button">Create</button>
+      </form>
+      <p class="muted">A task group reads JSON files from its input folder, tags every evidence item, and feeds requirements into the shared verification queue.</p>
+    </section>
+    """
+
+
+def task_group_card(task: object) -> str:
+    action = "stop" if task.status == TaskGroupStatus.RUNNING else "start"
+    action_label = "Stop" if task.status == TaskGroupStatus.RUNNING else "Start"
+    status_class = " running" if task.status == TaskGroupStatus.RUNNING else ""
+    domain = f" | Domain: {html.escape(str(task.domain))}" if task.domain else ""
+    return f"""
+    <div class="item">
+      <div class="title">{html.escape(task.name)}</div>
+      <div><span class="status{status_class}">{html.escape(task.status.value)}</span> {html.escape(task.task_type.value)}{domain}</div>
+      <div class="summary">Input: {html.escape(task.input_dir)}</div>
+      <div class="summary">Subreddits: {html.escape(', '.join(task.subreddits) or 'any')}</div>
+      <div class="summary">Keywords: {html.escape(', '.join(task.keywords) or 'default signal patterns')}</div>
+      <div class="linkbar">
+        <a href="/task?action={action}&id={html.escape(task.task_group_id)}">{action_label}</a>
+        <a href="/task?action=run-once&id={html.escape(task.task_group_id)}">Run Once</a>
+        <a href="/agent-log?role=discovery&ref={html.escape(task.task_group_id)}">Search Log</a>
+      </div>
+    </div>
+    """
+
+
+def task_group_labels(storage: Storage, requirement: object) -> str:
+    labels = []
+    for task_group_id in requirement.task_group_ids:
+        task = storage.get_task_group(task_group_id)
+        if task:
+            labels.append(f"{task.name} ({task.task_type.value})")
+        else:
+            labels.append(task_group_id)
+    return "Task group: " + ", ".join(labels) if labels else "Task group: unassigned"
+
+
+def split_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def agent_links_for_requirement(storage: Storage, requirement: object, roles: list[str]) -> str:
