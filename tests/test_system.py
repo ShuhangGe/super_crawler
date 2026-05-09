@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
+from super_crawler.collectors import normalize_reddit_item, parse_opencli_output
 from super_crawler.dashboard import grouped_requirement_lineage, home_page, visible_task_groups
 from super_crawler.models import RequirementStatus, TaskGroupStatus, TaskGroupType
 from super_crawler.runtime import RuntimeController
@@ -61,8 +62,14 @@ class SystemTests(unittest.TestCase):
                     "experiment_logs",
                     "requirement_samples",
                     "requirement_events",
+                    "app_config",
                 },
             )
+            config = storage.get_app_config()
+            self.assertEqual(config["collector_enabled"], "0")
+            self.assertEqual(config["model_search"], "deepseek-v4-flash")
+            self.assertEqual(config["model_deep_research"], "deepseek-v4-flash")
+            self.assertEqual(config["model_report"], "deepseek-v4-pro")
 
     def test_home_page_uses_group_controls_without_global_runtime_controls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -75,6 +82,8 @@ class SystemTests(unittest.TestCase):
 
             self.assertIn("Global Resource Allocation", html)
             self.assertIn("Create Task Group", html)
+            self.assertIn("Collector And Model Settings", html)
+            self.assertIn("deepseek-v4-flash", html)
             self.assertIn("General Search", html)
             self.assertIn("Domain Specific", html)
             self.assertIn("Group name", html)
@@ -149,6 +158,7 @@ class SystemTests(unittest.TestCase):
             self.assertTrue(requirements)
             self.assertTrue(any(task_group.task_group_id in requirement.task_group_ids for requirement in requirements))
             self.assertTrue(any(item["step_name"] == "task_group_started" for item in experiment_logs))
+            self.assertTrue(any(item["step_name"] == "collector_skipped" for item in experiment_logs))
             self.assertTrue(any(item["step_name"] == "pool_requirement_sample" for item in experiment_logs))
             self.assertTrue(samples)
             self.assertTrue(samples[0]["requirement_sentence"].endswith("."))
@@ -178,6 +188,34 @@ class SystemTests(unittest.TestCase):
             html = grouped_requirement_lineage(storage, requirements, task_group.task_group_id)
             self.assertIn("Pet Care Search", html)
             self.assertIn("domain_search", html)
+
+    def test_opencli_reddit_output_is_normalized(self) -> None:
+        payload = {
+            "results": [
+                {
+                    "id": "abc123",
+                    "title": "I need a better way to manage league schedules",
+                    "selftext": "The spreadsheet is painful and parents keep missing updates.",
+                    "permalink": "/r/sports/comments/abc123/test/",
+                    "subreddit_name_prefixed": "r/sports",
+                    "score": "12",
+                    "num_comments": "5",
+                }
+            ]
+        }
+
+        parsed = parse_opencli_output(json.dumps(payload))
+        item = normalize_reddit_item(parsed[0], "sports scheduling")
+
+        self.assertEqual(item["source"], "reddit_opencli")
+        self.assertEqual(item["subreddit"], "sports")
+        self.assertEqual(item["score"], 12)
+        self.assertEqual(item["comment_count"], 5)
+        self.assertTrue(item["source_url"].startswith("https://www.reddit.com/"))
+        self.assertEqual(item["collection_query"], "sports scheduling")
+
+        ndjson = '{"title": "Need cheaper sports registration", "subreddit": "sports"}\n{"title": "Need better roster tools"}'
+        self.assertEqual(len(parse_opencli_output(ndjson)), 2)
 
 
 if __name__ == "__main__":

@@ -119,6 +119,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._handle_task(storage, parse_qs(parsed.query))
                 elif parsed.path == "/resources":
                     self._handle_resources(storage, parse_qs(parsed.query))
+                elif parsed.path == "/settings":
+                    self._handle_settings(storage, parse_qs(parsed.query))
                 else:
                     self.send_error(404)
 
@@ -233,6 +235,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.end_headers()
 
+    def _handle_settings(self, storage: Storage, query: dict[str, list[str]]) -> None:
+        storage.update_app_config(
+            {
+                "collector_enabled": "1" if query.get("collector_enabled", ["0"])[0] == "1" else "0",
+                "collector_command": query.get("collector_command", ["opencli reddit search"])[0].strip() or "opencli reddit search",
+                "collector_limit": str(parse_int(query.get("collector_limit", ["25"])[0], 25)),
+                "collector_timeout_seconds": str(parse_int(query.get("collector_timeout_seconds", ["120"])[0], 120)),
+                "model_search": query.get("model_search", ["deepseek-v4-flash"])[0].strip() or "deepseek-v4-flash",
+                "model_pool": query.get("model_pool", ["deepseek-v4-flash"])[0].strip() or "deepseek-v4-flash",
+                "model_deep_research": query.get("model_deep_research", ["deepseek-v4-flash"])[0].strip() or "deepseek-v4-flash",
+                "model_report": query.get("model_report", ["deepseek-v4-pro"])[0].strip() or "deepseek-v4-pro",
+            }
+        )
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
 
 def layout(content: str) -> str:
     return f"""<!doctype html>
@@ -310,6 +329,7 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     return (
         "<h1>Running Status</h1>"
         + resource_allocation_panel(storage)
+        + app_settings_panel(storage)
         + task_create_panel()
         + task_group_boards(storage, task_groups, requirements)
     )
@@ -349,6 +369,30 @@ def resource_allocation_panel(storage: Storage) -> str:
         <label>Deep <input type="number" min="0" name="max_deep_research_agents" value="{resources["max_deep_research_agents"]}"></label>
         <label>Report <input type="number" min="0" name="max_report_agents" value="{resources["max_report_agents"]}"></label>
         <button class="button secondary">Save Limits</button>
+      </form>
+    </section>
+    """
+
+
+def app_settings_panel(storage: Storage) -> str:
+    config = storage.get_app_config()
+    checked = " checked" if config.get("collector_enabled") == "1" else ""
+    return f"""
+    <section class="controlbar">
+      <div>
+        <strong>Collector And Model Settings</strong>
+        <div class="muted">Collector: OpenCLI Reddit | Search: {html.escape(config["model_search"])} | Pool: {html.escape(config["model_pool"])} | Deep research: {html.escape(config["model_deep_research"])}</div>
+      </div>
+      <form action="/settings" class="actions">
+        <label><input type="checkbox" name="collector_enabled" value="1"{checked}> OpenCLI</label>
+        <label>Command <input name="collector_command" value="{html.escape(config["collector_command"])}"></label>
+        <label>Limit <input type="number" min="1" name="collector_limit" value="{html.escape(config["collector_limit"])}"></label>
+        <label>Timeout <input type="number" min="1" name="collector_timeout_seconds" value="{html.escape(config["collector_timeout_seconds"])}"></label>
+        <label>Search Model <input name="model_search" value="{html.escape(config["model_search"])}"></label>
+        <label>Pool Model <input name="model_pool" value="{html.escape(config["model_pool"])}"></label>
+        <label>Deep Model <input name="model_deep_research" value="{html.escape(config["model_deep_research"])}"></label>
+        <label>Report Model <input name="model_report" value="{html.escape(config["model_report"])}"></label>
+        <button class="button secondary">Save Settings</button>
       </form>
     </section>
     """

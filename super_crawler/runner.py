@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, one_sentence_requirement
+from .collectors import OpenCliRedditCollector
 from .models import TaskGroup, TaskGroupRun, TaskGroupStatus, TaskGroupType, utc_now
 from .storage import Storage
 
@@ -92,8 +93,9 @@ class AlwaysOnRunner:
             "scheduler",
             "task_group_started",
             f"Task group {task_group.name} started",
-            {"task_group_name": task_group.name, "input_dir": task_group.input_dir},
+            {"task_group_name": task_group.name, "input_dir": task_group.input_dir, "model_config": self.storage.get_app_config()},
         )
+        collection_result = self._collect_for_task_group(task_group, task_group_run_id)
         scan = load_json_items_with_report(task_group.input_dir)
         self.storage.log_experiment(
             task_group.task_group_id,
@@ -117,7 +119,7 @@ class AlwaysOnRunner:
             "scheduler",
             "input_loaded",
             f"Loaded {len(scan['items'])} item(s) from {task_group.input_dir}",
-            {"items_loaded": len(scan["items"]), "items_skipped": scan["items_skipped"]},
+            {"items_loaded": len(scan["items"]), "items_skipped": scan["items_skipped"], "collection_result": collection_result},
         )
         if scan["items_skipped"]:
             self.storage.log_experiment(
@@ -230,6 +232,48 @@ class AlwaysOnRunner:
             "task_group_run_id": task_group_run_id,
         }
 
+    def _collect_for_task_group(self, task_group: TaskGroup, task_group_run_id: str) -> dict[str, object] | None:
+        config = self.storage.get_app_config()
+        if config.get("collector_enabled") != "1":
+            self.storage.log_experiment(
+                task_group.task_group_id,
+                task_group_run_id,
+                "collector",
+                "collector_skipped",
+                "Reddit OpenCLI collector is disabled",
+                {"collector_enabled": config.get("collector_enabled", "0")},
+            )
+            return None
+        collector = OpenCliRedditCollector(
+            command=config.get("collector_command", "opencli reddit search"),
+            timeout_seconds=parse_int(config.get("collector_timeout_seconds"), 120),
+        )
+        try:
+            result = collector.collect_to_inbox(
+                task_group,
+                task_group_run_id,
+                limit=parse_int(config.get("collector_limit"), 25),
+            )
+        except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+            self.storage.log_experiment(
+                task_group.task_group_id,
+                task_group_run_id,
+                "collector",
+                "collector_failed",
+                f"OpenCLI Reddit collection failed: {exc}",
+                {"error": str(exc), "command": config.get("collector_command")},
+            )
+            return {"error": str(exc)}
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "collector",
+            "reddit_opencli_collected",
+            f"Collected {result['items_collected']} Reddit item(s) with OpenCLI",
+            result,
+        )
+        return result
+
 
 def load_json_items(input_dir: str | Path) -> list[dict]:
     return list(load_json_items_with_report(input_dir)["items"])
@@ -263,3 +307,10 @@ def tag_task_item(item: dict, task_group: TaskGroup, task_group_run_id: str) -> 
     if task_group.domain:
         tagged["domain"] = task_group.domain
     return tagged
+
+
+def parse_int(value: object, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default

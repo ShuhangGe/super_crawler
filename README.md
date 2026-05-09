@@ -52,6 +52,35 @@ python3 -m super_crawler.cli task delete tg_pet_care_search_0001
 
 Put Reddit-like JSON arrays into each task group's input folder. Running task groups tag evidence, candidates, and requirements so the possible/rejected pages preserve the line from task group to final conclusion. Delete archives a task group: it disappears from the Running Status page, but remains selectable in Possible/Rejected pages if it has historical requirements.
 
+## Reddit Collection With OpenCLI
+
+The dashboard can use OpenCLI as a replaceable Reddit collection layer before the existing JSON pipeline runs. On the Running Status page, enable `OpenCLI` in Collector And Model Settings and keep the default command unless your local OpenCLI install uses a different command:
+
+```bash
+opencli reddit search
+```
+
+Each running task group uses its description/domain/name as the query, writes normalized Reddit-like JSON into that group's input folder, logs the collector command and item count, then runs the same discovery, pool, and deep research pipeline.
+
+You can also collect manually:
+
+```bash
+python3 -m super_crawler.cli collect-reddit tg_sports_search_0001 --limit 25
+```
+
+If OpenCLI is not installed or Reddit blocks the command, the task group run logs `collector_failed` and continues with any JSON already in the input folder.
+
+## Model Settings
+
+The app stores model choices in SQLite so experiments can record which model configuration was active. Defaults are:
+
+- Search/discovery: `deepseek-v4-flash`
+- Pool manager: `deepseek-v4-flash`
+- Deep research: `deepseek-v4-flash`
+- Report: `deepseek-v4-pro`
+
+These are currently configuration and experiment metadata. The MVP's agent logic is still deterministic heuristics until a live LLM client is connected.
+
 ## Ingest Custom Reddit Data
 
 ```bash

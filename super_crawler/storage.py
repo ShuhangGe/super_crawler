@@ -200,6 +200,12 @@ class Storage:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS app_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS experiment_logs (
                 log_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_group_id TEXT,
@@ -245,6 +251,7 @@ class Storage:
         self._ensure_column("requirements", "task_group_run_ids", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column("task_groups", "description", "TEXT NOT NULL DEFAULT ''")
         self._ensure_default_resource_config()
+        self._ensure_default_app_config()
         self.conn.commit()
 
     def upsert_evidence(self, evidence: RawEvidence) -> None:
@@ -538,6 +545,7 @@ class Storage:
             "experiment_logs": self._count("experiment_logs"),
             "requirement_samples": self._count("requirement_samples"),
             "requirement_events": self._count("requirement_events"),
+            "app_config": self._count("app_config"),
         }
 
     def get_resource_config(self) -> dict[str, int]:
@@ -558,6 +566,36 @@ class Storage:
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                 """,
                 (key, max(int(value), 0), now),
+            )
+        self.conn.commit()
+
+    def get_app_config(self) -> dict[str, str]:
+        self._ensure_default_app_config()
+        rows = self.conn.execute("SELECT key, value FROM app_config").fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+    def update_app_config(self, values: dict[str, str]) -> None:
+        allowed = {
+            "collector_enabled",
+            "collector_command",
+            "collector_limit",
+            "collector_timeout_seconds",
+            "model_search",
+            "model_pool",
+            "model_deep_research",
+            "model_report",
+        }
+        now = utc_now()
+        for key, value in values.items():
+            if key not in allowed:
+                continue
+            self.conn.execute(
+                """
+                INSERT INTO app_config (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, str(value), now),
             )
         self.conn.commit()
 
@@ -842,6 +880,27 @@ class Storage:
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO resource_config (key, value, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (key, value, now),
+            )
+
+    def _ensure_default_app_config(self) -> None:
+        now = utc_now()
+        defaults = {
+            "collector_enabled": "0",
+            "collector_command": "opencli reddit search",
+            "collector_limit": "25",
+            "collector_timeout_seconds": "120",
+            "model_search": "deepseek-v4-flash",
+            "model_pool": "deepseek-v4-flash",
+            "model_deep_research": "deepseek-v4-flash",
+            "model_report": "deepseek-v4-pro",
+        }
+        for key, value in defaults.items():
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO app_config (key, value, updated_at)
                 VALUES (?, ?, ?)
                 """,
                 (key, value, now),

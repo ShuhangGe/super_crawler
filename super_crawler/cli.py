@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
+from .collectors import OpenCliRedditCollector
 from .dashboard import serve_dashboard
 from .models import RequirementStatus, TaskGroupStatus, TaskGroupType
 from .runner import AlwaysOnRunner
@@ -26,6 +27,12 @@ def main() -> None:
     subcommands.add_parser("run-cycle", help="Run discovery reconciliation, change detection, and one research job")
     subcommands.add_parser("research-next", help="Run the next queued deep research task")
 
+    collect = subcommands.add_parser("collect-reddit", help="Collect Reddit search results into a task group inbox with OpenCLI")
+    collect.add_argument("task_group_id")
+    collect.add_argument("--limit", type=int)
+    collect.add_argument("--command")
+    collect.add_argument("--timeout-seconds", type=int)
+
     daemon = subcommands.add_parser("daemon", help="Run the controlled-source discovery loop forever")
     daemon.add_argument("--input-dir", default="data/reddit_inbox", help="Directory containing Reddit JSON arrays")
     daemon.add_argument("--interval-seconds", type=int, default=10_800, help="Delay between scans")
@@ -35,6 +42,7 @@ def main() -> None:
     task_create = task_subcommands.add_parser("create")
     task_create.add_argument("type", choices=[TaskGroupType.GENERAL.value, TaskGroupType.DOMAIN.value, "general", "domain"])
     task_create.add_argument("name")
+    task_create.add_argument("--description", default="")
     task_create.add_argument("--domain")
     task_create.add_argument("--input-dir")
     task_create.add_argument("--subreddits", default="")
@@ -91,6 +99,25 @@ def main() -> None:
         elif args.command == "research-next":
             run = DeepResearchAgent(storage, "research-agent-1").run_next()
             print(run.research_run_id if run else "No queued research tasks")
+        elif args.command == "collect-reddit":
+            task_group = storage.get_task_group(args.task_group_id)
+            if task_group is None:
+                raise SystemExit(f"Unknown task group: {args.task_group_id}")
+            config = storage.get_app_config()
+            collector = OpenCliRedditCollector(
+                command=args.command or config["collector_command"],
+                timeout_seconds=args.timeout_seconds or int(config["collector_timeout_seconds"]),
+            )
+            result = collector.collect_to_inbox(task_group, f"manual_{slugify(task_group.name)}", args.limit or int(config["collector_limit"]))
+            storage.log_experiment(
+                task_group.task_group_id,
+                None,
+                "collector",
+                "reddit_opencli_collected",
+                f"Collected {result['items_collected']} Reddit item(s) with OpenCLI",
+                result,
+            )
+            print(json.dumps(result, indent=2))
         elif args.command == "daemon":
             AlwaysOnRunner(storage, args.input_dir, args.interval_seconds).run_forever()
         elif args.command == "task":
@@ -102,6 +129,7 @@ def main() -> None:
                     task_type=task_type,
                     domain=args.domain,
                     input_dir=input_dir,
+                    description=args.description,
                     subreddits=split_csv(args.subreddits),
                     keywords=split_csv(args.keywords),
                     negative_keywords=split_csv(args.negative_keywords),
