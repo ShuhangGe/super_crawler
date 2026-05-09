@@ -3,5 +3,6 @@ __pycache__/
 .DS_Store
 .pytest_cache/
 .coverage
+.env
 data/*.sqlite3
 reports/*.md
