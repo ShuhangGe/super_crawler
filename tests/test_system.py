@@ -7,7 +7,7 @@ from pathlib import Path
 
 from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
 from super_crawler.collectors import normalize_reddit_item, parse_opencli_output
-from super_crawler.dashboard import grouped_requirement_lineage, home_page, visible_task_groups
+from super_crawler.dashboard import group_settings_page, grouped_requirement_lineage, home_page, visible_task_groups
 from super_crawler.models import RequirementStatus, TaskGroupStatus, TaskGroupType
 from super_crawler.runtime import RuntimeController
 from super_crawler.seed import SAMPLE_REDDIT_ITEMS
@@ -63,6 +63,7 @@ class SystemTests(unittest.TestCase):
                     "requirement_samples",
                     "requirement_events",
                     "app_config",
+                    "task_group_config",
                 },
             )
             config = storage.get_app_config()
@@ -82,8 +83,7 @@ class SystemTests(unittest.TestCase):
 
             self.assertIn("Global Resource Allocation", html)
             self.assertIn("Create Task Group", html)
-            self.assertIn("Collector And Model Settings", html)
-            self.assertIn("deepseek-v4-flash", html)
+            self.assertNotIn("Collector And Model Settings", html)
             self.assertIn("General Search", html)
             self.assertIn("Domain Specific", html)
             self.assertIn("Group name", html)
@@ -108,6 +108,7 @@ class SystemTests(unittest.TestCase):
             self.assertIn('value="start"', html)
             self.assertIn('value="stop"', html)
             self.assertIn('value="delete"', html)
+            self.assertIn("Settings", html)
             self.assertIn("Details", html)
             self.assertIn("Discovery Agents", html)
             self.assertIn("Running Deep Research Agents", html)
@@ -132,6 +133,16 @@ class SystemTests(unittest.TestCase):
             self.assertIn("OpenCLI is disabled", html)
             self.assertIn("Latest: Loaded 0 item(s)", html)
             self.assertIn("no deep research for this group yet", html)
+
+            settings_html = group_settings_page(storage, task_group.task_group_id)
+            self.assertIn("Sports Search Settings", settings_html)
+            self.assertIn("OpenCLI Collection", settings_html)
+            self.assertIn("Results per run", settings_html)
+            self.assertIn("<summary>Advanced</summary>", settings_html)
+            self.assertIn('name="model_search"', settings_html)
+            self.assertIn('name="model_deep_research"', settings_html)
+            self.assertIn("deepseek-v4-flash", settings_html)
+            self.assertIn("deepseek-v4-pro", settings_html)
 
     def test_runtime_saves_pipeline_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -206,6 +206,15 @@ class Storage:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS task_group_config (
+                task_group_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (task_group_id, key),
+                FOREIGN KEY(task_group_id) REFERENCES task_groups(task_group_id)
+            );
+
             CREATE TABLE IF NOT EXISTS experiment_logs (
                 log_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_group_id TEXT,
@@ -546,6 +555,7 @@ class Storage:
             "requirement_samples": self._count("requirement_samples"),
             "requirement_events": self._count("requirement_events"),
             "app_config": self._count("app_config"),
+            "task_group_config": self._count("task_group_config"),
         }
 
     def get_resource_config(self) -> dict[str, int]:
@@ -596,6 +606,40 @@ class Storage:
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                 """,
                 (key, str(value), now),
+            )
+        self.conn.commit()
+
+    def get_task_group_config(self, task_group_id: str) -> dict[str, str]:
+        config = self.get_app_config()
+        rows = self.conn.execute(
+            "SELECT key, value FROM task_group_config WHERE task_group_id=?",
+            (task_group_id,),
+        ).fetchall()
+        config.update({row["key"]: row["value"] for row in rows})
+        return config
+
+    def update_task_group_config(self, task_group_id: str, values: dict[str, str]) -> None:
+        allowed = {
+            "collector_enabled",
+            "collector_command",
+            "collector_limit",
+            "collector_timeout_seconds",
+            "model_search",
+            "model_pool",
+            "model_deep_research",
+            "model_report",
+        }
+        now = utc_now()
+        for key, value in values.items():
+            if key not in allowed:
+                continue
+            self.conn.execute(
+                """
+                INSERT INTO task_group_config (task_group_id, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_group_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (task_group_id, key, str(value), now),
             )
         self.conn.commit()
 

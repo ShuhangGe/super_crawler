@@ -93,7 +93,7 @@ class AlwaysOnRunner:
             "scheduler",
             "task_group_started",
             f"Task group {task_group.name} started",
-            {"task_group_name": task_group.name, "input_dir": task_group.input_dir, "model_config": self.storage.get_app_config()},
+            {"task_group_name": task_group.name, "input_dir": task_group.input_dir, "model_config": self.storage.get_task_group_config(task_group.task_group_id)},
         )
         collection_result = self._collect_for_task_group(task_group, task_group_run_id)
         scan = load_json_items_with_report(task_group.input_dir)
@@ -233,7 +233,7 @@ class AlwaysOnRunner:
         }
 
     def _collect_for_task_group(self, task_group: TaskGroup, task_group_run_id: str) -> dict[str, object] | None:
-        config = self.storage.get_app_config()
+        config = self.storage.get_task_group_config(task_group.task_group_id)
         if config.get("collector_enabled") != "1":
             self.storage.log_experiment(
                 task_group.task_group_id,

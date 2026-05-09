@@ -119,8 +119,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._handle_task(storage, parse_qs(parsed.query))
                 elif parsed.path == "/resources":
                     self._handle_resources(storage, parse_qs(parsed.query))
-                elif parsed.path == "/settings":
-                    self._handle_settings(storage, parse_qs(parsed.query))
+                elif parsed.path == "/group-settings":
+                    query = parse_qs(parsed.query)
+                    if query.get("action", [""])[0] == "save":
+                        self._handle_group_settings(storage, query)
+                    else:
+                        self._html(group_settings_page(storage, query.get("id", [""])[0]))
                 else:
                     self.send_error(404)
 
@@ -239,8 +243,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.end_headers()
 
-    def _handle_settings(self, storage: Storage, query: dict[str, list[str]]) -> None:
-        storage.update_app_config(
+    def _handle_group_settings(self, storage: Storage, query: dict[str, list[str]]) -> None:
+        task_group_id = query.get("id", [""])[0]
+        if not storage.get_task_group(task_group_id):
+            self.send_error(404)
+            return
+        storage.update_task_group_config(
+            task_group_id,
             {
                 "collector_enabled": "1" if query.get("collector_enabled", ["0"])[0] == "1" else "0",
                 "collector_command": query.get("collector_command", ["opencli reddit search"])[0].strip() or "opencli reddit search",
@@ -253,7 +262,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             }
         )
         self.send_response(303)
-        self.send_header("Location", "/")
+        self.send_header("Location", f"/#{task_group_anchor(task_group_id)}")
         self.end_headers()
 
 
@@ -309,6 +318,9 @@ def layout(content: str) -> str:
     .button.stop {{ background: #b42318; }}
     .button.secondary {{ background: #52616b; }}
     .button.danger {{ background: #8a2d22; }}
+    .toggle-button {{ background: #52616b; }}
+    input[type="checkbox"]:checked + .toggle-button {{ background: #0d5c75; }}
+    .hidden-check {{ position: absolute; opacity: 0; pointer-events: none; }}
     .link-button {{ display: inline-block; text-decoration: none; }}
     .metric {{ font-size: 28px; font-weight: 700; }}
     table {{ width: 100%; border-collapse: collapse; background: white; border: 1px solid #dce2e8; }}
@@ -345,7 +357,6 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     return (
         "<h1>Running Status</h1>"
         + resource_allocation_panel(storage)
-        + app_settings_panel(storage)
         + task_create_panel()
         + task_group_boards(storage, task_groups, requirements)
     )
@@ -385,30 +396,6 @@ def resource_allocation_panel(storage: Storage) -> str:
         <label>Deep <input type="number" min="0" name="max_deep_research_agents" value="{resources["max_deep_research_agents"]}"></label>
         <label>Report <input type="number" min="0" name="max_report_agents" value="{resources["max_report_agents"]}"></label>
         <button class="button secondary">Save Limits</button>
-      </form>
-    </section>
-    """
-
-
-def app_settings_panel(storage: Storage) -> str:
-    config = storage.get_app_config()
-    checked = " checked" if config.get("collector_enabled") == "1" else ""
-    return f"""
-    <section class="controlbar">
-      <div>
-        <strong>Collector And Model Settings</strong>
-        <div class="muted">Collector: OpenCLI Reddit | Search: {html.escape(config["model_search"])} | Pool: {html.escape(config["model_pool"])} | Deep research: {html.escape(config["model_deep_research"])}</div>
-      </div>
-      <form action="/settings" class="actions">
-        <label><input type="checkbox" name="collector_enabled" value="1"{checked}> OpenCLI</label>
-        <label>Command <input name="collector_command" value="{html.escape(config["collector_command"])}"></label>
-        <label>Limit <input type="number" min="1" name="collector_limit" value="{html.escape(config["collector_limit"])}"></label>
-        <label>Timeout <input type="number" min="1" name="collector_timeout_seconds" value="{html.escape(config["collector_timeout_seconds"])}"></label>
-        <label>Search Model <input name="model_search" value="{html.escape(config["model_search"])}"></label>
-        <label>Pool Model <input name="model_pool" value="{html.escape(config["model_pool"])}"></label>
-        <label>Deep Model <input name="model_deep_research" value="{html.escape(config["model_deep_research"])}"></label>
-        <label>Report Model <input name="model_report" value="{html.escape(config["model_report"])}"></label>
-        <button class="button secondary">Save Settings</button>
       </form>
     </section>
     """
@@ -516,6 +503,7 @@ def task_group_header(storage: Storage, task_group: object, requirements: list[o
         <form action="/task"><input type="hidden" name="action" value="start"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button">Start</button></form>
         <form action="/task"><input type="hidden" name="action" value="stop"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button stop">Stop</button></form>
         <form action="/task"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button danger">Delete</button></form>
+        <a class="button link-button secondary" href="/group-settings?id={html.escape(task_group.task_group_id)}">Settings</a>
         <a class="button link-button secondary" href="/experiment-log?task_group_id={html.escape(task_group.task_group_id)}">Details</a>
         <a href="/possible?task_group_id={html.escape(task_group.task_group_id)}">Possible</a>
         <a href="/rejected?task_group_id={html.escape(task_group.task_group_id)}">Rejected</a>
@@ -552,7 +540,7 @@ def task_group_record_summary(storage: Storage, task_group: object, requirements
 
 
 def task_group_diagnostic(storage: Storage, task_group: object) -> str:
-    config = storage.get_app_config()
+    config = storage.get_task_group_config(task_group.task_group_id)
     recent = storage.list_experiment_logs(task_group_id=task_group.task_group_id, limit=20)
     latest_input = next((item for item in recent if item["step_name"] == "input_loaded"), None)
     latest_files = next((item for item in recent if item["step_name"] == "files_read"), None)
@@ -566,7 +554,7 @@ def task_group_diagnostic(storage: Storage, task_group: object) -> str:
             return (
                 "<section class='notice warning'><strong>No input is being collected.</strong> "
                 f"OpenCLI is disabled and {html.escape(task_group.input_dir)} has {file_count} JSON file(s). "
-                "Enable OpenCLI in Collector And Model Settings, or put Reddit-like JSON files in the group input folder.</section>"
+                "Enable OpenCLI in this group Settings, or put Reddit-like JSON files in the group input folder.</section>"
             )
         return (
             "<section class='notice warning'><strong>No input loaded.</strong> "
@@ -631,6 +619,54 @@ def task_group_deep_research_panel(storage: Storage, task_group: object, require
         + deep_research_agent_cards(storage, task_group, requirements)
         + queue_text
         + "</section>"
+    )
+
+
+def group_settings_page(storage: Storage, task_group_id: str) -> str:
+    task_group = storage.get_task_group(task_group_id)
+    if task_group is None:
+        return "<h1>Task group not found</h1>"
+    config = storage.get_task_group_config(task_group_id)
+    checked = " checked" if config.get("collector_enabled") == "1" else ""
+    return f"""
+    <h1>{html.escape(task_group.name)} Settings</h1>
+    <div class="linkbar"><a href="/#{html.escape(task_group_anchor(task_group_id))}">Back to Group</a></div>
+    <section class="card">
+      <h2>Reddit Collection</h2>
+      <form action="/group-settings" class="actions">
+        <input type="hidden" name="action" value="save">
+        <input type="hidden" name="id" value="{html.escape(task_group_id)}">
+        <label>
+          <input class="hidden-check" type="checkbox" name="collector_enabled" value="1"{checked}>
+          <span class="button toggle-button">OpenCLI Collection</span>
+        </label>
+        <label>Results per run <input type="number" min="1" name="collector_limit" value="{html.escape(config["collector_limit"])}"></label>
+        <label>Default model {model_select("model_search", config["model_search"])}</label>
+        <label>Deep research model {model_select("model_deep_research", config["model_deep_research"])}</label>
+        <details>
+          <summary>Advanced</summary>
+          <div class="actions">
+            <label>Command <input name="collector_command" value="{html.escape(config["collector_command"])}"></label>
+            <label>Timeout <input type="number" min="1" name="collector_timeout_seconds" value="{html.escape(config["collector_timeout_seconds"])}"></label>
+            <label>Pool model {model_select("model_pool", config["model_pool"])}</label>
+            <label>Report model {model_select("model_report", config["model_report"])}</label>
+          </div>
+        </details>
+        <button class="button">Save Settings</button>
+      </form>
+    </section>
+    """
+
+
+def model_select(name: str, selected: str) -> str:
+    options = ["deepseek-v4-flash", "deepseek-v4-pro"]
+    return (
+        f"<select name=\"{html.escape(name)}\">"
+        + "".join(
+            f"<option value=\"{html.escape(option)}\"{' selected' if option == selected else ''}>{html.escape(option)}</option>"
+            for option in options
+        )
+        + "</select>"
     )
 
 

@@ -54,13 +54,13 @@ Put Reddit-like JSON arrays into each task group's input folder. Running task gr
 
 ## Reddit Collection With OpenCLI
 
-The dashboard can use OpenCLI as a replaceable Reddit collection layer before the existing JSON pipeline runs. On the Running Status page, enable `OpenCLI` in Collector And Model Settings and keep the default command unless your local OpenCLI install uses a different command:
+The dashboard can use OpenCLI as a replaceable Reddit collection layer before the existing JSON pipeline runs. In a task group's `Settings` page, enable `OpenCLI Collection` and keep the default command unless your local OpenCLI install uses a different command:
 
 ```bash
 opencli reddit search
 ```
 
-Each running task group uses its description/domain/name as the query, writes normalized Reddit-like JSON into that group's input folder, logs the collector command and item count, then runs the same discovery, pool, and deep research pipeline.
+Each running task group uses its own settings plus its description/domain/name as the query, writes normalized Reddit-like JSON into that group's input folder, logs the collector command and item count, then runs the same discovery, pool, and deep research pipeline.
 
 You can also collect manually:
 
