@@ -208,6 +208,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             storage.create_task_group(name, task_type, domain, input_dir, description, subreddits, keywords, negative_keywords)
         elif action == "start":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.RUNNING)
+            from .runner import AlwaysOnRunner
+
+            AlwaysOnRunner(storage, "data/reddit_inbox").run_task_group(task_group_id)
         elif action == "stop":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.STOPPED)
         elif action == "delete":
@@ -220,7 +223,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         self.send_response(303)
-        self.send_header("Location", "/")
+        location = "/" if action in {"create", "delete"} else f"/#{task_group_anchor(task_group_id)}"
+        self.send_header("Location", location)
         self.end_headers()
 
     def _handle_resources(self, storage: Storage, query: dict[str, list[str]]) -> None:
@@ -273,9 +277,17 @@ def layout(content: str) -> str:
     .board {{ display: grid; grid-template-columns: minmax(240px, 1fr) minmax(420px, 1.7fr) minmax(300px, 1.2fr); gap: 14px; align-items: start; }}
     .workbench {{ display: grid; grid-template-columns: minmax(260px, 1fr) minmax(420px, 1.5fr) minmax(260px, 1fr); gap: 14px; align-items: start; }}
     .task-group-box {{ border: 2px solid #c8d8df; border-radius: 10px; background: #ffffff; margin-top: 18px; overflow: hidden; }}
+    .task-group-box:target {{ border-color: #0d5c75; box-shadow: 0 0 0 3px rgba(13, 92, 117, .12); }}
     .task-group-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; background: #eef5f7; border-bottom: 1px solid #d6e3e8; }}
     .task-group-header h2 {{ margin: 0; }}
     .group-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; min-width: 320px; }}
+    .run-indicator {{ display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; color: #0b6b3a; font-weight: 700; }}
+    .run-dot {{ width: 9px; height: 9px; border-radius: 50%; background: #18a058; animation: pulse 1.2s ease-in-out infinite; }}
+    .pipeline-motion {{ height: 4px; max-width: 460px; margin-top: 8px; overflow: hidden; border-radius: 999px; background: #dce9ee; }}
+    .pipeline-motion span {{ display: block; width: 45%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, transparent, #0d5c75, transparent); animation: shimmer 1.4s linear infinite; }}
+    .latest-activity {{ margin-top: 6px; color: #41515c; font-size: 13px; }}
+    @keyframes pulse {{ 0%, 100% {{ transform: scale(.85); opacity: .55; }} 50% {{ transform: scale(1.25); opacity: 1; }} }}
+    @keyframes shimmer {{ 0% {{ transform: translateX(-110%); }} 100% {{ transform: translateX(240%); }} }}
     .task-group-body {{ padding: 14px; }}
     .group-records {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }}
     .group-record {{ border: 1px solid #dce2e8; border-radius: 7px; padding: 10px; background: #fbfcfd; }}
@@ -438,8 +450,8 @@ def task_group_board(storage: Storage, task_group: object, requirements: list[ob
     group_requirements = [item for item in requirements if task_group.task_group_id in item.task_group_ids]
     waiting = [item for item in group_requirements if item.status in waiting_statuses()]
     return (
-        "<section class='task-group-box'>"
-        + task_group_header(task_group, group_requirements)
+        f"<section class=\"task-group-box\" id=\"{html.escape(task_group_anchor(task_group.task_group_id))}\">"
+        + task_group_header(storage, task_group, group_requirements)
         + "<div class='task-group-body'>"
         + task_group_record_summary(storage, task_group, group_requirements)
         + "<section class='workbench'>"
@@ -450,14 +462,20 @@ def task_group_board(storage: Storage, task_group: object, requirements: list[ob
     )
 
 
-def task_group_header(task_group: object, requirements: list[object]) -> str:
+def task_group_header(storage: Storage, task_group: object, requirements: list[object]) -> str:
     status_class = " running" if task_group.status == TaskGroupStatus.RUNNING else ""
+    running = task_group.status == TaskGroupStatus.RUNNING
+    latest = latest_task_group_activity(storage, task_group)
+    run_indicator = "<span class='run-indicator'><span class='run-dot'></span>Running</span>" if running else ""
+    motion = "<div class='pipeline-motion'><span></span></div>" if running else ""
     return f"""
     <div class="task-group-header">
       <div>
         <h2>{html.escape(task_group.name)}</h2>
-        <div class="summary"><span class="status{status_class}">{html.escape(task_group.status.value)}</span> {html.escape(task_group.task_type.value)} | {len(requirements)} requirement(s)</div>
+        <div class="summary"><span class="status{status_class}">{html.escape(task_group.status.value)}</span>{run_indicator} {html.escape(task_group.task_type.value)} | {len(requirements)} requirement(s)</div>
         <div class="summary">{html.escape(task_group.description or 'No search description yet.')}</div>
+        <div class="latest-activity">Latest: {html.escape(latest)}</div>
+        {motion}
       </div>
       <div class="group-actions">
         <form action="/task"><input type="hidden" name="action" value="start"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button">Start</button></form>
@@ -479,12 +497,14 @@ def task_group_record_summary(storage: Storage, task_group: object, requirements
     rejected = [item for item in requirements if item.status in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}]
     runs = storage.list_task_group_runs(task_group.task_group_id, limit=1)
     last_run = runs[0].completed_at or runs[0].started_at if runs else "Never"
+    last_summary = runs[0].summary if runs else "No cycle has completed yet."
     records = [
         ("Possible", len(possible)),
         ("Queued", len(queue)),
         ("Researching", len(researching)),
         ("Rejected", len(rejected)),
         ("Last run", last_run),
+        ("Last cycle", last_summary),
     ]
     return (
         "<section class='group-records'>"
@@ -494,6 +514,15 @@ def task_group_record_summary(storage: Storage, task_group: object, requirements
         )
         + "</section>"
     )
+
+
+def latest_task_group_activity(storage: Storage, task_group: object) -> str:
+    logs = storage.list_experiment_logs(task_group_id=task_group.task_group_id, limit=1)
+    if logs:
+        return str(logs[0]["message"])
+    if task_group.status == TaskGroupStatus.RUNNING:
+        return "Waiting for first scheduler cycle."
+    return "No run yet."
 
 
 def task_group_search_panel(storage: Storage, task_group: object) -> str:
@@ -739,6 +768,10 @@ def waiting_statuses() -> set[RequirementStatus]:
 
 def visible_task_groups(storage: Storage) -> list[object]:
     return [item for item in storage.list_task_groups() if item.status != TaskGroupStatus.ARCHIVED]
+
+
+def task_group_anchor(task_group_id: str) -> str:
+    return "group-" + "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in task_group_id)
 
 
 def lineage_task_groups(storage: Storage, requirements: list[object]) -> list[object]:

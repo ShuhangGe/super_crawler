@@ -104,6 +104,7 @@ class SystemTests(unittest.TestCase):
 
             self.assertIn("Sports Search", html)
             self.assertIn("Search for sports organization workflow pain.", html)
+            self.assertIn(f'id="group-{task_group.task_group_id}"', html)
             self.assertIn('value="start"', html)
             self.assertIn('value="stop"', html)
             self.assertIn('value="delete"', html)
@@ -116,6 +117,15 @@ class SystemTests(unittest.TestCase):
             self.assertNotIn(">Samples<", html)
             self.assertNotIn("Pool Manager", html)
             self.assertNotIn("Change Detection", html)
+            self.assertIn("Latest: No run yet.", html)
+
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+            storage.log_experiment(task_group.task_group_id, "run-1", "scheduler", "run_completed", "Loaded 0 item(s)", {})
+            html = home_page(storage, controller)
+
+            self.assertIn("run-indicator", html)
+            self.assertIn("pipeline-motion", html)
+            self.assertIn("Latest: Loaded 0 item(s)", html)
 
     def test_runtime_saves_pipeline_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
