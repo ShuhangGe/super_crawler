@@ -106,8 +106,16 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Search for sports organization workflow pain.", html)
             self.assertIn('value="start"', html)
             self.assertIn('value="stop"', html)
-            self.assertIn('value="run-once"', html)
             self.assertIn('value="delete"', html)
+            self.assertIn("Details", html)
+            self.assertIn("Discovery Agents", html)
+            self.assertIn("Running Deep Research Agents", html)
+            self.assertNotIn('value="run-once"', html)
+            self.assertNotIn("Search Log", html)
+            self.assertNotIn("Run Logs", html)
+            self.assertNotIn(">Samples<", html)
+            self.assertNotIn("Pool Manager", html)
+            self.assertNotIn("Change Detection", html)
 
     def test_runtime_saves_pipeline_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

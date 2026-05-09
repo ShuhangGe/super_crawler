@@ -275,6 +275,7 @@ def layout(content: str) -> str:
     .task-group-box {{ border: 2px solid #c8d8df; border-radius: 10px; background: #ffffff; margin-top: 18px; overflow: hidden; }}
     .task-group-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; background: #eef5f7; border-bottom: 1px solid #d6e3e8; }}
     .task-group-header h2 {{ margin: 0; }}
+    .group-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-end; min-width: 320px; }}
     .task-group-body {{ padding: 14px; }}
     .group-records {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }}
     .group-record {{ border: 1px solid #dce2e8; border-radius: 7px; padding: 10px; background: #fbfcfd; }}
@@ -294,6 +295,7 @@ def layout(content: str) -> str:
     .button.stop {{ background: #b42318; }}
     .button.secondary {{ background: #52616b; }}
     .button.danger {{ background: #8a2d22; }}
+    .link-button {{ display: inline-block; text-decoration: none; }}
     .metric {{ font-size: 28px; font-weight: 700; }}
     table {{ width: 100%; border-collapse: collapse; background: white; border: 1px solid #dce2e8; }}
     th, td {{ padding: 10px; border-bottom: 1px solid #e6ebf0; text-align: left; vertical-align: top; }}
@@ -457,7 +459,11 @@ def task_group_header(task_group: object, requirements: list[object]) -> str:
         <div class="summary"><span class="status{status_class}">{html.escape(task_group.status.value)}</span> {html.escape(task_group.task_type.value)} | {len(requirements)} requirement(s)</div>
         <div class="summary">{html.escape(task_group.description or 'No search description yet.')}</div>
       </div>
-      <div class="linkbar">
+      <div class="group-actions">
+        <form action="/task"><input type="hidden" name="action" value="start"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button">Start</button></form>
+        <form action="/task"><input type="hidden" name="action" value="stop"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button stop">Stop</button></form>
+        <form action="/task"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button danger">Delete</button></form>
+        <a class="button link-button secondary" href="/experiment-log?task_group_id={html.escape(task_group.task_group_id)}">Details</a>
         <a href="/possible?task_group_id={html.escape(task_group.task_group_id)}">Possible</a>
         <a href="/rejected?task_group_id={html.escape(task_group.task_group_id)}">Rejected</a>
       </div>
@@ -492,10 +498,8 @@ def task_group_record_summary(storage: Storage, task_group: object, requirements
 
 def task_group_search_panel(storage: Storage, task_group: object) -> str:
     return (
-        "<section class='panel'><h2>Search Task Group</h2>"
-        + task_group_card(task_group)
-        + "<h3>Search Agent Logs</h3>"
-        + agent_cards(storage, ["discovery", "pool_manager", "change_detection"], task_group.task_group_id)
+        "<section class='panel'><h2>Discovery Agents</h2>"
+        + agent_cards(storage, ["discovery"], task_group.task_group_id)
         + "</section>"
     )
 
@@ -536,7 +540,7 @@ def task_group_deep_research_panel(storage: Storage, task_group: object, require
     return (
         "<section class='panel'><h2>Running Deep Research Agents</h2>"
         "<p class='muted'>Deep research agents consuming this task group's requirement queue.</p>"
-        + agent_cards(storage, ["deep_research", "report"], task_group.task_group_id)
+        + agent_cards(storage, ["deep_research"], task_group.task_group_id)
         + queue_text
         + "</section>"
     )
@@ -692,13 +696,10 @@ def task_group_card(task: object) -> str:
       <div class="actions">
         <form action="/task"><input type="hidden" name="action" value="start"><input type="hidden" name="id" value="{html.escape(task.task_group_id)}"><button class="button">Start</button></form>
         <form action="/task"><input type="hidden" name="action" value="stop"><input type="hidden" name="id" value="{html.escape(task.task_group_id)}"><button class="button stop">Stop</button></form>
-        <form action="/task"><input type="hidden" name="action" value="run-once"><input type="hidden" name="id" value="{html.escape(task.task_group_id)}"><button class="button secondary">Run Once</button></form>
         <form action="/task"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{html.escape(task.task_group_id)}"><button class="button danger">Delete</button></form>
       </div>
       <div class="linkbar">
-        <a href="/agent-log?role=discovery&ref={html.escape(task.task_group_id)}">Search Log</a>
-        <a href="/experiment-log?task_group_id={html.escape(task.task_group_id)}">Run Logs</a>
-        <a href="/requirement-samples?task_group_id={html.escape(task.task_group_id)}">Samples</a>
+        <a href="/experiment-log?task_group_id={html.escape(task.task_group_id)}">Details</a>
       </div>
     </div>
     """
