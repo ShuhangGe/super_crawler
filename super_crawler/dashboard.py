@@ -192,17 +192,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         task_group_id = query.get("id", [""])[0]
         if action == "create":
             task_type = TaskGroupType(query.get("type", [TaskGroupType.GENERAL.value])[0])
-            name = query.get("name", [""])[0].strip() or ("General Search" if task_type == TaskGroupType.GENERAL else "Domain Search")
+            name = query.get("name", [""])[0].strip() or "Search Group"
+            description = query.get("description", [""])[0].strip()
             domain = query.get("domain", [""])[0].strip() or None
             input_dir = query.get("input_dir", [""])[0].strip()
             if not input_dir:
-                folder = domain or name
+                folder = name
                 slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in folder).strip("_")
                 input_dir = f"data/task_inbox/{slug or 'general'}"
             subreddits = split_csv(query.get("subreddits", [""])[0])
             keywords = split_csv(query.get("keywords", [""])[0])
             negative_keywords = split_csv(query.get("negative_keywords", [""])[0])
-            storage.create_task_group(name, task_type, domain, input_dir, subreddits, keywords, negative_keywords)
+            storage.create_task_group(name, task_type, domain, input_dir, description, subreddits, keywords, negative_keywords)
         elif action == "start":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.RUNNING)
         elif action == "stop":
@@ -256,18 +257,24 @@ def layout(content: str) -> str:
     .task-group-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; background: #eef5f7; border-bottom: 1px solid #d6e3e8; }}
     .task-group-header h2 {{ margin: 0; }}
     .task-group-body {{ padding: 14px; }}
+    .group-records {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }}
+    .group-record {{ border: 1px solid #dce2e8; border-radius: 7px; padding: 10px; background: #fbfcfd; }}
+    .group-record-value {{ font-weight: 750; font-size: 17px; margin-top: 2px; overflow-wrap: anywhere; }}
     .panel {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; min-height: 260px; }}
     .item {{ display: block; padding: 10px; border: 1px solid #e4e9ee; border-radius: 7px; margin-bottom: 8px; color: inherit; text-decoration: none; background: #fbfcfd; }}
     .item:hover {{ border-color: #9eb8c4; background: #f1f6f8; }}
     .title {{ font-weight: 700; }}
     .summary {{ color: #52616b; font-size: 13px; margin-top: 4px; }}
     .controlbar {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; margin-bottom: 18px; }}
-    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-    input, select {{ border: 1px solid #cfd8df; border-radius: 6px; padding: 8px; min-height: 20px; }}
+    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
+    .stacked-form {{ display: grid; grid-template-columns: minmax(180px, 260px) minmax(280px, 1fr) auto; gap: 10px; align-items: start; }}
+    input, select, textarea {{ border: 1px solid #cfd8df; border-radius: 6px; padding: 8px; min-height: 20px; font: inherit; }}
+    textarea {{ min-height: 42px; resize: vertical; }}
     input[type="number"] {{ width: 80px; }}
     .button {{ border: 0; border-radius: 6px; padding: 9px 14px; color: white; background: #0d5c75; cursor: pointer; font-weight: 650; }}
     .button.stop {{ background: #b42318; }}
     .button.secondary {{ background: #52616b; }}
+    .button.danger {{ background: #8a2d22; }}
     .metric {{ font-size: 28px; font-weight: 700; }}
     table {{ width: 100%; border-collapse: collapse; background: white; border: 1px solid #dce2e8; }}
     th, td {{ padding: 10px; border-bottom: 1px solid #e6ebf0; text-align: left; vertical-align: top; }}
@@ -298,26 +305,11 @@ def layout(content: str) -> str:
 
 
 def home_page(storage: Storage, controller: RuntimeController) -> str:
-    counts = storage.dashboard_counts()
     requirements = storage.list_requirements()
-    by_status = {status.value: 0 for status in RequirementStatus}
-    for requirement in requirements:
-        by_status[requirement.status.value] = by_status.get(requirement.status.value, 0) + 1
     task_groups = visible_task_groups(storage)
-    cards = [
-        ("Possible requirements", len(possible_requirements(storage))),
-        ("Queued for research", counts["queued"]),
-        ("Currently researching", by_status.get("researching", 0)),
-        ("Validated requirements", by_status.get("validated", 0)),
-        ("Reopened requirements", by_status.get("reopened", 0)),
-        ("Rejected/noisy", by_status.get("rejected", 0)),
-    ]
     return (
         "<h1>Running Status</h1>"
         + resource_allocation_panel(storage)
-        + "<section class='grid'>"
-        + "".join(f"<div class='card'><div class='muted'>{label}</div><div class='metric'>{value}</div></div>" for label, value in cards)
-        + "</section>"
         + task_create_panel()
         + task_group_boards(storage, task_groups, requirements)
     )
@@ -402,7 +394,9 @@ def task_group_board(storage: Storage, task_group: object, requirements: list[ob
     return (
         "<section class='task-group-box'>"
         + task_group_header(task_group, group_requirements)
-        + "<div class='task-group-body'><section class='workbench'>"
+        + "<div class='task-group-body'>"
+        + task_group_record_summary(storage, task_group, group_requirements)
+        + "<section class='workbench'>"
         + task_group_search_panel(storage, task_group)
         + waiting_requirements_panel(waiting)
         + task_group_deep_research_panel(storage, task_group, group_requirements)
@@ -416,7 +410,8 @@ def task_group_header(task_group: object, requirements: list[object]) -> str:
     <div class="task-group-header">
       <div>
         <h2>{html.escape(task_group.name)}</h2>
-        <div class="summary"><span class="status{status_class}">{html.escape(task_group.status.value)}</span> {html.escape(task_group.task_type.value)} | {html.escape(task_group.domain or 'general')} | {len(requirements)} requirement(s)</div>
+        <div class="summary"><span class="status{status_class}">{html.escape(task_group.status.value)}</span> {html.escape(task_group.task_type.value)} | {len(requirements)} requirement(s)</div>
+        <div class="summary">{html.escape(task_group.description or 'No search description yet.')}</div>
       </div>
       <div class="linkbar">
         <a href="/possible?task_group_id={html.escape(task_group.task_group_id)}">Possible</a>
@@ -424,6 +419,31 @@ def task_group_header(task_group: object, requirements: list[object]) -> str:
       </div>
     </div>
     """
+
+
+def task_group_record_summary(storage: Storage, task_group: object, requirements: list[object]) -> str:
+    requirement_ids = {item.requirement_id for item in requirements}
+    queue = [row for row in storage.list_queue() if row["requirement_id"] in requirement_ids]
+    possible = [item for item in requirements if item.status not in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}]
+    researching = [item for item in requirements if item.status == RequirementStatus.RESEARCHING]
+    rejected = [item for item in requirements if item.status in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}]
+    runs = storage.list_task_group_runs(task_group.task_group_id, limit=1)
+    last_run = runs[0].completed_at or runs[0].started_at if runs else "Never"
+    records = [
+        ("Possible", len(possible)),
+        ("Queued", len(queue)),
+        ("Researching", len(researching)),
+        ("Rejected", len(rejected)),
+        ("Last run", last_run),
+    ]
+    return (
+        "<section class='group-records'>"
+        + "".join(
+            f"<div class='group-record'><div class='muted'>{html.escape(label)}</div><div class='group-record-value'>{html.escape(str(value))}</div></div>"
+            for label, value in records
+        )
+        + "</section>"
+    )
 
 
 def task_group_search_panel(storage: Storage, task_group: object) -> str:
@@ -603,41 +623,31 @@ def task_create_panel() -> str:
     return """
     <section class="card">
       <h2>Create Task Group</h2>
-      <form action="/task" class="actions">
+      <form action="/task" class="stacked-form">
         <input type="hidden" name="action" value="create">
-        <select name="type">
-          <option value="general_search">General Search Task</option>
-          <option value="domain_search">Domain Search Task</option>
-        </select>
-        <input name="name" placeholder="Task name">
-        <input name="domain" placeholder="Domain, e.g. pet care">
-        <input name="subreddits" placeholder="Subreddits comma-separated">
-        <input name="keywords" placeholder="Keywords comma-separated">
-        <input name="negative_keywords" placeholder="Negative keywords">
-        <input name="input_dir" placeholder="Input folder, optional">
+        <input name="name" placeholder="Group name">
+        <textarea name="description" placeholder="What are we planning to search?"></textarea>
         <button class="button">Create</button>
       </form>
-      <p class="muted">A task group reads JSON files from its input folder, tags every evidence item, and feeds requirements into the shared verification queue.</p>
     </section>
     """
 
 
 def task_group_card(task: object) -> str:
-    action = "stop" if task.status == TaskGroupStatus.RUNNING else "start"
-    action_label = "Stop" if task.status == TaskGroupStatus.RUNNING else "Start"
     status_class = " running" if task.status == TaskGroupStatus.RUNNING else ""
-    domain = f" | Domain: {html.escape(str(task.domain))}" if task.domain else ""
     return f"""
     <div class="item">
       <div class="title">{html.escape(task.name)}</div>
-      <div><span class="status{status_class}">{html.escape(task.status.value)}</span> {html.escape(task.task_type.value)}{domain}</div>
+      <div><span class="status{status_class}">{html.escape(task.status.value)}</span> {html.escape(task.task_type.value)}</div>
+      <div class="summary">{html.escape(task.description or 'No search description yet.')}</div>
       <div class="summary">Input: {html.escape(task.input_dir)}</div>
-      <div class="summary">Subreddits: {html.escape(', '.join(task.subreddits) or 'any')}</div>
-      <div class="summary">Keywords: {html.escape(', '.join(task.keywords) or 'default signal patterns')}</div>
+      <div class="actions">
+        <form action="/task"><input type="hidden" name="action" value="start"><input type="hidden" name="id" value="{html.escape(task.task_group_id)}"><button class="button">Start</button></form>
+        <form action="/task"><input type="hidden" name="action" value="stop"><input type="hidden" name="id" value="{html.escape(task.task_group_id)}"><button class="button stop">Stop</button></form>
+        <form action="/task"><input type="hidden" name="action" value="run-once"><input type="hidden" name="id" value="{html.escape(task.task_group_id)}"><button class="button secondary">Run Once</button></form>
+        <form action="/task"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{html.escape(task.task_group_id)}"><button class="button danger">Delete</button></form>
+      </div>
       <div class="linkbar">
-        <a href="/task?action={action}&id={html.escape(task.task_group_id)}">{action_label}</a>
-        <a href="/task?action=run-once&id={html.escape(task.task_group_id)}">Run Once</a>
-        <a href="/task?action=delete&id={html.escape(task.task_group_id)}">Delete</a>
         <a href="/agent-log?role=discovery&ref={html.escape(task.task_group_id)}">Search Log</a>
         <a href="/experiment-log?task_group_id={html.escape(task.task_group_id)}">Run Logs</a>
         <a href="/requirement-samples?task_group_id={html.escape(task.task_group_id)}">Samples</a>

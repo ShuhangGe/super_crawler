@@ -170,6 +170,7 @@ class Storage:
                 task_type TEXT NOT NULL,
                 status TEXT NOT NULL,
                 domain TEXT,
+                description TEXT NOT NULL DEFAULT '',
                 input_dir TEXT NOT NULL,
                 subreddits TEXT NOT NULL,
                 keywords TEXT NOT NULL,
@@ -242,6 +243,7 @@ class Storage:
         self._ensure_column("candidate_requirements", "task_group_run_id", "TEXT")
         self._ensure_column("requirements", "task_group_ids", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column("requirements", "task_group_run_ids", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("task_groups", "description", "TEXT NOT NULL DEFAULT ''")
         self._ensure_default_resource_config()
         self.conn.commit()
 
@@ -581,6 +583,7 @@ class Storage:
         task_type: TaskGroupType,
         domain: str | None,
         input_dir: str,
+        description: str = "",
         subreddits: list[str] | None = None,
         keywords: list[str] | None = None,
         negative_keywords: list[str] | None = None,
@@ -594,6 +597,7 @@ class Storage:
             task_type=task_type,
             status=TaskGroupStatus.STOPPED,
             domain=domain,
+            description=description,
             input_dir=input_dir,
             subreddits=subreddits or [],
             keywords=keywords or [],

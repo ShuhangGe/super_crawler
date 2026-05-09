@@ -75,8 +75,28 @@ class SystemTests(unittest.TestCase):
 
             self.assertIn("Global Resource Allocation", html)
             self.assertIn("Create Task Group", html)
+            self.assertIn("Group name", html)
+            self.assertIn("What are we planning to search?", html)
+            self.assertNotIn("Possible requirements", html)
+            self.assertNotIn("Queued for research", html)
             self.assertNotIn("Agent Runtime", html)
             self.assertNotIn('action="/runtime"', html)
+
+            task_group = storage.create_task_group(
+                name="Sports Search",
+                task_type=TaskGroupType.GENERAL,
+                domain=None,
+                input_dir=str(Path(directory) / "sports"),
+                description="Search for sports organization workflow pain.",
+            )
+            html = home_page(storage, controller)
+
+            self.assertIn("Sports Search", html)
+            self.assertIn("Search for sports organization workflow pain.", html)
+            self.assertIn('value="start"', html)
+            self.assertIn('value="stop"', html)
+            self.assertIn('value="run-once"', html)
+            self.assertIn('value="delete"', html)
 
     def test_runtime_saves_pipeline_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

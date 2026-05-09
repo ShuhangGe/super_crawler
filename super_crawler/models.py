@@ -153,6 +153,7 @@ class TaskGroup:
     task_type: TaskGroupType
     status: TaskGroupStatus
     domain: str | None
+    description: str
     input_dir: str
     subreddits: list[str]
     keywords: list[str]
