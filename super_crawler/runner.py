@@ -4,7 +4,7 @@ import json
 import time
 from pathlib import Path
 
-from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, PoolManagerAgent
+from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, one_sentence_requirement
 from .models import TaskGroup, TaskGroupRun, TaskGroupStatus, TaskGroupType, utc_now
 from .storage import Storage
 
@@ -86,15 +86,109 @@ class AlwaysOnRunner:
     def _run_search_task_group(self, task_group: TaskGroup) -> dict[str, int | str | None]:
         started_at = utc_now()
         task_group_run_id = f"tgr_{task_group.task_group_id}_{started_at.replace('-', '').replace(':', '').replace('+', 'Z')}"
-        items = [tag_task_item(item, task_group, task_group_run_id) for item in load_json_items(task_group.input_dir)]
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "scheduler",
+            "task_group_started",
+            f"Task group {task_group.name} started",
+            {"task_group_name": task_group.name, "input_dir": task_group.input_dir},
+        )
+        scan = load_json_items_with_report(task_group.input_dir)
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "scheduler",
+            "input_folder_scanned",
+            f"Scanned input folder {task_group.input_dir}",
+            {"input_dir": task_group.input_dir, "files": scan["files"]},
+        )
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "scheduler",
+            "files_read",
+            f"Read {len(scan['files'])} JSON file(s)",
+            {"files": scan["files"]},
+        )
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "scheduler",
+            "input_loaded",
+            f"Loaded {len(scan['items'])} item(s) from {task_group.input_dir}",
+            {"items_loaded": len(scan["items"]), "items_skipped": scan["items_skipped"]},
+        )
+        if scan["items_skipped"]:
+            self.storage.log_experiment(
+                task_group.task_group_id,
+                task_group_run_id,
+                "scheduler",
+                "items_skipped",
+                f"Skipped {scan['items_skipped']} invalid item(s)",
+                {"skipped": scan["skipped"]},
+            )
+
+        items = [tag_task_item(item, task_group, task_group_run_id) for item in scan["items"]]
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "discovery",
+            "discovery_started",
+            f"Discovery started for {task_group.name}",
+            {"items_loaded": len(items)},
+        )
         candidates = DiscoveryAgent(self.storage, f"discovery-{task_group.task_group_id}").ingest_reddit_items(
             items,
             task_group_id=task_group.task_group_id,
             task_group_run_id=task_group_run_id,
         )
+        candidate_titles = [candidate.requirement_title for candidate in candidates]
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "discovery",
+            "candidates_generated",
+            f"Generated {len(candidates)} candidate requirement(s)",
+            {"candidate_titles": candidate_titles},
+        )
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "pool_manager",
+            "pool_manager_started",
+            f"Pool manager started for {task_group.name}",
+            {"candidate_ids": [candidate.candidate_id for candidate in candidates]},
+        )
         changed = PoolManagerAgent(self.storage, "pool-manager").reconcile_candidates()
         queued = len([item for item in changed if item.task_group_ids and task_group.task_group_id in item.task_group_ids])
         rejected = len([item for item in changed if item.status.value in {"rejected", "archived"}])
+        group_changed = [item for item in changed if task_group.task_group_id in item.task_group_ids]
+        requirement_sentences = [one_sentence_requirement(item) for item in group_changed]
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "pool_manager",
+            "requirements_generated",
+            f"Generated or updated {len(group_changed)} requirement(s)",
+            {"requirement_ids": [item.requirement_id for item in group_changed]},
+        )
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "pool_manager",
+            "pool_requirement_sample",
+            f"Pool manager generated {len(requirement_sentences)} one-sentence requirement(s)",
+            {"requirements": requirement_sentences},
+        )
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "pool_manager",
+            "requirements_queued",
+            f"Queued {queued} requirement(s) for deep research",
+            {"queued": queued},
+        )
         completed_at = utc_now()
         summary = (
             f"{task_group.name}: loaded {len(items)} item(s), created {len(candidates)} candidate(s), "
@@ -115,6 +209,20 @@ class AlwaysOnRunner:
                 summary=summary,
             )
         )
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "scheduler",
+            "run_completed",
+            summary,
+            {
+                "items_loaded": len(items),
+                "candidates": len(candidates),
+                "requirements_changed": len(changed),
+                "requirements_queued": queued,
+                "requirements_rejected": rejected,
+            },
+        )
         return {
             "items_loaded": len(items),
             "candidates": len(candidates),
@@ -124,15 +232,26 @@ class AlwaysOnRunner:
 
 
 def load_json_items(input_dir: str | Path) -> list[dict]:
+    return list(load_json_items_with_report(input_dir)["items"])
+
+
+def load_json_items_with_report(input_dir: str | Path) -> dict[str, object]:
     directory = Path(input_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    items = []
+    items: list[dict] = []
+    files: list[str] = []
+    skipped: list[dict[str, str]] = []
     for path in sorted(directory.glob("*.json")):
+        files.append(str(path))
         loaded = json.loads(path.read_text())
         if not isinstance(loaded, list):
             raise ValueError(f"{path} must contain a JSON array")
-        items.extend(loaded)
-    return items
+        for index, item in enumerate(loaded):
+            if isinstance(item, dict):
+                items.append(item)
+            else:
+                skipped.append({"file": str(path), "index": str(index), "reason": "item is not an object"})
+    return {"items": items, "files": files, "items_skipped": len(skipped), "skipped": skipped}
 
 
 def tag_task_item(item: dict, task_group: TaskGroup, task_group_run_id: str) -> dict:

@@ -58,10 +58,13 @@ class SystemTests(unittest.TestCase):
                     "pipeline_runs",
                     "task_groups",
                     "task_group_runs",
+                    "experiment_logs",
+                    "requirement_samples",
+                    "requirement_events",
                 },
             )
 
-    def test_home_page_includes_runtime_controls(self) -> None:
+    def test_home_page_uses_group_controls_without_global_runtime_controls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
             storage = Storage(db_path)
@@ -70,11 +73,10 @@ class SystemTests(unittest.TestCase):
 
             html = home_page(storage, controller)
 
-            self.assertIn("Agent Runtime", html)
             self.assertIn("Global Resource Allocation", html)
-            self.assertIn("Start", html)
-            self.assertIn("Stop", html)
             self.assertIn("Create Task Group", html)
+            self.assertNotIn("Agent Runtime", html)
+            self.assertNotIn('action="/runtime"', html)
 
     def test_runtime_saves_pipeline_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -117,10 +119,19 @@ class SystemTests(unittest.TestCase):
             controller = RuntimeController(db_path, input_dir=Path(directory) / "unused", interval_seconds=1)
             result = controller.run_once()
             requirements = Storage(db_path).list_requirements()
+            storage = Storage(db_path)
+            experiment_logs = storage.list_experiment_logs(task_group_id=task_group.task_group_id)
+            samples = storage.list_requirement_samples(task_group_id=task_group.task_group_id)
 
             self.assertEqual(result["task_group_runs"], 1)
             self.assertTrue(requirements)
             self.assertTrue(any(task_group.task_group_id in requirement.task_group_ids for requirement in requirements))
+            self.assertTrue(any(item["step_name"] == "task_group_started" for item in experiment_logs))
+            self.assertTrue(any(item["step_name"] == "pool_requirement_sample" for item in experiment_logs))
+            self.assertTrue(samples)
+            self.assertTrue(samples[0]["requirement_sentence"].endswith("."))
+            events = storage.list_requirement_events(samples[0]["requirement_id"])
+            self.assertTrue(events)
 
     def test_archived_task_group_hidden_on_page_one_but_kept_for_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -198,6 +198,42 @@ class Storage:
                 value INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS experiment_logs (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_group_id TEXT,
+                task_group_run_id TEXT,
+                agent_role TEXT NOT NULL,
+                step_name TEXT NOT NULL,
+                message TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS requirement_samples (
+                sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_group_id TEXT,
+                task_group_run_id TEXT,
+                requirement_id TEXT NOT NULL,
+                requirement_sentence TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(requirement_id) REFERENCES requirements(requirement_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS requirement_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requirement_id TEXT NOT NULL,
+                task_group_id TEXT,
+                task_group_run_id TEXT,
+                agent_id TEXT,
+                agent_role TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(requirement_id) REFERENCES requirements(requirement_id)
+            );
             """
         )
         self._ensure_column("raw_evidence", "task_group_id", "TEXT")
@@ -234,6 +270,95 @@ class Storage:
         self.conn.execute(
             f"INSERT INTO agent_activity_logs ({columns}) VALUES ({placeholders})",
             list(data.values()),
+        )
+        self.conn.commit()
+
+    def log_experiment(
+        self,
+        task_group_id: str | None,
+        task_group_run_id: str | None,
+        agent_role: str,
+        step_name: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO experiment_logs (
+                task_group_id, task_group_run_id, agent_role, step_name,
+                message, payload_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_group_id,
+                task_group_run_id,
+                agent_role,
+                step_name,
+                message,
+                json.dumps(payload or {}, sort_keys=True),
+                utc_now(),
+            ),
+        )
+        self.conn.commit()
+
+    def save_requirement_sample(
+        self,
+        task_group_id: str | None,
+        task_group_run_id: str | None,
+        requirement_id: str,
+        requirement_sentence: str,
+        status: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO requirement_samples (
+                task_group_id, task_group_run_id, requirement_id,
+                requirement_sentence, status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_group_id,
+                task_group_run_id,
+                requirement_id,
+                requirement_sentence.strip(),
+                status,
+                utc_now(),
+            ),
+        )
+        self.conn.commit()
+
+    def log_requirement_event(
+        self,
+        requirement_id: str,
+        task_group_id: str | None,
+        task_group_run_id: str | None,
+        agent_id: str | None,
+        agent_role: str,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO requirement_events (
+                requirement_id, task_group_id, task_group_run_id,
+                agent_id, agent_role, event_type, message, payload_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                requirement_id,
+                task_group_id,
+                task_group_run_id,
+                agent_id,
+                agent_role,
+                event_type,
+                message,
+                json.dumps(payload or {}, sort_keys=True),
+                utc_now(),
+            ),
         )
         self.conn.commit()
 
@@ -317,6 +442,16 @@ class Storage:
         requirement.status = status
         requirement.decision_history.append({"at": utc_now(), "decision": status.value, "reason": reason})
         self.upsert_requirement(requirement)
+        self.log_requirement_event(
+            requirement_id,
+            requirement.task_group_ids[-1] if requirement.task_group_ids else None,
+            requirement.task_group_run_ids[-1] if requirement.task_group_run_ids else None,
+            None,
+            "human",
+            "status_changed",
+            f"Requirement status changed to {status.value}: {reason}",
+            {"status": status.value, "reason": reason},
+        )
 
     def merge_requirements(self, source_id: str, target_id: str) -> RequirementRecord:
         source = self.get_requirement(source_id)
@@ -398,6 +533,9 @@ class Storage:
             "pipeline_runs": self._count("pipeline_runs"),
             "task_groups": self._count("task_groups"),
             "task_group_runs": self._count("task_group_runs"),
+            "experiment_logs": self._count("experiment_logs"),
+            "requirement_samples": self._count("requirement_samples"),
+            "requirement_events": self._count("requirement_events"),
         }
 
     def get_resource_config(self) -> dict[str, int]:
@@ -502,6 +640,84 @@ class Storage:
             item["output_refs"] = json.loads(item["output_refs"])
             result.append(item)
         return result
+
+    def list_experiment_logs(
+        self,
+        task_group_id: str | None = None,
+        task_group_run_id: str | None = None,
+        agent_role: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if task_group_id:
+            clauses.append("task_group_id = ?")
+            params.append(task_group_id)
+        if task_group_run_id:
+            clauses.append("task_group_run_id = ?")
+            params.append(task_group_run_id)
+        if agent_role:
+            clauses.append("agent_role = ?")
+            params.append(agent_role)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT log_id, task_group_id, task_group_run_id, agent_role,
+                   step_name, message, payload_json, created_at
+            FROM experiment_logs
+            {where}
+            ORDER BY log_id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [self._decode_json_column(dict(row), "payload_json") for row in rows]
+
+    def list_requirement_samples(
+        self,
+        task_group_id: str | None = None,
+        task_group_run_id: str | None = None,
+        requirement_id: str | None = None,
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if task_group_id:
+            clauses.append("task_group_id = ?")
+            params.append(task_group_id)
+        if task_group_run_id:
+            clauses.append("task_group_run_id = ?")
+            params.append(task_group_run_id)
+        if requirement_id:
+            clauses.append("requirement_id = ?")
+            params.append(requirement_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT sample_id, task_group_id, task_group_run_id, requirement_id,
+                   requirement_sentence, status, created_at
+            FROM requirement_samples
+            {where}
+            ORDER BY sample_id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_requirement_events(self, requirement_id: str, limit: int = 300) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT event_id, requirement_id, task_group_id, task_group_run_id,
+                   agent_id, agent_role, event_type, message, payload_json, created_at
+            FROM requirement_events
+            WHERE requirement_id=?
+            ORDER BY event_id ASC
+            LIMIT ?
+            """,
+            (requirement_id, limit),
+        ).fetchall()
+        return [self._decode_json_column(dict(row), "payload_json") for row in rows]
 
     def list_agent_logs(self, agent_role: str | None = None, agent_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         clauses = []
@@ -704,3 +920,7 @@ class Storage:
             if field.name == "task_type" and data.get(field.name) is not None:
                 data[field.name] = TaskGroupType(data[field.name])
         return model(**{field.name: data[field.name] for field in fields(model)})
+
+    def _decode_json_column(self, row: dict[str, Any], key: str) -> dict[str, Any]:
+        row[key] = json.loads(row[key]) if row.get(key) else {}
+        return row

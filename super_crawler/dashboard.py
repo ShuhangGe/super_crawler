@@ -86,6 +86,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             query.get("ref", [""])[0],
                         )
                     )
+                elif parsed.path == "/experiment-log":
+                    query = parse_qs(parsed.query)
+                    self._html(
+                        experiment_log_page(
+                            storage,
+                            query.get("task_group_id", [""])[0],
+                            query.get("task_group_run_id", [""])[0],
+                            query.get("agent_role", [""])[0],
+                        )
+                    )
+                elif parsed.path == "/requirement-samples":
+                    query = parse_qs(parsed.query)
+                    self._html(
+                        requirement_samples_page(
+                            storage,
+                            query.get("task_group_id", [""])[0],
+                            query.get("task_group_run_id", [""])[0],
+                            query.get("requirement_id", [""])[0],
+                        )
+                    )
                 elif parsed.path == "/pipeline":
                     pipeline_run_id = parse_qs(parsed.query).get("id", [""])[0]
                     self._html(pipeline_page(storage, pipeline_run_id))
@@ -279,7 +299,6 @@ def layout(content: str) -> str:
 
 def home_page(storage: Storage, controller: RuntimeController) -> str:
     counts = storage.dashboard_counts()
-    runtime = controller.status()
     requirements = storage.list_requirements()
     by_status = {status.value: 0 for status in RequirementStatus}
     for requirement in requirements:
@@ -295,7 +314,6 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     ]
     return (
         "<h1>Running Status</h1>"
-        + runtime_controls(runtime)
         + resource_allocation_panel(storage)
         + "<section class='grid'>"
         + "".join(f"<div class='card'><div class='muted'>{label}</div><div class='metric'>{value}</div></div>" for label, value in cards)
@@ -621,6 +639,8 @@ def task_group_card(task: object) -> str:
         <a href="/task?action=run-once&id={html.escape(task.task_group_id)}">Run Once</a>
         <a href="/task?action=delete&id={html.escape(task.task_group_id)}">Delete</a>
         <a href="/agent-log?role=discovery&ref={html.escape(task.task_group_id)}">Search Log</a>
+        <a href="/experiment-log?task_group_id={html.escape(task.task_group_id)}">Run Logs</a>
+        <a href="/requirement-samples?task_group_id={html.escape(task.task_group_id)}">Samples</a>
       </div>
     </div>
     """
@@ -759,6 +779,8 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
         return "<h1>Requirement not found</h1>"
     evidence = storage.list_evidence(requirement.evidence_ids)
     runs = storage.list_research_runs(requirement_id)
+    events = storage.list_requirement_events(requirement_id)
+    samples = storage.list_requirement_samples(requirement_id=requirement_id, limit=20)
     evidence_rows = "".join(
         f"<li>{html.escape(item.subreddit)}: <a href='{html.escape(item.source_url)}'>{html.escape(item.title)}</a></li>"
         for item in evidence
@@ -775,6 +797,28 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
         """
         for run in runs
     )
+    event_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(event['created_at']))}</td>
+          <td>{html.escape(str(event['agent_role']))}</td>
+          <td>{html.escape(str(event['event_type']))}</td>
+          <td>{html.escape(str(event['message']))}</td>
+        </tr>
+        """
+        for event in events
+    ) or "<tr><td colspan='4' class='muted'>No workflow events recorded yet.</td></tr>"
+    sample_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(sample['created_at']))}</td>
+          <td>{html.escape(str(sample['requirement_sentence']))}</td>
+          <td>{html.escape(str(sample['status']))}</td>
+          <td>{html.escape(str(sample['task_group_run_id'] or ''))}</td>
+        </tr>
+        """
+        for sample in samples
+    ) or "<tr><td colspan='4' class='muted'>No sample sentence recorded yet.</td></tr>"
     report = ""
     if latest:
         findings = latest.findings
@@ -789,8 +833,9 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
     <h1>{html.escape(requirement.canonical_requirement)}</h1>
     <p><span class="status">{requirement.status.value}</span> Score: {requirement.current_scores.get('overall_score', 0)}</p>
     <div class="linkbar">
-      <a href="/agent-log?role=discovery">Requirement Search Agent Log</a>
-      <a href="/agent-log?role=deep_research">Deep Research Agent Log</a>
+      <a href="/agent-log?role=discovery&ref={html.escape(requirement.requirement_id)}">Requirement Search Agent Log</a>
+      <a href="/agent-log?role=deep_research&ref={html.escape(requirement.requirement_id)}">Deep Research Agent Log</a>
+      <a href="/requirement-samples?requirement_id={html.escape(requirement.requirement_id)}">Pool Samples</a>
       <a href="/possible">Back to Possible Requirements</a>
       <a href="/rejected">Back to Rejected Requirements</a>
     </div>
@@ -811,6 +856,10 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
     <ul>{evidence_rows}</ul>
     <h2>Decision History</h2>
     <pre>{html.escape(json.dumps(requirement.decision_history, indent=2))}</pre>
+    <h2>Workflow Timeline</h2>
+    <table><thead><tr><th>Time</th><th>Agent</th><th>Event</th><th>Message</th></tr></thead><tbody>{event_rows}</tbody></table>
+    <h2>Pool Manager Sample Sentences</h2>
+    <table><thead><tr><th>Time</th><th>Sample</th><th>Status</th><th>Task Group Run</th></tr></thead><tbody>{sample_rows}</tbody></table>
     <h2>Research History</h2>
     <table><thead><tr><th>Run</th><th>Agent</th><th>Completed</th><th>Recommendation</th></tr></thead><tbody>{run_rows}</tbody></table>
     <h2>Change Since Last Research</h2>
@@ -821,13 +870,22 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
 
 def agent_log_page(storage: Storage, role: str, agent_id: str, ref: str = "") -> str:
     logs = storage.list_agent_logs(agent_role=role or None, agent_id=agent_id or None, limit=200)
+    experiment_logs = []
     if ref:
+        related_refs = {ref}
+        requirement = storage.get_requirement(ref)
+        if requirement:
+            related_refs.update(requirement.evidence_ids)
+            related_refs.update(requirement.research_history)
+            related_refs.update(requirement.task_group_ids)
+            related_refs.update(requirement.task_group_run_ids)
         filtered = []
         for item in logs:
             refs = {str(value) for value in item["input_refs"] + item["output_refs"]}
-            if ref in refs:
+            if related_refs & refs:
                 filtered.append(item)
         logs = filtered
+        experiment_logs = storage.list_experiment_logs(task_group_id=ref, agent_role=role or None, limit=100)
     title = role.replace("_", " ").title() if role else agent_id or "Agent"
     rows = "".join(
         f"""
@@ -843,16 +901,102 @@ def agent_log_page(storage: Storage, role: str, agent_id: str, ref: str = "") ->
         """
         for item in logs
     )
+    experiment_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item['log_id']))}</td>
+          <td>{html.escape(str(item['created_at']))}</td>
+          <td>{html.escape(str(item['agent_role']))}</td>
+          <td>{html.escape(str(item['step_name']))}</td>
+          <td>{html.escape(str(item['message']))}</td>
+        </tr>
+        """
+        for item in experiment_logs
+    )
     full_logs = html.escape(json.dumps(logs, indent=2, default=str))
+    full_experiment_logs = html.escape(json.dumps(experiment_logs, indent=2, default=str))
     ref_text = f" Related to {ref}." if ref else ""
-    summary = f"{len(logs)} log event(s). Latest status: {logs[0]['status'] if logs else 'none'}.{ref_text}"
+    summary = f"{len(logs)} activity log event(s), {len(experiment_logs)} experiment log event(s). Latest status: {logs[0]['status'] if logs else 'none'}.{ref_text}"
     return f"""
     <h1>{html.escape(title)} Log</h1>
     <p class="muted">{html.escape(summary)}</p>
     <div class="linkbar"><a href="/">Running Status</a><a href="/possible">Possible Requirements</a><a href="/rejected">Rejected Requirements</a></div>
     <table><thead><tr><th>ID</th><th>Time</th><th>Role</th><th>Agent</th><th>Task</th><th>Status</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>
+    <h2>Experiment Steps</h2>
+    <table><thead><tr><th>ID</th><th>Time</th><th>Role</th><th>Step</th><th>Message</th></tr></thead><tbody>{experiment_rows or "<tr><td colspan='5' class='muted'>No experiment steps for this filter.</td></tr>"}</tbody></table>
     <h2>Full Log Payload</h2>
     <pre>{full_logs}</pre>
+    <h2>Full Experiment Payload</h2>
+    <pre>{full_experiment_logs}</pre>
+    """
+
+
+def experiment_log_page(storage: Storage, task_group_id: str = "", task_group_run_id: str = "", agent_role: str = "") -> str:
+    logs = storage.list_experiment_logs(
+        task_group_id=task_group_id or None,
+        task_group_run_id=task_group_run_id or None,
+        agent_role=agent_role or None,
+        limit=500,
+    )
+    title_parts = ["Experiment Logs"]
+    if task_group_id:
+        task = storage.get_task_group(task_group_id)
+        title_parts.append(task.name if task else task_group_id)
+    if agent_role:
+        title_parts.append(agent_role.replace("_", " ").title())
+    rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item['created_at']))}</td>
+          <td>{html.escape(str(item['agent_role']))}</td>
+          <td>{html.escape(str(item['step_name']))}</td>
+          <td>{html.escape(str(item['message']))}</td>
+          <td><pre>{html.escape(json.dumps(item['payload_json'], indent=2, default=str))}</pre></td>
+        </tr>
+        """
+        for item in logs
+    ) or "<tr><td colspan='5' class='muted'>No experiment logs yet.</td></tr>"
+    return f"""
+    <h1>{html.escape(' - '.join(title_parts))}</h1>
+    <div class="linkbar"><a href="/">Running Status</a><a href="/possible">Possible Requirements</a><a href="/rejected">Rejected Requirements</a></div>
+    <table><thead><tr><th>Time</th><th>Agent</th><th>Step</th><th>Message</th><th>Payload</th></tr></thead><tbody>{rows}</tbody></table>
+    """
+
+
+def requirement_samples_page(
+    storage: Storage,
+    task_group_id: str = "",
+    task_group_run_id: str = "",
+    requirement_id: str = "",
+) -> str:
+    samples = storage.list_requirement_samples(
+        task_group_id=task_group_id or None,
+        task_group_run_id=task_group_run_id or None,
+        requirement_id=requirement_id or None,
+        limit=500,
+    )
+    title = "Requirement Samples"
+    if task_group_id:
+        task = storage.get_task_group(task_group_id)
+        title += f" - {task.name if task else task_group_id}"
+    rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item['created_at']))}</td>
+          <td><a href="/requirement?id={html.escape(str(item['requirement_id']))}">{html.escape(str(item['requirement_id']))}</a></td>
+          <td>{html.escape(str(item['requirement_sentence']))}</td>
+          <td>{html.escape(str(item['status']))}</td>
+          <td>{html.escape(str(item['task_group_id'] or ''))}</td>
+          <td>{html.escape(str(item['task_group_run_id'] or ''))}</td>
+        </tr>
+        """
+        for item in samples
+    ) or "<tr><td colspan='6' class='muted'>No requirement samples yet.</td></tr>"
+    return f"""
+    <h1>{html.escape(title)}</h1>
+    <p class="muted">One short sentence for every requirement generated or updated by the pool manager.</p>
+    <div class="linkbar"><a href="/">Running Status</a><a href="/possible">Possible Requirements</a><a href="/rejected">Rejected Requirements</a></div>
+    <table><thead><tr><th>Time</th><th>Requirement</th><th>Sample</th><th>Status</th><th>Task Group</th><th>Run</th></tr></thead><tbody>{rows}</tbody></table>
     """
 
 

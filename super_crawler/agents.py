@@ -163,13 +163,38 @@ class PoolManagerAgent(BaseAgent):
             if match:
                 record = self._merge_candidate(match, candidate)
                 candidate.status = RequirementStatus.DUPLICATE_CANDIDATE
+                event_type = "pool_merged_candidate"
+                event_message = f"Pool manager merged candidate into {record.requirement_id}"
             else:
                 record = self._create_requirement(candidate)
                 requirements.append(record)
+                event_type = "pool_created_requirement"
+                event_message = f"Pool manager created requirement {record.requirement_id}"
 
             record = self._prioritize(record)
             self.storage.upsert_requirement(record)
             self.storage.upsert_candidate(candidate)
+            self.storage.save_requirement_sample(
+                candidate.task_group_id,
+                candidate.task_group_run_id,
+                record.requirement_id,
+                one_sentence_requirement(record),
+                record.status.value,
+            )
+            self.storage.log_requirement_event(
+                record.requirement_id,
+                candidate.task_group_id,
+                candidate.task_group_run_id,
+                self.agent_id,
+                self.role,
+                event_type,
+                event_message,
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "requirement_sentence": one_sentence_requirement(record),
+                    "status": record.status.value,
+                },
+            )
             if record.status in {RequirementStatus.QUEUED_FOR_RESEARCH, RequirementStatus.REOPENED}:
                 self.storage.enqueue_research(
                     requirement_id=record.requirement_id,
@@ -177,6 +202,19 @@ class PoolManagerAgent(BaseAgent):
                     reason=self._queue_reason(record),
                     new_evidence_count=len(candidate.evidence_ids),
                     previous_research_status=record.latest_recommendation,
+                )
+                self.storage.log_requirement_event(
+                    record.requirement_id,
+                    candidate.task_group_id,
+                    candidate.task_group_run_id,
+                    self.agent_id,
+                    self.role,
+                    "queued_for_deep_research",
+                    f"Pool manager queued {record.requirement_id} for deep research",
+                    {
+                        "priority": int(record.current_scores["overall_score"]),
+                        "reason": self._queue_reason(record),
+                    },
                 )
             changed.append(record)
 
@@ -320,6 +358,27 @@ class DeepResearchAgent(BaseAgent):
         requirement.status = RequirementStatus.RESEARCHING
         requirement.assigned_to = self.agent_id
         self.storage.upsert_requirement(requirement)
+        task_group_id = requirement.task_group_ids[-1] if requirement.task_group_ids else None
+        task_group_run_id = requirement.task_group_run_ids[-1] if requirement.task_group_run_ids else None
+        self.storage.log_requirement_event(
+            requirement.requirement_id,
+            task_group_id,
+            task_group_run_id,
+            self.agent_id,
+            self.role,
+            "deep_research_started",
+            f"Deep research started for {requirement.requirement_id}",
+            {"evidence_ids": requirement.evidence_ids},
+        )
+        if task_group_id or task_group_run_id:
+            self.storage.log_experiment(
+                task_group_id,
+                task_group_run_id,
+                self.role,
+                "deep_research_started",
+                f"Deep research started for {requirement.requirement_id}",
+                {"requirement_id": requirement.requirement_id, "agent_id": self.agent_id},
+            )
 
         evidence = self.storage.list_evidence(requirement.evidence_ids)
         scores = score_requirement(requirement, evidence)
@@ -377,6 +436,35 @@ class DeepResearchAgent(BaseAgent):
         requirement.decision_history.append({"at": utc_now(), "decision": requirement.status.value, "research_run": run_id})
         self.storage.upsert_requirement(requirement)
         self.storage.dequeue_research(requirement.requirement_id)
+        self.storage.log_requirement_event(
+            requirement.requirement_id,
+            task_group_id,
+            task_group_run_id,
+            self.agent_id,
+            self.role,
+            "deep_research_completed",
+            f"Deep research completed for {requirement.requirement_id}: {recommendation}",
+            {
+                "research_run_id": run.research_run_id,
+                "recommendation": recommendation,
+                "status": requirement.status.value,
+                "scores": scores,
+            },
+        )
+        if task_group_id or task_group_run_id:
+            self.storage.log_experiment(
+                task_group_id,
+                task_group_run_id,
+                self.role,
+                "deep_research_output",
+                f"Deep research output for {requirement.requirement_id}: {recommendation}",
+                {
+                    "requirement_id": requirement.requirement_id,
+                    "research_run_id": run.research_run_id,
+                    "recommendation": recommendation,
+                    "status": requirement.status.value,
+                },
+            )
         self.log("run_next", "completed", [requirement.requirement_id], [run.research_run_id])
         return run
 
@@ -497,6 +585,13 @@ def score_label(score: float) -> str:
     if score >= 35:
         return SignalLabel.WATCH.value
     return SignalLabel.WEAK.value
+
+
+def one_sentence_requirement(requirement: RequirementRecord) -> str:
+    sentence = " ".join(requirement.canonical_requirement.split())
+    if not sentence.endswith((".", "!", "?")):
+        sentence += "."
+    return sentence[:240]
 
 
 def detect_change(requirement: RequirementRecord) -> dict[str, Any]:
