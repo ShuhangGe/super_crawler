@@ -121,11 +121,17 @@ class SystemTests(unittest.TestCase):
 
             storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
             storage.log_experiment(task_group.task_group_id, "run-1", "scheduler", "run_completed", "Loaded 0 item(s)", {})
+            storage.log_experiment(task_group.task_group_id, "run-1", "collector", "collector_skipped", "Reddit OpenCLI collector is disabled", {"collector_enabled": "0"})
+            storage.log_experiment(task_group.task_group_id, "run-1", "scheduler", "files_read", "Read 0 JSON file(s)", {"files": []})
+            storage.log_experiment(task_group.task_group_id, "run-1", "scheduler", "input_loaded", "Loaded 0 item(s)", {"items_loaded": 0, "items_skipped": 0})
             html = home_page(storage, controller)
 
             self.assertIn("run-indicator", html)
             self.assertIn("pipeline-motion", html)
+            self.assertIn("No input is being collected", html)
+            self.assertIn("OpenCLI is disabled", html)
             self.assertIn("Latest: Loaded 0 item(s)", html)
+            self.assertIn("no deep research for this group yet", html)
 
     def test_runtime_saves_pipeline_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

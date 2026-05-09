@@ -292,6 +292,8 @@ def layout(content: str) -> str:
     .group-records {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }}
     .group-record {{ border: 1px solid #dce2e8; border-radius: 7px; padding: 10px; background: #fbfcfd; }}
     .group-record-value {{ font-weight: 750; font-size: 17px; margin-top: 2px; overflow-wrap: anywhere; }}
+    .notice {{ border: 1px solid #dce2e8; border-radius: 7px; padding: 10px 12px; margin-bottom: 14px; background: #fbfcfd; }}
+    .notice.warning {{ border-color: #f0c36a; background: #fff8e6; color: #5f4300; }}
     .panel {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; min-height: 260px; }}
     .item {{ display: block; padding: 10px; border: 1px solid #e4e9ee; border-radius: 7px; margin-bottom: 8px; color: inherit; text-decoration: none; background: #fbfcfd; }}
     .item:hover {{ border-color: #9eb8c4; background: #f1f6f8; }}
@@ -417,12 +419,18 @@ def agent_cards(storage: Storage, roles: list[str], ref: str | None = None) -> s
     runtime_agents = []
     for role in roles:
         role_logs = [item for item in logs if item["agent_role"] == role]
+        if ref:
+            role_logs = [
+                item
+                for item in role_logs
+                if ref in {str(value) for value in item["input_refs"] + item["output_refs"]}
+            ]
         latest = role_logs[0] if role_logs else None
         runtime_agents.append(
             {
                 "role": role,
                 "count": len(role_logs),
-                "latest_status": latest["status"] if latest else "waiting",
+                "latest_status": latest["status"] if latest else "idle",
                 "latest_task": latest["task_id"] if latest else "no task yet",
                 "latest_time": latest["completed_at"] if latest else "",
             }
@@ -440,6 +448,32 @@ def agent_cards(storage: Storage, roles: list[str], ref: str | None = None) -> s
     )
 
 
+def deep_research_agent_cards(storage: Storage, task_group: object, requirements: list[object]) -> str:
+    related_refs = {task_group.task_group_id}
+    for run in storage.list_task_group_runs(task_group.task_group_id, limit=50):
+        related_refs.add(run.task_group_run_id)
+    for requirement in requirements:
+        related_refs.add(requirement.requirement_id)
+        related_refs.update(requirement.research_history)
+    logs = []
+    for item in storage.list_agent_logs(agent_role="deep_research", limit=300):
+        refs = {str(value) for value in item["input_refs"] + item["output_refs"]}
+        if refs & related_refs:
+            logs.append(item)
+    latest = logs[0] if logs else None
+    status = latest["status"] if latest else "idle"
+    task = latest["task_id"] if latest else "no deep research for this group yet"
+    time = latest["completed_at"] if latest else ""
+    return f"""
+    <a class="item" href="/agent-log?role=deep_research&ref={html.escape(task_group.task_group_id)}">
+      <div class="title">Deep Research</div>
+      <div><span class="status{' running' if status != 'idle' else ''}">{html.escape(str(status))}</span></div>
+      <div class="summary">{html.escape(str(task))}</div>
+      <div class="summary">{len(logs)} group log event(s) {html.escape(str(time or ''))}</div>
+    </a>
+    """
+
+
 def task_group_boards(storage: Storage, task_groups: list[object], requirements: list[object]) -> str:
     if not task_groups:
         return "<section class='card'><p class='muted'>No task group yet. Create a general or domain task above.</p></section>"
@@ -453,6 +487,7 @@ def task_group_board(storage: Storage, task_group: object, requirements: list[ob
         f"<section class=\"task-group-box\" id=\"{html.escape(task_group_anchor(task_group.task_group_id))}\">"
         + task_group_header(storage, task_group, group_requirements)
         + "<div class='task-group-body'>"
+        + task_group_diagnostic(storage, task_group)
         + task_group_record_summary(storage, task_group, group_requirements)
         + "<section class='workbench'>"
         + task_group_search_panel(storage, task_group)
@@ -516,6 +551,30 @@ def task_group_record_summary(storage: Storage, task_group: object, requirements
     )
 
 
+def task_group_diagnostic(storage: Storage, task_group: object) -> str:
+    config = storage.get_app_config()
+    recent = storage.list_experiment_logs(task_group_id=task_group.task_group_id, limit=20)
+    latest_input = next((item for item in recent if item["step_name"] == "input_loaded"), None)
+    latest_files = next((item for item in recent if item["step_name"] == "files_read"), None)
+    latest_collector_failed = next((item for item in recent if item["step_name"] == "collector_failed"), None)
+    latest_collector_skipped = next((item for item in recent if item["step_name"] == "collector_skipped"), None)
+    if latest_collector_failed:
+        return f"<section class='notice warning'><strong>Collector failed.</strong> {html.escape(latest_collector_failed['message'])}</section>"
+    if latest_input and int(latest_input["payload_json"].get("items_loaded", 0)) == 0:
+        file_count = len(latest_files["payload_json"].get("files", [])) if latest_files else 0
+        if latest_collector_skipped or config.get("collector_enabled") != "1":
+            return (
+                "<section class='notice warning'><strong>No input is being collected.</strong> "
+                f"OpenCLI is disabled and {html.escape(task_group.input_dir)} has {file_count} JSON file(s). "
+                "Enable OpenCLI in Collector And Model Settings, or put Reddit-like JSON files in the group input folder.</section>"
+            )
+        return (
+            "<section class='notice warning'><strong>No input loaded.</strong> "
+            f"{html.escape(task_group.input_dir)} has {file_count} JSON file(s), but the latest run loaded 0 item(s).</section>"
+        )
+    return ""
+
+
 def latest_task_group_activity(storage: Storage, task_group: object) -> str:
     logs = storage.list_experiment_logs(task_group_id=task_group.task_group_id, limit=1)
     if logs:
@@ -569,7 +628,7 @@ def task_group_deep_research_panel(storage: Storage, task_group: object, require
     return (
         "<section class='panel'><h2>Running Deep Research Agents</h2>"
         "<p class='muted'>Deep research agents consuming this task group's requirement queue.</p>"
-        + agent_cards(storage, ["deep_research"], task_group.task_group_id)
+        + deep_research_agent_cards(storage, task_group, requirements)
         + queue_text
         + "</section>"
     )
