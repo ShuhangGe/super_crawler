@@ -194,7 +194,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             task_type = TaskGroupType(query.get("type", [TaskGroupType.GENERAL.value])[0])
             name = query.get("name", [""])[0].strip() or "Search Group"
             description = query.get("description", [""])[0].strip()
-            domain = query.get("domain", [""])[0].strip() or None
+            domain = description if task_type == TaskGroupType.DOMAIN and description else None
             input_dir = query.get("input_dir", [""])[0].strip()
             if not input_dir:
                 folder = name
@@ -267,7 +267,7 @@ def layout(content: str) -> str:
     .summary {{ color: #52616b; font-size: 13px; margin-top: 4px; }}
     .controlbar {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; margin-bottom: 18px; }}
     .actions {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
-    .stacked-form {{ display: grid; grid-template-columns: minmax(180px, 260px) minmax(280px, 1fr) auto; gap: 10px; align-items: start; }}
+    .stacked-form {{ display: grid; grid-template-columns: minmax(160px, 220px) minmax(180px, 260px) minmax(280px, 1fr) auto; gap: 10px; align-items: start; }}
     input, select, textarea {{ border: 1px solid #cfd8df; border-radius: 6px; padding: 8px; min-height: 20px; font: inherit; }}
     textarea {{ min-height: 42px; resize: vertical; }}
     input[type="number"] {{ width: 80px; }}
@@ -625,6 +625,10 @@ def task_create_panel() -> str:
       <h2>Create Task Group</h2>
       <form action="/task" class="stacked-form">
         <input type="hidden" name="action" value="create">
+        <select name="type" aria-label="Task group type">
+          <option value="general_search">General Search</option>
+          <option value="domain_search">Domain Specific</option>
+        </select>
         <input name="name" placeholder="Group name">
         <textarea name="description" placeholder="What are we planning to search?"></textarea>
         <button class="button">Create</button>

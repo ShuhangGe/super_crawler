@@ -75,6 +75,8 @@ class SystemTests(unittest.TestCase):
 
             self.assertIn("Global Resource Allocation", html)
             self.assertIn("Create Task Group", html)
+            self.assertIn("General Search", html)
+            self.assertIn("Domain Specific", html)
             self.assertIn("Group name", html)
             self.assertIn("What are we planning to search?", html)
             self.assertNotIn("Possible requirements", html)
