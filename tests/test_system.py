@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
-from super_crawler.dashboard import home_page
+from super_crawler.dashboard import grouped_requirement_lineage, home_page, visible_task_groups
 from super_crawler.models import RequirementStatus, TaskGroupStatus, TaskGroupType
 from super_crawler.runtime import RuntimeController
 from super_crawler.seed import SAMPLE_REDDIT_ITEMS
@@ -121,6 +121,30 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(result["task_group_runs"], 1)
             self.assertTrue(requirements)
             self.assertTrue(any(task_group.task_group_id in requirement.task_group_ids for requirement in requirements))
+
+    def test_archived_task_group_hidden_on_page_one_but_kept_for_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            inbox = Path(directory) / "pet_care"
+            inbox.mkdir()
+            (inbox / "items.json").write_text(json.dumps(SAMPLE_REDDIT_ITEMS[:1]))
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Pet Care Search",
+                task_type=TaskGroupType.DOMAIN,
+                domain="pet care",
+                input_dir=str(inbox),
+            )
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+            RuntimeController(db_path, input_dir=Path(directory) / "unused", interval_seconds=1).run_once()
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.ARCHIVED)
+            requirements = storage.list_requirements()
+
+            self.assertFalse(visible_task_groups(storage))
+            html = grouped_requirement_lineage(storage, requirements, task_group.task_group_id)
+            self.assertIn("Pet Care Search", html)
+            self.assertIn("domain_search", html)
 
 
 if __name__ == "__main__":

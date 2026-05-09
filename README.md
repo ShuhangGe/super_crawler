@@ -47,9 +47,10 @@ python3 -m super_crawler.cli task create domain "Pet Care Search" --domain "pet 
 python3 -m super_crawler.cli task start tg_pet_care_search_0001
 python3 -m super_crawler.cli task run tg_pet_care_search_0001
 python3 -m super_crawler.cli task stop tg_pet_care_search_0001
+python3 -m super_crawler.cli task delete tg_pet_care_search_0001
 ```
 
-Put Reddit-like JSON arrays into each task group's input folder. Running task groups tag evidence, candidates, and requirements so the possible/rejected pages preserve the line from task group to final conclusion.
+Put Reddit-like JSON arrays into each task group's input folder. Running task groups tag evidence, candidates, and requirements so the possible/rejected pages preserve the line from task group to final conclusion. Delete archives a task group: it disappears from the Running Status page, but remains selectable in Possible/Rejected pages if it has historical requirements.
 
 ## Ingest Custom Reddit Data
 

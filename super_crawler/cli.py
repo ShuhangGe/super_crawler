@@ -45,6 +45,8 @@ def main() -> None:
     task_start.add_argument("task_group_id")
     task_stop = task_subcommands.add_parser("stop")
     task_stop.add_argument("task_group_id")
+    task_delete = task_subcommands.add_parser("delete")
+    task_delete.add_argument("task_group_id")
     task_run = task_subcommands.add_parser("run")
     task_run.add_argument("task_group_id")
 
@@ -114,6 +116,9 @@ def main() -> None:
             elif args.task_command == "stop":
                 storage.update_task_group_status(args.task_group_id, TaskGroupStatus.STOPPED)
                 print(f"Stopped {args.task_group_id}")
+            elif args.task_command == "delete":
+                storage.update_task_group_status(args.task_group_id, TaskGroupStatus.ARCHIVED)
+                print(f"Archived {args.task_group_id}")
             elif args.task_command == "run":
                 result = AlwaysOnRunner(storage, "data/reddit_inbox").run_task_group(args.task_group_id)
                 print(json.dumps(result, indent=2))

@@ -37,6 +37,7 @@ class TaskGroupStatus(StrEnum):
     STOPPED = "stopped"
     COMPLETED = "completed"
     FAILED = "failed"
+    ARCHIVED = "archived"
 
 
 class TaskGroupType(StrEnum):

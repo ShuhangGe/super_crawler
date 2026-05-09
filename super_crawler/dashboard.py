@@ -50,9 +50,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/":
                     self._html(home_page(storage, self.app_controller))
                 elif parsed.path == "/possible":
-                    self._html(requirement_list_page(storage, "Possible Requirements", possible_requirements(storage)))
+                    query = parse_qs(parsed.query)
+                    self._html(
+                        requirement_list_page(
+                            storage,
+                            "Possible Requirements",
+                            filter_requirements_by_group(possible_requirements(storage), query.get("task_group_id", [""])[0]),
+                            query.get("task_group_id", [""])[0],
+                            "/possible",
+                        )
+                    )
                 elif parsed.path == "/rejected":
-                    self._html(requirement_list_page(storage, "Rejected Requirements", rejected_requirements(storage)))
+                    query = parse_qs(parsed.query)
+                    self._html(
+                        requirement_list_page(
+                            storage,
+                            "Rejected Requirements",
+                            filter_requirements_by_group(rejected_requirements(storage), query.get("task_group_id", [""])[0]),
+                            query.get("task_group_id", [""])[0],
+                            "/rejected",
+                        )
+                    )
                 elif parsed.path == "/queue":
                     self._html(queue_page(storage))
                 elif parsed.path == "/requirement":
@@ -169,6 +187,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             storage.update_task_group_status(task_group_id, TaskGroupStatus.RUNNING)
         elif action == "stop":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.STOPPED)
+        elif action == "delete":
+            storage.update_task_group_status(task_group_id, TaskGroupStatus.ARCHIVED)
         elif action == "run-once":
             from .runner import AlwaysOnRunner
 
@@ -212,6 +232,10 @@ def layout(content: str) -> str:
     .card {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; }}
     .board {{ display: grid; grid-template-columns: minmax(240px, 1fr) minmax(420px, 1.7fr) minmax(300px, 1.2fr); gap: 14px; align-items: start; }}
     .workbench {{ display: grid; grid-template-columns: minmax(260px, 1fr) minmax(420px, 1.5fr) minmax(260px, 1fr); gap: 14px; align-items: start; }}
+    .task-group-box {{ border: 2px solid #c8d8df; border-radius: 10px; background: #ffffff; margin-top: 18px; overflow: hidden; }}
+    .task-group-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; background: #eef5f7; border-bottom: 1px solid #d6e3e8; }}
+    .task-group-header h2 {{ margin: 0; }}
+    .task-group-body {{ padding: 14px; }}
     .panel {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; min-height: 260px; }}
     .item {{ display: block; padding: 10px; border: 1px solid #e4e9ee; border-radius: 7px; margin-bottom: 8px; color: inherit; text-decoration: none; background: #fbfcfd; }}
     .item:hover {{ border-color: #9eb8c4; background: #f1f6f8; }}
@@ -260,7 +284,7 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     by_status = {status.value: 0 for status in RequirementStatus}
     for requirement in requirements:
         by_status[requirement.status.value] = by_status.get(requirement.status.value, 0) + 1
-    task_groups = storage.list_task_groups()
+    task_groups = visible_task_groups(storage)
     cards = [
         ("Possible requirements", len(possible_requirements(storage))),
         ("Queued for research", counts["queued"]),
@@ -358,13 +382,30 @@ def task_group_board(storage: Storage, task_group: object, requirements: list[ob
     group_requirements = [item for item in requirements if task_group.task_group_id in item.task_group_ids]
     waiting = [item for item in group_requirements if item.status in waiting_statuses()]
     return (
-        f"<h2>{html.escape(task_group.name)}</h2>"
-        "<section class='workbench'>"
+        "<section class='task-group-box'>"
+        + task_group_header(task_group, group_requirements)
+        + "<div class='task-group-body'><section class='workbench'>"
         + task_group_search_panel(storage, task_group)
         + waiting_requirements_panel(waiting)
         + task_group_deep_research_panel(storage, task_group, group_requirements)
-        + "</section>"
+        + "</section></div></section>"
     )
+
+
+def task_group_header(task_group: object, requirements: list[object]) -> str:
+    status_class = " running" if task_group.status == TaskGroupStatus.RUNNING else ""
+    return f"""
+    <div class="task-group-header">
+      <div>
+        <h2>{html.escape(task_group.name)}</h2>
+        <div class="summary"><span class="status{status_class}">{html.escape(task_group.status.value)}</span> {html.escape(task_group.task_type.value)} | {html.escape(task_group.domain or 'general')} | {len(requirements)} requirement(s)</div>
+      </div>
+      <div class="linkbar">
+        <a href="/possible?task_group_id={html.escape(task_group.task_group_id)}">Possible</a>
+        <a href="/rejected?task_group_id={html.escape(task_group.task_group_id)}">Rejected</a>
+      </div>
+    </div>
+    """
 
 
 def task_group_search_panel(storage: Storage, task_group: object) -> str:
@@ -451,16 +492,21 @@ def rejected_requirements(storage: Storage) -> list[object]:
     return [item for item in storage.list_requirements() if item.status in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}]
 
 
-def requirement_list_page(storage: Storage, title: str, requirements: list[object]) -> str:
+def requirement_list_page(storage: Storage, title: str, requirements: list[object], selected_task_group_id: str, page_path: str) -> str:
     return (
         f"<h1>{html.escape(title)}</h1>"
-        "<p class='muted'>Each row preserves the whole line from requirement search to conclusion so it can be evaluated later.</p>"
-        + grouped_requirement_lineage(storage, requirements)
+        + task_group_filter(storage, selected_task_group_id, page_path)
+        + "<p class='muted'>Each row preserves the whole line from requirement search to conclusion so it can be evaluated later.</p>"
+        + grouped_requirement_lineage(storage, requirements, selected_task_group_id)
     )
 
 
-def grouped_requirement_lineage(storage: Storage, requirements: list[object]) -> str:
-    task_groups = storage.list_task_groups()
+def grouped_requirement_lineage(storage: Storage, requirements: list[object], selected_task_group_id: str = "") -> str:
+    task_groups = lineage_task_groups(storage, requirements)
+    if selected_task_group_id == "__ungrouped__":
+        return "<h2>Ungrouped / Legacy</h2>" + requirement_lineage_table(storage, [item for item in requirements if not item.task_group_ids])
+    if selected_task_group_id:
+        task_groups = [item for item in task_groups if item.task_group_id == selected_task_group_id]
     sections = []
     used_ids: set[str] = set()
     for task_group in task_groups:
@@ -477,6 +523,23 @@ def grouped_requirement_lineage(storage: Storage, requirements: list[object]) ->
     if ungrouped:
         sections.append("<h2>Ungrouped / Legacy</h2>" + requirement_lineage_table(storage, ungrouped))
     return "".join(sections) if sections else requirement_lineage_table(storage, [])
+
+
+def task_group_filter(storage: Storage, selected_task_group_id: str, page_path: str) -> str:
+    options = ["<option value=''>All groups</option>"]
+    for task_group in lineage_task_groups(storage, storage.list_requirements()):
+        selected = " selected" if task_group.task_group_id == selected_task_group_id else ""
+        label = f"{task_group.name} ({task_group.status.value})"
+        options.append(f"<option value='{html.escape(task_group.task_group_id)}'{selected}>{html.escape(label)}</option>")
+    selected = " selected" if selected_task_group_id == "__ungrouped__" else ""
+    options.append(f"<option value='__ungrouped__'{selected}>Ungrouped / Legacy</option>")
+    return (
+        "<form class='controlbar' action='" + html.escape(page_path) + "'>"
+        "<strong>Task Group</strong>"
+        "<select name='task_group_id'>" + "".join(options) + "</select>"
+        "<button class='button secondary'>Show Group</button>"
+        "</form>"
+    )
 
 
 def requirement_lineage_table(storage: Storage, requirements: list[object]) -> str:
@@ -556,6 +619,7 @@ def task_group_card(task: object) -> str:
       <div class="linkbar">
         <a href="/task?action={action}&id={html.escape(task.task_group_id)}">{action_label}</a>
         <a href="/task?action=run-once&id={html.escape(task.task_group_id)}">Run Once</a>
+        <a href="/task?action=delete&id={html.escape(task.task_group_id)}">Delete</a>
         <a href="/agent-log?role=discovery&ref={html.escape(task.task_group_id)}">Search Log</a>
       </div>
     </div>
@@ -592,6 +656,23 @@ def waiting_statuses() -> set[RequirementStatus]:
         RequirementStatus.WATCHING,
         RequirementStatus.REOPENED,
     }
+
+
+def visible_task_groups(storage: Storage) -> list[object]:
+    return [item for item in storage.list_task_groups() if item.status != TaskGroupStatus.ARCHIVED]
+
+
+def lineage_task_groups(storage: Storage, requirements: list[object]) -> list[object]:
+    referenced = {task_group_id for requirement in requirements for task_group_id in requirement.task_group_ids}
+    return [item for item in storage.list_task_groups() if item.status != TaskGroupStatus.ARCHIVED or item.task_group_id in referenced]
+
+
+def filter_requirements_by_group(requirements: list[object], task_group_id: str) -> list[object]:
+    if not task_group_id:
+        return requirements
+    if task_group_id == "__ungrouped__":
+        return [item for item in requirements if not item.task_group_ids]
+    return [item for item in requirements if task_group_id in item.task_group_ids]
 
 
 def agent_links_for_requirement(storage: Storage, requirement: object, roles: list[str]) -> str:
