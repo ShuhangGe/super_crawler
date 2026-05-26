@@ -29,9 +29,10 @@ class Storage:
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.execute("PRAGMA busy_timeout = 30000")
 
     def __enter__(self) -> Storage:
         return self
@@ -250,6 +251,46 @@ class Storage:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(requirement_id) REFERENCES requirements(requirement_id)
             );
+
+            CREATE TABLE IF NOT EXISTS todo_jobs (
+                todo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requirement_id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                source_status TEXT NOT NULL,
+                status TEXT NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(requirement_id) REFERENCES requirements(requirement_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS search_plans (
+                plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_group_id TEXT NOT NULL,
+                task_group_run_id TEXT NOT NULL,
+                planner_agent_id TEXT NOT NULL,
+                cycle_index INTEGER NOT NULL,
+                input_description TEXT NOT NULL,
+                search_goal TEXT NOT NULL,
+                search_brief_json TEXT NOT NULL,
+                assignments_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(task_group_id) REFERENCES task_groups(task_group_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS search_insights (
+                insight_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_group_id TEXT,
+                task_group_run_id TEXT,
+                requirement_id TEXT NOT NULL,
+                research_run_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                insight_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(requirement_id) REFERENCES requirements(requirement_id),
+                FOREIGN KEY(research_run_id) REFERENCES research_runs(research_run_id)
+            );
             """
         )
         self._ensure_column("raw_evidence", "task_group_id", "TEXT")
@@ -262,6 +303,198 @@ class Storage:
         self._ensure_default_resource_config()
         self._ensure_default_app_config()
         self.conn.commit()
+
+    def add_todo_job(self, requirement_id: str, note: str = "") -> None:
+        requirement = self.get_requirement(requirement_id)
+        if requirement is None:
+            raise ValueError(f"Unknown requirement: {requirement_id}")
+        now = utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO todo_jobs (
+                requirement_id, title, source_status, status, note, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 'open', ?, ?, ?)
+            ON CONFLICT(requirement_id) DO UPDATE SET
+                title=excluded.title,
+                source_status=excluded.source_status,
+                status='open',
+                note=excluded.note,
+                updated_at=excluded.updated_at
+            """,
+            (requirement_id, requirement.canonical_requirement, requirement.status.value, note.strip(), now, now),
+        )
+        self.log_requirement_event(
+            requirement_id,
+            requirement.task_group_ids[-1] if requirement.task_group_ids else None,
+            requirement.task_group_run_ids[-1] if requirement.task_group_run_ids else None,
+            "dashboard",
+            "todo",
+            "moved_to_todo",
+            f"Moved {requirement_id} to todo list",
+            {"todo_status": "open", "note": note.strip()},
+        )
+
+    def update_todo_status(self, requirement_id: str, status: str) -> None:
+        now = utc_now()
+        self.conn.execute(
+            "UPDATE todo_jobs SET status=?, updated_at=? WHERE requirement_id=?",
+            (status, now, requirement_id),
+        )
+        self.conn.commit()
+
+    def list_todo_jobs(self, status: str | None = None) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT todo_id, requirement_id, title, source_status, status, note, created_at, updated_at
+            FROM todo_jobs
+            {where}
+            ORDER BY updated_at DESC, todo_id DESC
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_todo_job(self, requirement_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT todo_id, requirement_id, title, source_status, status, note, created_at, updated_at
+            FROM todo_jobs
+            WHERE requirement_id=?
+            """,
+            (requirement_id,),
+        ).fetchone()
+        return None if row is None else dict(row)
+
+    def save_search_plan(
+        self,
+        task_group_id: str,
+        task_group_run_id: str,
+        planner_agent_id: str,
+        cycle_index: int,
+        input_description: str,
+        search_goal: str,
+        search_brief: dict[str, Any],
+        assignments: list[dict[str, Any]],
+    ) -> int:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO search_plans (
+                task_group_id, task_group_run_id, planner_agent_id, cycle_index,
+                input_description, search_goal, search_brief_json, assignments_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_group_id,
+                task_group_run_id,
+                planner_agent_id,
+                cycle_index,
+                input_description,
+                search_goal,
+                json.dumps(search_brief, sort_keys=True),
+                json.dumps(assignments, sort_keys=True),
+                utc_now(),
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def list_search_plans(self, task_group_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        if task_group_id:
+            rows = self.conn.execute(
+                """
+                SELECT plan_id, task_group_id, task_group_run_id, planner_agent_id, cycle_index,
+                       input_description, search_goal, search_brief_json, assignments_json, created_at
+                FROM search_plans
+                WHERE task_group_id=?
+                ORDER BY plan_id DESC
+                LIMIT ?
+                """,
+                (task_group_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT plan_id, task_group_id, task_group_run_id, planner_agent_id, cycle_index,
+                       input_description, search_goal, search_brief_json, assignments_json, created_at
+                FROM search_plans
+                ORDER BY plan_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        plans = []
+        for row in rows:
+            item = dict(row)
+            item["search_brief"] = json.loads(item.pop("search_brief_json"))
+            item["assignments"] = json.loads(item.pop("assignments_json"))
+            plans.append(item)
+        return plans
+
+    def save_search_insight(
+        self,
+        task_group_id: str | None,
+        task_group_run_id: str | None,
+        requirement_id: str,
+        research_run_id: str,
+        agent_id: str,
+        insight_type: str,
+        payload: dict[str, Any],
+    ) -> int:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO search_insights (
+                task_group_id, task_group_run_id, requirement_id, research_run_id,
+                agent_id, insight_type, payload_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_group_id,
+                task_group_run_id,
+                requirement_id,
+                research_run_id,
+                agent_id,
+                insight_type,
+                json.dumps(payload, sort_keys=True),
+                utc_now(),
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def list_search_insights(self, task_group_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        if task_group_id:
+            rows = self.conn.execute(
+                """
+                SELECT insight_id, task_group_id, task_group_run_id, requirement_id,
+                       research_run_id, agent_id, insight_type, payload_json, created_at
+                FROM search_insights
+                WHERE task_group_id=?
+                ORDER BY insight_id DESC
+                LIMIT ?
+                """,
+                (task_group_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT insight_id, task_group_id, task_group_run_id, requirement_id,
+                       research_run_id, agent_id, insight_type, payload_json, created_at
+                FROM search_insights
+                ORDER BY insight_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._decode_json_column(dict(row), "payload_json") for row in rows]
 
     def upsert_evidence(self, evidence: RawEvidence) -> None:
         self._upsert("raw_evidence", "evidence_id", evidence)
@@ -554,6 +787,9 @@ class Storage:
             "experiment_logs": self._count("experiment_logs"),
             "requirement_samples": self._count("requirement_samples"),
             "requirement_events": self._count("requirement_events"),
+            "todo_jobs": self._count("todo_jobs"),
+            "search_plans": self._count("search_plans"),
+            "search_insights": self._count("search_insights"),
             "app_config": self._count("app_config"),
             "task_group_config": self._count("task_group_config"),
         }

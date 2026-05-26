@@ -4,9 +4,10 @@ import json
 import time
 from pathlib import Path
 
-from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, one_sentence_requirement
+from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, RequirementMemoryAgent, one_sentence_requirement
 from .collectors import OpenCliRedditCollector
-from .models import TaskGroup, TaskGroupRun, TaskGroupStatus, TaskGroupType, utc_now
+from .models import AgentActivityLog, TaskGroup, TaskGroupRun, TaskGroupStatus, TaskGroupType, utc_now
+from .search_planner import SearchPlannerAgent
 from .storage import Storage
 
 
@@ -31,7 +32,7 @@ class AlwaysOnRunner:
 
         items = load_json_items(self.input_dir)
         candidates = DiscoveryAgent(self.storage, "discovery-daemon").ingest_reddit_items(items) if items else []
-        changed = PoolManagerAgent(self.storage, "pool-manager").reconcile_candidates()
+        changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates()
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
         research_runs = self._run_deep_research_slots(resources.get("max_deep_research_agents", 1))
         return {
@@ -50,19 +51,21 @@ class AlwaysOnRunner:
         return self.run_task_groups([task_group])
 
     def run_task_groups(self, task_groups: list[TaskGroup]) -> dict[str, int | str | None]:
+        resources = self.storage.get_resource_config()
+        search_slots = max(int(resources.get("max_search_agents", 3)), 1)
+        slot_allocations = allocate_search_slots(len(task_groups), search_slots)
         total_items = 0
         total_candidates = 0
         total_changed = 0
         task_runs: list[str] = []
-        for task_group in task_groups:
-            result = self._run_search_task_group(task_group)
+        for index, task_group in enumerate(task_groups):
+            result = self._run_search_task_group(task_group, search_agent_count=slot_allocations[index])
             total_items += int(result["items_loaded"] or 0)
             total_candidates += int(result["candidates"] or 0)
             total_changed += int(result["requirements_changed"] or 0)
             task_runs.append(str(result["task_group_run_id"]))
 
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
-        resources = self.storage.get_resource_config()
         research_runs = self._run_deep_research_slots(resources.get("max_deep_research_agents", 1))
         return {
             "items_loaded": total_items,
@@ -84,7 +87,7 @@ class AlwaysOnRunner:
             run_ids.append(run.research_run_id)
         return run_ids
 
-    def _run_search_task_group(self, task_group: TaskGroup) -> dict[str, int | str | None]:
+    def _run_search_task_group(self, task_group: TaskGroup, search_agent_count: int = 1) -> dict[str, int | str | None]:
         started_at = utc_now()
         task_group_run_id = f"tgr_{task_group.task_group_id}_{started_at.replace('-', '').replace(':', '').replace('+', 'Z')}"
         self.storage.log_experiment(
@@ -93,10 +96,19 @@ class AlwaysOnRunner:
             "scheduler",
             "task_group_started",
             f"Task group {task_group.name} started",
-            {"task_group_name": task_group.name, "input_dir": task_group.input_dir, "model_config": self.storage.get_task_group_config(task_group.task_group_id)},
+            {
+                "task_group_name": task_group.name,
+                "input_dir": task_group.input_dir,
+                "search_agent_count": search_agent_count,
+                "model_config": self.storage.get_task_group_config(task_group.task_group_id),
+            },
         )
-        collection_result = self._collect_for_task_group(task_group, task_group_run_id)
-        scan = load_json_items_with_report(task_group.input_dir)
+        collection_result = self._collect_for_task_group(task_group, task_group_run_id, search_agent_count)
+        if collection_result and collection_result.get("search_agents"):
+            output_paths = [agent["output_path"] for agent in collection_result["search_agents"] if agent.get("output_path")]
+            scan = load_json_files_with_report(output_paths)
+        else:
+            scan = load_json_items_with_report(task_group.input_dir)
         self.storage.log_experiment(
             task_group.task_group_id,
             task_group_run_id,
@@ -132,18 +144,21 @@ class AlwaysOnRunner:
             )
 
         items = [tag_task_item(item, task_group, task_group_run_id) for item in scan["items"]]
+        config = self.storage.get_task_group_config(task_group.task_group_id)
         self.storage.log_experiment(
             task_group.task_group_id,
             task_group_run_id,
             "discovery",
             "discovery_started",
             f"Discovery started for {task_group.name}",
-            {"items_loaded": len(items)},
+            {"items_loaded": len(items), "model": config.get("model_search"), "method": "llm"},
         )
         candidates = DiscoveryAgent(self.storage, f"discovery-{task_group.task_group_id}").ingest_reddit_items(
             items,
             task_group_id=task_group.task_group_id,
             task_group_run_id=task_group_run_id,
+            model_name=config.get("model_search", "deepseek-v4-flash"),
+            use_llm=True,
         )
         candidate_titles = [candidate.requirement_title for candidate in candidates]
         self.storage.log_experiment(
@@ -157,12 +172,12 @@ class AlwaysOnRunner:
         self.storage.log_experiment(
             task_group.task_group_id,
             task_group_run_id,
-            "pool_manager",
-            "pool_manager_started",
-            f"Pool manager started for {task_group.name}",
+            "requirement_memory",
+            "requirement_memory_started",
+            f"Requirement memory started for {task_group.name}",
             {"candidate_ids": [candidate.candidate_id for candidate in candidates]},
         )
-        changed = PoolManagerAgent(self.storage, "pool-manager").reconcile_candidates()
+        changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates()
         queued = len([item for item in changed if item.task_group_ids and task_group.task_group_id in item.task_group_ids])
         rejected = len([item for item in changed if item.status.value in {"rejected", "archived"}])
         group_changed = [item for item in changed if task_group.task_group_id in item.task_group_ids]
@@ -170,7 +185,7 @@ class AlwaysOnRunner:
         self.storage.log_experiment(
             task_group.task_group_id,
             task_group_run_id,
-            "pool_manager",
+            "requirement_memory",
             "requirements_generated",
             f"Generated or updated {len(group_changed)} requirement(s)",
             {"requirement_ids": [item.requirement_id for item in group_changed]},
@@ -178,15 +193,15 @@ class AlwaysOnRunner:
         self.storage.log_experiment(
             task_group.task_group_id,
             task_group_run_id,
-            "pool_manager",
+            "requirement_memory",
             "pool_requirement_sample",
-            f"Pool manager generated {len(requirement_sentences)} one-sentence requirement(s)",
+            f"Requirement memory generated {len(requirement_sentences)} one-sentence requirement(s)",
             {"requirements": requirement_sentences},
         )
         self.storage.log_experiment(
             task_group.task_group_id,
             task_group_run_id,
-            "pool_manager",
+            "requirement_memory",
             "requirements_queued",
             f"Queued {queued} requirement(s) for deep research",
             {"queued": queued},
@@ -232,7 +247,7 @@ class AlwaysOnRunner:
             "task_group_run_id": task_group_run_id,
         }
 
-    def _collect_for_task_group(self, task_group: TaskGroup, task_group_run_id: str) -> dict[str, object] | None:
+    def _collect_for_task_group(self, task_group: TaskGroup, task_group_run_id: str, search_agent_count: int = 1) -> dict[str, object] | None:
         config = self.storage.get_task_group_config(task_group.task_group_id)
         if config.get("collector_enabled") != "1":
             self.storage.log_experiment(
@@ -244,15 +259,72 @@ class AlwaysOnRunner:
                 {"collector_enabled": config.get("collector_enabled", "0")},
             )
             return None
+        cycle_index = len(self.storage.list_search_plans(task_group.task_group_id, limit=500)) + 1
+        recent_queries = [
+            str(assignment.get("query", ""))
+            for plan in self.storage.list_search_plans(task_group.task_group_id, limit=20)
+            for assignment in plan.get("assignments", [])
+        ]
+        search_insights = self.storage.list_search_insights(task_group.task_group_id, limit=20)
+        plan = SearchPlannerAgent().plan(task_group, search_agent_count, cycle_index, recent_queries, search_insights)
+        plan_id = self.storage.save_search_plan(
+            task_group.task_group_id,
+            task_group_run_id,
+            str(plan["planner_agent_id"]),
+            int(plan["cycle_index"]),
+            str(plan["input_description"]),
+            str(plan["search_goal"]),
+            dict(plan["search_brief"]),
+            list(plan["assignments"]),
+        )
+        self.storage.log_activity(
+            AgentActivityLog(
+                agent_id=str(plan["planner_agent_id"]),
+                agent_role="search_planner",
+                task_id="plan_search_cycle",
+                status="completed",
+                started_at=utc_now(),
+                completed_at=utc_now(),
+                input_refs=[task_group.task_group_id, task_group_run_id, str(plan["input_description"])],
+                output_refs=[f"search_plan:{plan_id}", *[str(query) for query in plan["queries"]]],
+                error=None,
+                retry_count=0,
+                cost_estimate=0.0,
+            )
+        )
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "search_planner",
+            "search_plan_created",
+            f"Search planner created {len(plan['assignments'])} search assignment(s)",
+            {"plan_id": plan_id, **plan},
+        )
         collector = OpenCliRedditCollector(
             command=config.get("collector_command", "opencli reddit search"),
             timeout_seconds=parse_int(config.get("collector_timeout_seconds"), 120),
         )
+        assignments = list(plan["assignments"])
+        queries = [str(query) for query in plan["queries"]]
+        limit = parse_int(config.get("collector_limit"), 25)
+        limit_per_query = max(1, limit // max(len(queries), 1))
+        def log_collector_event(step_name: str, message: str, payload: dict[str, object]) -> None:
+            self.storage.log_experiment(
+                task_group.task_group_id,
+                task_group_run_id,
+                "collector",
+                step_name,
+                message,
+                payload,
+            )
+
         try:
-            result = collector.collect_to_inbox(
+            result = collector.collect_queries_to_inbox(
                 task_group,
                 task_group_run_id,
-                limit=parse_int(config.get("collector_limit"), 25),
+                assignments,
+                limit_per_query=limit_per_query,
+                event_callback=log_collector_event,
             )
         except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             self.storage.log_experiment(
@@ -261,9 +333,33 @@ class AlwaysOnRunner:
                 "collector",
                 "collector_failed",
                 f"OpenCLI Reddit collection failed: {exc}",
-                {"error": str(exc), "command": config.get("collector_command")},
+                {"error": str(exc), "command": config.get("collector_command"), "queries": queries},
             )
             return {"error": str(exc)}
+        for search_agent in result["search_agents"]:
+            self.storage.log_activity(
+                AgentActivityLog(
+                    agent_id=str(search_agent["agent_id"]),
+                    agent_role="discovery",
+                    task_id="reddit_opencli_search",
+                    status="completed",
+                    started_at=search_agent["started_at"],
+                    completed_at=search_agent["completed_at"],
+                    input_refs=[task_group.task_group_id, task_group_run_id, str(search_agent["query"])],
+                    output_refs=[str(search_agent["output_path"]), *[str(url) for url in search_agent.get("urls", [])]],
+                    error=None,
+                    retry_count=0,
+                    cost_estimate=0.0,
+                )
+            )
+            self.storage.log_experiment(
+                task_group.task_group_id,
+                task_group_run_id,
+                "discovery",
+                "search_agent_completed",
+                f"{search_agent['agent_id']} collected {search_agent['items_collected']} item(s) for query: {search_agent['query']}",
+                search_agent,
+            )
         self.storage.log_experiment(
             task_group.task_group_id,
             task_group_run_id,
@@ -282,10 +378,14 @@ def load_json_items(input_dir: str | Path) -> list[dict]:
 def load_json_items_with_report(input_dir: str | Path) -> dict[str, object]:
     directory = Path(input_dir)
     directory.mkdir(parents=True, exist_ok=True)
+    return load_json_files_with_report(sorted(directory.glob("*.json")))
+
+
+def load_json_files_with_report(paths: list[str | Path]) -> dict[str, object]:
     items: list[dict] = []
     files: list[str] = []
     skipped: list[dict[str, str]] = []
-    for path in sorted(directory.glob("*.json")):
+    for path in [Path(item) for item in paths]:
         files.append(str(path))
         loaded = json.loads(path.read_text())
         if not isinstance(loaded, list):
@@ -314,3 +414,17 @@ def parse_int(value: object, default: int) -> int:
         return int(str(value))
     except (TypeError, ValueError):
         return default
+
+
+def allocate_search_slots(group_count: int, max_search_agents: int) -> list[int]:
+    if group_count <= 0:
+        return []
+    slots = max(max_search_agents, 1)
+    allocations = [1 for _ in range(group_count)]
+    remaining = max(slots - group_count, 0)
+    index = 0
+    while remaining > 0:
+        allocations[index % group_count] += 1
+        remaining -= 1
+        index += 1
+    return allocations

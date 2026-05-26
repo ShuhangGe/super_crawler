@@ -4,13 +4,16 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
-from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
-from super_crawler.collectors import normalize_reddit_item, parse_opencli_output
-from super_crawler.dashboard import group_settings_page, grouped_requirement_lineage, home_page, visible_task_groups
-from super_crawler.models import RequirementStatus, TaskGroupStatus, TaskGroupType
+from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, ReportAgent, RequirementMemoryAgent, normalize_llm_requirement_analysis, search_relevance_check
+from super_crawler.collectors import OpenCliRedditCollector, build_requirement_search_queries, normalize_reddit_item, parse_opencli_output
+from super_crawler.dashboard import agent_log_page, detail_page, experiment_log_page, filter_requirements_by_group, grouped_requirement_lineage, home_page, possible_requirements, rejected_requirements, requirement_list_page, visible_task_groups, search_agent_count_for_group, todo_page
+from super_crawler.models import RequirementRecord, RequirementStatus, ResearchRun, TaskGroupStatus, TaskGroupType, utc_now
+from super_crawler.runner import allocate_search_slots
 from super_crawler.runtime import RuntimeController
 from super_crawler.seed import SAMPLE_REDDIT_ITEMS
+from super_crawler.search_planner import SearchPlannerAgent
 from super_crawler.storage import Storage
 
 
@@ -21,7 +24,7 @@ class SystemTests(unittest.TestCase):
             storage.migrate()
 
             candidates = DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(SAMPLE_REDDIT_ITEMS)
-            requirements = PoolManagerAgent(storage, "pool-test").reconcile_candidates()
+            requirements = RequirementMemoryAgent(storage, "memory-test").reconcile_candidates()
             queued = storage.list_queue()
             run = DeepResearchAgent(storage, "research-test").run_next()
             report = ReportAgent(storage, "report-test").daily_report()
@@ -62,6 +65,9 @@ class SystemTests(unittest.TestCase):
                     "experiment_logs",
                     "requirement_samples",
                     "requirement_events",
+                    "todo_jobs",
+                    "search_plans",
+                    "search_insights",
                     "app_config",
                     "task_group_config",
                 },
@@ -87,7 +93,9 @@ class SystemTests(unittest.TestCase):
             self.assertIn("General Search", html)
             self.assertIn("Domain Specific", html)
             self.assertIn("Group name", html)
-            self.assertIn("What are we planning to search?", html)
+            self.assertIn('id="domain-description" class="domain-description" hidden', html)
+            self.assertIn('id="task-description" name="description" placeholder="Domain search plan" disabled', html)
+            self.assertNotIn("What are we planning to search?", html)
             self.assertNotIn("Possible requirements", html)
             self.assertNotIn("Queued for research", html)
             self.assertNotIn("Agent Runtime", html)
@@ -109,7 +117,18 @@ class SystemTests(unittest.TestCase):
             self.assertIn('value="stop"', html)
             self.assertIn('value="delete"', html)
             self.assertIn("Settings", html)
+            self.assertIn("settings-popout", html)
+            self.assertIn("Sports Search Settings", html)
+            self.assertIn("OpenCLI Collection", html)
+            self.assertIn("Results per run", html)
+            self.assertIn("<summary>Advanced</summary>", html)
+            self.assertIn('name="model_search"', html)
+            self.assertIn('name="model_deep_research"', html)
+            self.assertIn("deepseek-v4-flash", html)
+            self.assertIn("deepseek-v4-pro", html)
             self.assertIn("Details", html)
+            self.assertIn("Search Planner", html)
+            self.assertIn("Search Planner Agent", html)
             self.assertIn("Discovery Agents", html)
             self.assertIn("Running Deep Research Agents", html)
             self.assertNotIn('value="run-once"', html)
@@ -121,6 +140,7 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Latest: No run yet.", html)
 
             storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+            DiscoveryAgent(storage, "discovery-old").ingest_reddit_items([], task_group.task_group_id)
             storage.log_experiment(task_group.task_group_id, "run-1", "scheduler", "run_completed", "Loaded 0 item(s)", {})
             storage.log_experiment(task_group.task_group_id, "run-1", "collector", "collector_skipped", "Reddit OpenCLI collector is disabled", {"collector_enabled": "0"})
             storage.log_experiment(task_group.task_group_id, "run-1", "scheduler", "files_read", "Read 0 JSON file(s)", {"files": []})
@@ -129,20 +149,489 @@ class SystemTests(unittest.TestCase):
 
             self.assertIn("run-indicator", html)
             self.assertIn("pipeline-motion", html)
+            self.assertIn("Search Agent 1", html)
+            self.assertIn("Search Agent 2", html)
+            self.assertIn("Search Agent 3", html)
+            self.assertIn("agent_id=search-agent-1", html)
+            self.assertIn("agent_id=search-agent-2", html)
+            self.assertIn("agent_id=search-agent-3", html)
+            self.assertEqual(search_agent_count_for_group(storage, task_group), 3)
             self.assertIn("No input is being collected", html)
             self.assertIn("OpenCLI is disabled", html)
             self.assertIn("Latest: Loaded 0 item(s)", html)
-            self.assertIn("no deep research for this group yet", html)
+            self.assertIn("No active deep research agent for this group.", html)
+            self.assertNotIn("ingest_reddit_items", html)
+            self.assertNotIn(">completed<", html)
 
-            settings_html = group_settings_page(storage, task_group.task_group_id)
-            self.assertIn("Sports Search Settings", settings_html)
-            self.assertIn("OpenCLI Collection", settings_html)
-            self.assertIn("Results per run", settings_html)
-            self.assertIn("<summary>Advanced</summary>", settings_html)
-            self.assertIn('name="model_search"', settings_html)
-            self.assertIn('name="model_deep_research"', settings_html)
-            self.assertIn("deepseek-v4-flash", settings_html)
-            self.assertIn("deepseek-v4-pro", settings_html)
+            detail_html = experiment_log_page(storage, task_group.task_group_id)
+            agent_html = agent_log_page(storage, "discovery", "", task_group.task_group_id)
+            self.assertIn("Terminal Style Log", detail_html)
+            self.assertIn("terminal-log", detail_html)
+            self.assertIn("collector_skipped", detail_html)
+            self.assertIn("&quot;items_loaded&quot;: 0", detail_html)
+            self.assertIn("Search Log", agent_html)
+            self.assertIn("Raw Terminal Log", agent_html)
+            self.assertIn("status=completed", agent_html)
+            self.assertNotIn("Experiment Steps", agent_html)
+            self.assertNotIn("Full Log Payload", agent_html)
+            self.assertNotIn("Full Experiment Payload", agent_html)
+            self.assertNotIn("<th>ID</th><th>Time</th><th>Role</th><th>Agent</th>", agent_html)
+
+    def test_search_planner_expands_user_description_for_breadth_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C product search",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(Path(directory) / "3c"),
+                description="I'm selling 3C products",
+            )
+
+            first = SearchPlannerAgent().plan(task_group, 3, cycle_index=1, recent_queries=[])
+            second = SearchPlannerAgent().plan(task_group, 3, cycle_index=2, recent_queries=first["queries"])
+
+            self.assertIn("consumer electronics", first["search_brief"]["domain"])
+            self.assertEqual(len(first["assignments"]), 3)
+            self.assertTrue(any("laptop" in query or "headphone" in query or "charger" in query for query in first["queries"]))
+            self.assertTrue(all(assignment["subreddit"] for assignment in first["assignments"]))
+            self.assertIn(first["assignments"][0]["subreddit"], first["search_brief"]["subreddits"])
+            self.assertNotEqual(first["queries"], second["queries"])
+
+    def test_saved_search_plan_shows_on_group_dashboard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            controller = RuntimeController(Path(directory) / "test.sqlite3", input_dir=Path(directory) / "inbox", interval_seconds=1)
+            task_group = storage.create_task_group(
+                name="3C product search",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(Path(directory) / "3c"),
+                description="I'm selling 3C products",
+            )
+            plan = SearchPlannerAgent().plan(task_group, 2, cycle_index=1, recent_queries=[])
+            storage.save_search_plan(
+                task_group.task_group_id,
+                "run-1",
+                plan["planner_agent_id"],
+                plan["cycle_index"],
+                plan["input_description"],
+                plan["search_goal"],
+                plan["search_brief"],
+                plan["assignments"],
+            )
+
+            html = home_page(storage, controller)
+
+            self.assertIn("Search Planner Agent", html)
+            self.assertIn("consumer electronics", html)
+            self.assertIn(str(plan["assignments"][0]["query"]), html)
+
+    def test_search_planner_uses_deep_research_insights(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C product search",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(Path(directory) / "3c"),
+                description="I'm selling 3C products",
+            )
+            storage.upsert_requirement(
+                RequirementRecord(
+                    requirement_id="REQ-2026-000001",
+                    canonical_requirement="Users need better phone battery warranty support",
+                    description="Users complain about battery warranty pain.",
+                    status=RequirementStatus.WATCHING,
+                    first_seen=utc_now(),
+                    last_seen=utc_now(),
+                    times_detected=1,
+                    evidence_count=1,
+                    subreddit_count=1,
+                    geo_distribution=[],
+                    audience_segments=[],
+                    current_scores={},
+                    previous_scores={},
+                    research_history=[],
+                    decision_history=[],
+                    reopen_events=[],
+                    latest_recommendation=None,
+                    aliases=[],
+                    evidence_ids=[],
+                    task_group_ids=[task_group.task_group_id],
+                    task_group_run_ids=["run-1"],
+                )
+            )
+            storage.upsert_research_run(
+                ResearchRun(
+                    research_run_id="research-run-1",
+                    requirement_id="REQ-2026-000001",
+                    agent_id="research-agent-1",
+                    started_at=utc_now(),
+                    completed_at=utc_now(),
+                    input_evidence_ids=[],
+                    research_questions=[],
+                    findings={},
+                    scores={},
+                    geo_analysis=[],
+                    market_signal_analysis={},
+                    existing_solution_analysis={},
+                    recommendation="keep tracking and run lightweight validation",
+                    limitations=[],
+                    changed_since_last_run={},
+                )
+            )
+            storage.save_search_insight(
+                task_group.task_group_id,
+                "run-1",
+                "REQ-2026-000001",
+                "research-run-1",
+                "research-agent-1",
+                "deep_research_feedback",
+                {
+                    "productive_queries": ["phone battery warranty pain"],
+                    "noisy_queries": ["regret buying laptop phone headphones charger broke warranty"],
+                    "suggested_searches": [
+                        {
+                            "query": "phone battery warranty pain",
+                            "subreddit": "techsupport",
+                            "strategy": "learned_support_gap",
+                            "why": "Deep research found relevant warranty evidence.",
+                        }
+                    ],
+                },
+            )
+
+            plan = SearchPlannerAgent().plan(
+                task_group,
+                2,
+                cycle_index=1,
+                recent_queries=[],
+                search_insights=storage.list_search_insights(task_group.task_group_id),
+            )
+
+            self.assertEqual(plan["assignments"][0]["query"], "phone battery warranty pain")
+            self.assertEqual(plan["assignments"][0]["strategy"], "learned_support_gap")
+            self.assertNotIn("regret buying laptop phone headphones charger broke warranty", plan["queries"])
+
+    def test_search_planner_log_lists_each_planned_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C product search",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(Path(directory) / "3c"),
+                description="I'm selling 3C products",
+            )
+            plan = SearchPlannerAgent().plan(task_group, 3, cycle_index=3, recent_queries=[])
+            storage.log_experiment(
+                task_group.task_group_id,
+                "run-1",
+                "search_planner",
+                "search_plan_created",
+                "Search planner created 3 search assignment(s)",
+                {"plan_id": 1, **plan},
+            )
+
+            html = agent_log_page(storage, "search_planner", "", task_group.task_group_id)
+
+            self.assertIn("Search Plan Cycle 3", html)
+            self.assertIn("Question / Query", html)
+            for assignment in plan["assignments"]:
+                self.assertIn(str(assignment["agent_id"]), html)
+                self.assertIn(str(assignment["query"]), html)
+                self.assertIn(str(assignment["strategy"]), html)
+                self.assertIn(str(assignment["why"]), html)
+            self.assertIn("Raw Terminal Log", html)
+
+    def test_search_agent_activity_logs_are_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Photo",
+                task_type=TaskGroupType.DOMAIN,
+                domain="photo workflow",
+                input_dir=str(Path(directory) / "photo"),
+            )
+            now = "2026-05-11T00:00:00+00:00"
+            from super_crawler.models import AgentActivityLog
+
+            storage.log_activity(
+                AgentActivityLog("search-agent-1", "discovery", "reddit_opencli_search", "completed", now, now, [task_group.task_group_id, "query 1"], ["out1.json", "https://reddit.com/one"], None, 0, 0)
+            )
+            storage.log_activity(
+                AgentActivityLog("search-agent-2", "discovery", "reddit_opencli_search", "completed", now, now, [task_group.task_group_id, "query 2"], ["out2.json", "https://reddit.com/two"], None, 0, 0)
+            )
+            storage.log_experiment(
+                task_group.task_group_id,
+                "run-1",
+                "discovery",
+                "search_agent_completed",
+                "search-agent-1 collected 1 item(s)",
+                {
+                    "agent_id": "search-agent-1",
+                    "query": "query 1",
+                    "items_collected": 1,
+                    "output_path": "out1.json",
+                    "urls": ["https://reddit.com/one"],
+                    "titles": ["First URL"],
+                },
+            )
+            storage.log_experiment(
+                task_group.task_group_id,
+                "run-1",
+                "discovery",
+                "sample_analyzed",
+                "Sample analyzed: First URL",
+                {
+                    "agent_id": "search-agent-1",
+                    "search_query": "query 1",
+                    "url": "https://reddit.com/one",
+                    "title": "First URL",
+                    "subreddit": "photo",
+                    "method": "llm",
+                    "is_possible_requirement": True,
+                    "signals": ["workflow_pain"],
+                    "sample_analysis": "The post asks for a better workflow.",
+                    "requirement_title": "Users need a better photo workflow.",
+                    "confidence": 0.8,
+                },
+            )
+
+            agent_1 = agent_log_page(storage, "discovery", "search-agent-1", task_group.task_group_id)
+            agent_2 = agent_log_page(storage, "discovery", "search-agent-2", task_group.task_group_id)
+
+            self.assertIn("search-agent-1", agent_1)
+            self.assertIn("query 1", agent_1)
+            self.assertIn("https://reddit.com/one", agent_1)
+            self.assertIn("The post asks for a better workflow.", agent_1)
+            self.assertNotIn("query 2", agent_1)
+            self.assertIn("search-agent-2", agent_2)
+
+    def test_queued_requirements_show_deep_research_agent_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=1)
+            task_group = storage.create_task_group(
+                name="Photo",
+                task_type=TaskGroupType.DOMAIN,
+                domain="photo workflow",
+                input_dir=str(Path(directory) / "photo"),
+            )
+            candidates = DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(
+                [
+                    {
+                        "source_url": "https://reddit.com/photo-workflow",
+                        "subreddit": "photography",
+                        "title": "Is there an app for delivering client photo galleries?",
+                        "body": "I am tired of using a spreadsheet and manual links for client photo delivery. I would pay for this.",
+                        "score": 25,
+                        "comment_count": 10,
+                    }
+                ],
+                task_group.task_group_id,
+                "run-1",
+            )
+            self.assertEqual(len(candidates), 1)
+            changed = RequirementMemoryAgent(storage, "memory-test").reconcile_candidates()
+            self.assertEqual(changed[0].status, RequirementStatus.QUEUED_FOR_RESEARCH)
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+
+            html = home_page(storage, controller)
+
+            self.assertIn("Possible Requirements Waiting For Deep Research", html)
+            self.assertIn("client photo galleries", html)
+            self.assertIn("Deep Research Agent 1", html)
+            self.assertIn(">running<", html)
+            self.assertIn("Assigned to a deep research slot", html)
+
+            queued_log_html = agent_log_page(storage, "deep_research", "", changed[0].requirement_id)
+            self.assertIn("Deep Research Log", queued_log_html)
+            self.assertIn("Waiting For Deep Research", queued_log_html)
+
+            run = DeepResearchAgent(storage, "research-agent-1").run_next()
+            self.assertIsNotNone(run)
+            possible_html = grouped_requirement_lineage(storage, storage.list_requirements())
+            deep_log_html = agent_log_page(storage, "deep_research", "", changed[0].requirement_id)
+
+            self.assertIn("Deep Research (", possible_html)
+            self.assertNotIn("Deep Research (0)", possible_html)
+            self.assertIn("Deep Research Log", deep_log_html)
+            self.assertIn("Deep Research Output", deep_log_html)
+            self.assertIn("Is real requirement", deep_log_html)
+            self.assertIn("deep_research_output", deep_log_html)
+            self.assertIn("is_real_requirement", deep_log_html)
+
+    def test_deep_research_actively_searches_and_logs_evidence(self) -> None:
+        class FakeCollector:
+            def __init__(self, command: str = "opencli reddit search", timeout_seconds: int = 120):
+                self.command = command
+                self.timeout_seconds = timeout_seconds
+
+            def search(self, query: str, limit: int = 5, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, object]:
+                return {
+                    "command": ["opencli", "reddit", "search", query],
+                    "stderr": "",
+                    "items": [
+                        {
+                            "source": "reddit_opencli",
+                            "source_url": f"https://reddit.com/deep/{query.replace(' ', '-')}",
+                            "subreddit": subreddit or "smarthome",
+                            "post_id": query[:12],
+                            "comment_id": None,
+                            "title": "Is there an app or workaround for smart camera subscription fees?",
+                            "body": "I am tired of paying subscription fees and wish there was a local storage alternative. I would pay for a better way.",
+                            "author_metadata_allowed": False,
+                            "score": 18,
+                            "comment_count": 7,
+                            "created_at": utc_now(),
+                            "language": "en",
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C",
+                task_type=TaskGroupType.DOMAIN,
+                domain="smart home devices",
+                input_dir=str(Path(directory) / "3c"),
+            )
+            storage.update_task_group_config(task_group.task_group_id, {"collector_enabled": "1"})
+            candidates = DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(
+                [
+                    {
+                        "source_url": "https://reddit.com/original",
+                        "subreddit": "smarthome",
+                        "title": "I need smart cameras without subscriptions",
+                        "body": "I am tired of subscription fees and manual workarounds.",
+                        "score": 10,
+                        "comment_count": 5,
+                    }
+                ],
+                task_group.task_group_id,
+                "run-1",
+            )
+            self.assertEqual(len(candidates), 1)
+            changed = RequirementMemoryAgent(storage, "memory-test").reconcile_candidates()
+            storage.update_requirement_status(changed[0].requirement_id, RequirementStatus.QUEUED_FOR_RESEARCH, "test active deep research")
+            storage.enqueue_research(changed[0].requirement_id, 50, "test active deep research", 1, None)
+
+            run = DeepResearchAgent(storage, "research-agent-1", collector_factory=FakeCollector).run_next()
+
+            self.assertIsNotNone(run)
+            requirement = storage.get_requirement(changed[0].requirement_id)
+            self.assertIsNotNone(requirement)
+            self.assertGreater(requirement.evidence_count, 1)
+            logs = storage.list_experiment_logs(task_group_id=task_group.task_group_id, agent_role="deep_research", limit=50)
+            step_names = {item["step_name"] for item in logs}
+            self.assertIn("deep_research_plan_created", step_names)
+            self.assertIn("deep_research_search_completed", step_names)
+            self.assertIn("deep_research_item_analyzed", step_names)
+            self.assertIn("deep_research_evidence_collected", step_names)
+            deep_log_html = agent_log_page(storage, "deep_research", "", changed[0].requirement_id)
+            self.assertIn("Deep Research Plan", deep_log_html)
+            self.assertIn("Evidence Item Analysis", deep_log_html)
+            self.assertIn("Evidence Collected", deep_log_html)
+
+    def test_rejected_deep_research_has_rejected_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Weak",
+                task_type=TaskGroupType.DOMAIN,
+                domain="weak signal",
+                input_dir=str(Path(directory) / "weak"),
+            )
+            storage.update_task_group_config(task_group.task_group_id, {"collector_enabled": "0"})
+            now = utc_now()
+            storage.upsert_requirement(
+                RequirementRecord(
+                    requirement_id="req-weak",
+                    canonical_requirement="Users need a better vague thing",
+                    description="Thin evidence with no pain or buying signal.",
+                    status=RequirementStatus.QUEUED_FOR_RESEARCH,
+                    first_seen=now,
+                    last_seen=now,
+                    times_detected=1,
+                    evidence_count=0,
+                    subreddit_count=0,
+                    geo_distribution=[],
+                    audience_segments=[],
+                    current_scores={},
+                    previous_scores={},
+                    research_history=[],
+                    decision_history=[],
+                    reopen_events=[],
+                    latest_recommendation=None,
+                    evidence_ids=[],
+                    task_group_ids=[task_group.task_group_id],
+                    task_group_run_ids=["run-weak"],
+                )
+            )
+            storage.enqueue_research("req-weak", 1, "test weak signal", 0, None)
+
+            run = DeepResearchAgent(storage, "research-agent-1").run_next()
+            requirement = storage.get_requirement("req-weak")
+
+            self.assertIsNotNone(run)
+            self.assertIsNotNone(requirement)
+            self.assertEqual(requirement.status, RequirementStatus.REJECTED)
+            self.assertIn("rejected", run.recommendation.lower())
+            self.assertNotEqual(run.recommendation, "watch for more evidence before acting")
+            self.assertIn("rejection_summary", run.findings)
+            self.assertIn("Rejected because", run.findings["rejection_summary"])
+            rejected_html = grouped_requirement_lineage(storage, rejected_requirements(storage), task_group.task_group_id)
+            detail_html = detail_page(storage, "req-weak")
+            self.assertIn("Reason:", rejected_html)
+            self.assertIn("Rejected because", rejected_html)
+            self.assertIn("Rejected reason:", detail_html)
+
+    def test_possible_requirement_can_move_to_todo_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Pets",
+                task_type=TaskGroupType.DOMAIN,
+                domain="pet medication",
+                input_dir=str(Path(directory) / "pets"),
+            )
+            candidates = DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(
+                SAMPLE_REDDIT_ITEMS[:1],
+                task_group.task_group_id,
+                "run-1",
+            )
+            self.assertEqual(len(candidates), 1)
+            requirements = RequirementMemoryAgent(storage, "memory-test").reconcile_candidates()
+            requirement = requirements[0]
+
+            possible_html = grouped_requirement_lineage(storage, storage.list_requirements())
+            self.assertIn("Move to todo list", possible_html)
+
+            storage.add_todo_job(requirement.requirement_id, "Prepare follow-up validation")
+            todo_html = todo_page(storage)
+            possible_html = grouped_requirement_lineage(storage, storage.list_requirements())
+
+            self.assertIn("Todo Jobs", todo_html)
+            self.assertIn(requirement.canonical_requirement, todo_html)
+            self.assertIn("Prepare follow-up validation", todo_html)
+            self.assertIn("Todo: open", possible_html)
 
     def test_runtime_saves_pipeline_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -150,7 +639,7 @@ class SystemTests(unittest.TestCase):
             storage = Storage(db_path)
             storage.migrate()
             DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(SAMPLE_REDDIT_ITEMS)
-            PoolManagerAgent(storage, "pool-test").reconcile_candidates()
+            RequirementMemoryAgent(storage, "memory-test").reconcile_candidates()
             storage.close()
 
             controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=1)
@@ -200,6 +689,97 @@ class SystemTests(unittest.TestCase):
             events = storage.list_requirement_events(samples[0]["requirement_id"])
             self.assertTrue(events)
 
+    def test_task_group_opencli_run_ignores_stale_inbox_files(self) -> None:
+        class FakeCollector:
+            def __init__(self, command: str = "", timeout_seconds: int = 120):
+                pass
+
+            def collect_queries_to_inbox(self, task_group, run_id, queries, limit_per_query=10, event_callback=None):
+                output_dir = Path(task_group.input_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_path = output_dir / f"opencli_{run_id}_agent_1.json"
+                output_path.write_text(
+                    json.dumps(
+                        [
+                            {
+                                "source": "reddit_opencli",
+                                "source_url": "https://reddit.com/current",
+                                "subreddit": "HeadphoneAdvice",
+                                "title": "Need headphones that do not hurt after a full work day",
+                                "body": "Noise cancelling headphones make my ears sore.",
+                                "score": 12,
+                                "comment_count": 4,
+                                "collection_query": "headphones uncomfortable problem",
+                                "search_query": "headphones uncomfortable problem",
+                                "search_subreddit": "HeadphoneAdvice",
+                                "search_strategy": "headphone_problem",
+                            }
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                return {
+                    "queries": ["headphones uncomfortable problem"],
+                    "items_collected": 1,
+                    "limit_per_query": limit_per_query,
+                    "search_agents": [
+                        {
+                            "agent_id": "search-agent-1",
+                            "query": "headphones uncomfortable problem",
+                            "subreddit": "HeadphoneAdvice",
+                            "strategy": "headphone_problem",
+                            "output_path": str(output_path),
+                            "urls": ["https://reddit.com/current"],
+                            "titles": ["Need headphones that do not hurt after a full work day"],
+                            "subreddits": ["HeadphoneAdvice"],
+                            "command": ["opencli"],
+                            "stderr": "",
+                            "started_at": utc_now(),
+                            "completed_at": utc_now(),
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            inbox = Path(directory) / "3c"
+            inbox.mkdir()
+            (inbox / "old_run.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "source": "reddit_opencli",
+                            "source_url": "https://reddit.com/stale",
+                            "subreddit": "BestofRedditorUpdates",
+                            "title": "Old stale story that should not be loaded",
+                            "body": "",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(inbox),
+                description="I want to find people's requirement about 3c products",
+            )
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+
+            with patch("super_crawler.runner.OpenCliRedditCollector", FakeCollector):
+                result = RuntimeController(db_path, input_dir=Path(directory) / "unused", interval_seconds=1).run_once()
+
+            storage = Storage(db_path)
+            logs = storage.list_experiment_logs(task_group_id=task_group.task_group_id)
+            input_loaded = next(item for item in logs if item["step_name"] == "input_loaded")
+
+            self.assertEqual(result["items_loaded"], 1)
+            self.assertEqual(input_loaded["payload_json"]["items_loaded"], 1)
+            self.assertNotIn("old_run.json", json.dumps(input_loaded["payload_json"]))
+
     def test_archived_task_group_hidden_on_page_one_but_kept_for_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
@@ -223,6 +803,204 @@ class SystemTests(unittest.TestCase):
             html = grouped_requirement_lineage(storage, requirements, task_group.task_group_id)
             self.assertIn("Pet Care Search", html)
             self.assertIn("domain_search", html)
+
+    def test_rejected_page_hides_ungrouped_legacy_data_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            DiscoveryAgent(storage, "discovery-legacy").ingest_reddit_items(SAMPLE_REDDIT_ITEMS[:1])
+            requirements = RequirementMemoryAgent(storage, "memory-legacy").reconcile_candidates()
+            storage.update_requirement_status(requirements[0].requirement_id, RequirementStatus.REJECTED, "legacy demo data")
+            now = utc_now()
+            storage.upsert_research_run(
+                ResearchRun(
+                    research_run_id="run-legacy-rejected",
+                    requirement_id=requirements[0].requirement_id,
+                    agent_id="research-test",
+                    started_at=now,
+                    completed_at=now,
+                    input_evidence_ids=[],
+                    research_questions=[],
+                    findings={},
+                    scores={},
+                    geo_analysis=[],
+                    market_signal_analysis={},
+                    existing_solution_analysis={},
+                    recommendation="rejected",
+                    limitations=[],
+                    changed_since_last_run={},
+                )
+            )
+
+            default_html = grouped_requirement_lineage(storage, rejected_requirements(storage))
+            legacy_html = grouped_requirement_lineage(storage, rejected_requirements(storage), "__ungrouped__")
+
+            self.assertIn("No requirements in this page yet.", default_html)
+            self.assertNotIn("pet medication", default_html.lower())
+            self.assertIn("Ungrouped / Legacy", legacy_html)
+            self.assertIn("medication", legacy_html.lower())
+
+    def test_requirement_page_group_filter_limits_visible_group_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            pets = storage.create_task_group(
+                name="Pets",
+                task_type=TaskGroupType.DOMAIN,
+                domain="pet care",
+                input_dir=str(Path(directory) / "pets"),
+            )
+            sports = storage.create_task_group(
+                name="Sports",
+                task_type=TaskGroupType.DOMAIN,
+                domain="sports",
+                input_dir=str(Path(directory) / "sports"),
+            )
+            now = utc_now()
+            for requirement_id, title, task_group_id, status, research_history in [
+                ("req-pets", "Pet owners need medication reminders", pets.task_group_id, RequirementStatus.WATCHING, ["run-pets"]),
+                ("req-sports", "Coaches need player availability tools", sports.task_group_id, RequirementStatus.WATCHING, ["run-sports"]),
+                ("req-queued", "Queued items should stay off page two", pets.task_group_id, RequirementStatus.QUEUED_FOR_RESEARCH, []),
+            ]:
+                storage.upsert_requirement(
+                    RequirementRecord(
+                        requirement_id=requirement_id,
+                        canonical_requirement=title,
+                        description=title,
+                        status=status,
+                        first_seen=now,
+                        last_seen=now,
+                        times_detected=1,
+                        evidence_count=1,
+                        subreddit_count=1,
+                        geo_distribution=[],
+                        audience_segments=[],
+                        current_scores={},
+                        previous_scores={},
+                        research_history=research_history,
+                        decision_history=[],
+                        reopen_events=[],
+                        latest_recommendation=None,
+                        evidence_ids=[],
+                        task_group_ids=[task_group_id],
+                        task_group_run_ids=[],
+                    )
+                )
+            for run_id, requirement_id in [("run-pets", "req-pets"), ("run-sports", "req-sports")]:
+                storage.upsert_research_run(
+                    ResearchRun(
+                        research_run_id=run_id,
+                        requirement_id=requirement_id,
+                        agent_id="research-test",
+                        started_at=now,
+                        completed_at=now,
+                        input_evidence_ids=[],
+                        research_questions=[],
+                        findings={},
+                        scores={},
+                        geo_analysis=[],
+                        market_signal_analysis={},
+                        existing_solution_analysis={},
+                        recommendation="accepted",
+                        limitations=[],
+                        changed_since_last_run={},
+                    )
+                )
+
+            html = requirement_list_page(
+                storage,
+                "Possible Requirements",
+                filter_requirements_by_group(possible_requirements(storage), pets.task_group_id),
+                pets.task_group_id,
+                "/possible",
+            )
+
+            self.assertIn("method='get'", html)
+            self.assertIn("onchange='this.form.submit()'", html)
+            self.assertIn("Pets", html)
+            self.assertIn("Pet owners need medication reminders", html)
+            self.assertNotIn("<h2>Sports</h2>", html)
+            self.assertNotIn("Coaches need player availability tools", html)
+            self.assertNotIn("Queued items should stay off page two", html)
+
+    def test_group_summary_shows_generated_and_accepted_counts_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=1)
+            task_group = storage.create_task_group(
+                name="3C",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(Path(directory) / "3c"),
+            )
+            now = utc_now()
+            rows = [
+                ("req-generated", RequirementStatus.NEEDS_MORE_EVIDENCE, []),
+                ("req-queued", RequirementStatus.QUEUED_FOR_RESEARCH, []),
+                ("req-accepted", RequirementStatus.WATCHING, ["run-accepted"]),
+                ("req-rejected", RequirementStatus.REJECTED, ["run-rejected"]),
+            ]
+            for requirement_id, status, research_history in rows:
+                storage.upsert_requirement(
+                    RequirementRecord(
+                        requirement_id=requirement_id,
+                        canonical_requirement=requirement_id,
+                        description=requirement_id,
+                        status=status,
+                        first_seen=now,
+                        last_seen=now,
+                        times_detected=1,
+                        evidence_count=1,
+                        subreddit_count=1,
+                        geo_distribution=[],
+                        audience_segments=[],
+                        current_scores={},
+                        previous_scores={},
+                        research_history=research_history,
+                        decision_history=[],
+                        reopen_events=[],
+                        latest_recommendation=None,
+                        evidence_ids=[],
+                        task_group_ids=[task_group.task_group_id],
+                        task_group_run_ids=[],
+                    )
+                )
+            for run_id, requirement_id, recommendation in [
+                ("run-accepted", "req-accepted", "accepted"),
+                ("run-rejected", "req-rejected", "rejected"),
+            ]:
+                storage.upsert_research_run(
+                    ResearchRun(
+                        research_run_id=run_id,
+                        requirement_id=requirement_id,
+                        agent_id="research-test",
+                        started_at=now,
+                        completed_at=now,
+                        input_evidence_ids=[],
+                        research_questions=[],
+                        findings={},
+                        scores={},
+                        geo_analysis=[],
+                        market_signal_analysis={},
+                        existing_solution_analysis={},
+                        recommendation=recommendation,
+                        limitations=[],
+                        changed_since_last_run={},
+                    )
+                )
+            storage.enqueue_research("req-queued", 50, "test", 1, None)
+
+            html = home_page(storage, controller)
+
+            self.assertIn("Generated", html)
+            self.assertIn("Accepted", html)
+            self.assertIn("Rejected", html)
+            self.assertIn("<div class='group-record-value'>3</div>", html)
+            self.assertIn("<div class='group-record-value'>1</div>", html)
 
     def test_opencli_reddit_output_is_normalized(self) -> None:
         payload = {
@@ -251,6 +1029,131 @@ class SystemTests(unittest.TestCase):
 
         ndjson = '{"title": "Need cheaper sports registration", "subreddit": "sports"}\n{"title": "Need better roster tools"}'
         self.assertEqual(len(parse_opencli_output(ndjson)), 2)
+
+    def test_opencli_missing_binary_error_is_actionable(self) -> None:
+        collector = OpenCliRedditCollector(command="definitely_missing_opencli_binary reddit search")
+
+        with self.assertRaisesRegex(RuntimeError, "npm install -g @jackwener/opencli"):
+            collector.search("sports scheduling", limit=1)
+
+    def test_search_slots_and_query_variants_support_multiple_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Photography",
+                task_type=TaskGroupType.DOMAIN,
+                domain="photography",
+                input_dir=str(Path(directory) / "photo"),
+                description="photography workflow pain",
+            )
+
+            self.assertEqual(allocate_search_slots(1, 3), [3])
+            self.assertEqual(allocate_search_slots(2, 3), [2, 1])
+            queries = build_requirement_search_queries(task_group, 3)
+            self.assertEqual(len(queries), 3)
+            self.assertIn("photography workflow pain problem pain workflow", queries)
+            self.assertIn("is there an app for photography", queries)
+            self.assertIn("best way to manage photography", queries)
+
+    def test_collected_items_keep_search_agent_identity(self) -> None:
+        class FakeCollector(OpenCliRedditCollector):
+            def search(self, query: str, limit: int = 25, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, object]:
+                return {
+                    "command": ["opencli", "reddit", "search", query, "--subreddit", subreddit],
+                    "stderr": "",
+                    "items": [
+                        {
+                            "source": "reddit_opencli",
+                            "source_url": f"https://reddit.com/{query.replace(' ', '-')}",
+                            "subreddit": subreddit or "photo",
+                            "title": f"Need help with {query}",
+                            "body": "",
+                            "collection_query": query,
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Photography",
+                task_type=TaskGroupType.DOMAIN,
+                domain="photography",
+                input_dir=str(Path(directory) / "photo"),
+            )
+
+            result = FakeCollector().collect_queries_to_inbox(
+                task_group,
+                "run-1",
+                [
+                    {"agent_id": "search-agent-1", "query": "query one", "subreddit": "photography", "strategy": "advice"},
+                    {"agent_id": "search-agent-2", "query": "query two", "subreddit": "AskPhotography", "strategy": "support"},
+                ],
+                limit_per_query=1,
+            )
+
+            self.assertEqual(result["search_agents"][0]["agent_id"], "search-agent-1")
+            self.assertEqual(result["search_agents"][0]["subreddit"], "photography")
+            self.assertEqual(result["search_agents"][0]["strategy"], "advice")
+            first_output = Path(result["search_agents"][0]["output_path"]).read_text(encoding="utf-8")
+            self.assertIn('"search_agent_id": "search-agent-1"', first_output)
+            self.assertIn('"search_query": "query one"', first_output)
+            self.assertIn('"search_subreddit": "photography"', first_output)
+
+    def test_search_relevance_gate_rejects_unrelated_3c_results(self) -> None:
+        unrelated = search_relevance_check(
+            {
+                "search_query": "headphones earbuds uncomfortable noise cancelling connection problem",
+                "search_subreddit": "HeadphoneAdvice",
+                "subreddit": "BestofRedditorUpdates",
+                "title": "AITA for getting angry with my girlfriend",
+                "body": "Personal relationship story.",
+            }
+        )
+        related = search_relevance_check(
+            {
+                "search_query": "Amazon electronics wrong item refund denied phone laptop gpu",
+                "search_subreddit": "amazonprime",
+                "subreddit": "TwentiesIndia",
+                "title": "Ordered an RTX 5090 on Amazon, got detergent and refund was denied",
+                "body": "",
+            }
+        )
+
+        self.assertFalse(unrelated["is_relevant"])
+        self.assertTrue(related["is_relevant"])
+
+    def test_llm_requirement_analysis_normalization(self) -> None:
+        analysis = normalize_llm_requirement_analysis(
+            {
+                "is_possible_requirement": True,
+                "signals": ["workflow_pain"],
+                "requirement_title": "Users need a better way to organize client photo galleries.",
+                "requirement_description": "Photographers struggle to deliver and organize albums for clients.",
+                "audience": ["photographers"],
+                "pain_level": "medium",
+                "confidence": 0.82,
+            },
+            "Photo workflow is painful",
+            "I need a better way to deliver galleries.",
+        )
+
+        self.assertIsNotNone(analysis)
+        self.assertEqual(analysis["is_possible_requirement"], True)
+        self.assertEqual(analysis["signals"], ["workflow_pain"])
+        self.assertEqual(analysis["requirement_title"], "Users need a better way to organize client photo galleries.")
+        self.assertEqual(analysis["confidence"], 0.82)
+
+        rejected = normalize_llm_requirement_analysis(
+            {"is_possible_requirement": False},
+            "Björk photographed by Spike Jonze, 1995",
+            "",
+        )
+        self.assertEqual(rejected["is_possible_requirement"], False)
+        self.assertEqual(rejected["signals"], [])
+        self.assertIn("deep research", rejected["sample_rejection_reason"])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -31,8 +32,115 @@ class OpenCliRedditCollector:
             "stderr": result["stderr"],
         }
 
-    def search(self, query: str, limit: int = 25) -> dict[str, Any]:
-        command = [*shlex.split(self.command), query, "--limit", str(limit), "--json"]
+    def collect_queries_to_inbox(
+        self,
+        task_group: TaskGroup,
+        run_id: str,
+        queries: list[str | dict[str, Any]],
+        limit_per_query: int = 10,
+        event_callback: Any | None = None,
+    ) -> dict[str, Any]:
+        output_dir = Path(task_group.input_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        results = []
+        all_items: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        assignments = [normalize_search_assignment(item, index) for index, item in enumerate(queries, start=1)]
+        for assignment in assignments:
+            index = int(assignment["index"])
+            query = str(assignment["query"])
+            agent_id = str(assignment["agent_id"])
+            started_at = utc_now()
+            if event_callback:
+                event_callback(
+                    "collector_query_started",
+                    f"{agent_id} started OpenCLI query: {query}",
+                    {"agent_id": agent_id, "query": query, "subreddit": assignment.get("subreddit", ""), "limit": limit_per_query, "command": self.command},
+                )
+            result = self.search(
+                query=query,
+                limit=limit_per_query,
+                subreddit=str(assignment.get("subreddit", "")),
+                sort=str(assignment.get("sort", "")),
+                time=str(assignment.get("time", "")),
+            )
+            completed_at = utc_now()
+            query_items = []
+            for item in result["items"]:
+                item = {
+                    **item,
+                    "search_agent_id": agent_id,
+                    "search_agent_index": index,
+                    "search_query": query,
+                    "search_subreddit": assignment.get("subreddit", ""),
+                    "search_strategy": assignment.get("strategy", ""),
+                }
+                url = str(item.get("source_url") or "")
+                if url and url in seen_urls:
+                    continue
+                if url:
+                    seen_urls.add(url)
+                query_items.append(item)
+                all_items.append(item)
+            output_path = output_dir / f"opencli_{safe_file_id(run_id)}_agent_{index}.json"
+            output_path.write_text(json.dumps(query_items, indent=2, sort_keys=True), encoding="utf-8")
+            if event_callback:
+                event_callback(
+                    "collector_query_completed",
+                    f"{agent_id} completed OpenCLI query with {len(query_items)} item(s): {query}",
+                    {
+                        "agent_id": agent_id,
+                        "query": query,
+                        "subreddit": assignment.get("subreddit", ""),
+                        "strategy": assignment.get("strategy", ""),
+                        "items_collected": len(query_items),
+                        "output_path": str(output_path),
+                        "urls": [item.get("source_url", "") for item in query_items],
+                    },
+                )
+            results.append(
+                {
+                    "agent_id": agent_id,
+                    "query": query,
+                    "subreddit": assignment.get("subreddit", ""),
+                    "strategy": assignment.get("strategy", ""),
+                    "sort": assignment.get("sort", ""),
+                    "time": assignment.get("time", ""),
+                    "items_collected": len(query_items),
+                    "urls": [item.get("source_url", "") for item in query_items],
+                    "titles": [item.get("title", "") for item in query_items],
+                    "subreddits": sorted({str(item.get("subreddit", "")) for item in query_items if item.get("subreddit")}),
+                    "output_path": str(output_path),
+                    "command": result["command"],
+                    "stderr": result["stderr"],
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                }
+            )
+        return {
+            "queries": [assignment["query"] for assignment in assignments],
+            "assignments": assignments,
+            "items_collected": len(all_items),
+            "limit_per_query": limit_per_query,
+            "search_agents": results,
+        }
+
+    def search(self, query: str, limit: int = 25, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, Any]:
+        command = [*shlex.split(self.command), query, "--limit", str(limit), "-f", "json"]
+        if subreddit:
+            command.extend(["--subreddit", subreddit])
+        if sort:
+            command.extend(["--sort", sort])
+        if time:
+            command.extend(["--time", time])
+        executable = command[0]
+        if shutil.which(executable) is None:
+            raise RuntimeError(
+                f"OpenCLI executable '{executable}' was not found on PATH. "
+                "Install it with: npm install -g @jackwener/opencli. "
+                "Then restart the dashboard so it inherits the updated PATH. "
+                "If you use a non-global install, set this group's OpenCLI command to the full executable path."
+            )
         try:
             completed = subprocess.run(
                 command,
@@ -42,7 +150,10 @@ class OpenCliRedditCollector:
                 timeout=self.timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"opencli command timed out after {self.timeout_seconds} seconds") from exc
+            raise RuntimeError(
+                f"opencli command timed out after {self.timeout_seconds} seconds for query: {query}. "
+                f"Command: {' '.join(command)}"
+            ) from exc
         if completed.returncode != 0:
             raise RuntimeError((completed.stderr or completed.stdout or "opencli command failed").strip())
         raw_items = parse_opencli_output(completed.stdout)
@@ -51,6 +162,31 @@ class OpenCliRedditCollector:
             "stderr": completed.stderr.strip(),
             "items": [normalize_reddit_item(item, query) for item in raw_items],
         }
+
+
+def normalize_search_assignment(item: str | dict[str, Any], index: int) -> dict[str, Any]:
+    if isinstance(item, dict):
+        query = str(item.get("query", "")).strip()
+        return {
+            "index": index,
+            "agent_id": str(item.get("agent_id") or f"search-agent-{index}"),
+            "strategy": str(item.get("strategy") or ""),
+            "query": query,
+            "subreddit": str(item.get("subreddit") or "").strip(),
+            "sort": str(item.get("sort") or "relevance").strip(),
+            "time": str(item.get("time") or "year").strip(),
+            "why": str(item.get("why") or ""),
+        }
+    return {
+        "index": index,
+        "agent_id": f"search-agent-{index}",
+        "strategy": "",
+        "query": str(item).strip(),
+        "subreddit": "",
+        "sort": "",
+        "time": "",
+        "why": "",
+    }
 
 
 def parse_opencli_output(output: str) -> list[dict[str, Any]]:
@@ -125,3 +261,28 @@ def int_or_zero(value: Any) -> int:
 
 def safe_file_id(value: str) -> str:
     return "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")[:120] or "run"
+
+
+def build_requirement_search_queries(task_group: TaskGroup, count: int) -> list[str]:
+    base = (task_group.description or task_group.domain or task_group.name).strip()
+    if not base:
+        base = "user workflow pain"
+    domain = (task_group.domain or task_group.description or task_group.name).strip()
+    templates = [
+        "{base} problem pain workflow",
+        "is there an app for {domain}",
+        "best way to manage {domain}",
+        "alternative to {domain} app",
+        "tired of {domain} manual workflow",
+        "how do people handle {domain}",
+        "{domain} spreadsheet workaround",
+        "{domain} annoying problem",
+    ]
+    queries: list[str] = []
+    for template in templates:
+        query = template.format(base=base, domain=domain).strip()
+        if query and query not in queries:
+            queries.append(query)
+        if len(queries) >= max(count, 1):
+            break
+    return queries

@@ -19,7 +19,7 @@ Reddit Sources
   -> Discovery Agents
   -> Raw Evidence Store
   -> Candidate Requirement Pool
-  -> Main Pool Manager Agent
+  -> Requirement Memory Agent
   -> Deep Research Queue
   -> Deep Research Agents
   -> Requirement Knowledge Base
@@ -31,8 +31,8 @@ High-level flow:
 1. Discovery agents continuously scan Reddit posts and comments.
 2. They identify possible user requirements and save supporting evidence.
 3. Candidate requirements are added to a shared pool.
-4. The main pool manager deduplicates, merges, prioritizes, and checks historical records.
-5. Requirements with enough signal are assigned to deep research agents.
+4. Requirement memory deduplicates, merges, preserves history, and checks historical records.
+5. Every canonical requirement is assigned to deep research; priority only controls order.
 6. Deep research agents validate the requirement, estimate signal strength, infer geography, and identify opportunity types.
 7. Results are saved into the knowledge base.
 8. Human users read, filter, review, and act on the results through a dashboard.
@@ -77,9 +77,9 @@ Example output:
 }
 ```
 
-### 3.2 Main Pool Manager Agent
+### 3.2 Requirement Memory Agent
 
-The pool manager is the system's memory and prioritization layer.
+The requirement memory agent is the system's canonicalization and history layer.
 
 Responsibilities:
 
@@ -88,8 +88,8 @@ Responsibilities:
 - Merge similar requirements into canonical requirement records.
 - Check whether a requirement has appeared before.
 - Compare new evidence with previous research results.
-- Decide whether a requirement should be watched, rejected, queued, reopened, or researched again.
-- Assign deep research tasks.
+- Queue every canonical requirement for deep research.
+- Preserve enough history for deep research and search planning to learn from prior runs.
 - Prevent multiple agents from researching the same requirement at the same time.
 
 Key questions:
@@ -331,9 +331,9 @@ Recommended statuses:
 
 Status meanings:
 
-- `new_candidate`: newly discovered and not yet reviewed by the pool manager.
+- `new_candidate`: newly discovered and not yet canonicalized by requirement memory.
 - `duplicate_candidate`: merged into an existing requirement.
-- `needs_more_evidence`: interesting but too weak for deep research.
+- `needs_more_evidence`: legacy status for older runs before all canonical requirements were queued for research.
 - `queued_for_research`: ready for deep research.
 - `researching`: currently assigned to a deep research agent.
 - `validated`: research suggests the requirement is real.
@@ -654,7 +654,7 @@ Mitigation:
 - Give each agent a narrow role.
 - Require structured JSON outputs.
 - Store decision history.
-- Use the pool manager as the source of truth.
+- Use requirement memory as the source of truth.
 
 ### 11.4 Duplicate Requirements
 
@@ -688,4 +688,3 @@ Mitigation:
 - Agents should have narrow jobs and structured outputs.
 - The system should explain why something appeared again.
 - The dashboard should help humans decide what to research, validate, build, or ignore.
-

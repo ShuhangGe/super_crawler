@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, PoolManagerAgent, ReportAgent
+from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, ReportAgent, RequirementMemoryAgent
 from .collectors import OpenCliRedditCollector
 from .dashboard import serve_dashboard
 from .models import RequirementStatus, TaskGroupStatus, TaskGroupType
@@ -30,7 +30,7 @@ def main() -> None:
     collect = subcommands.add_parser("collect-reddit", help="Collect Reddit search results into a task group inbox with OpenCLI")
     collect.add_argument("task_group_id")
     collect.add_argument("--limit", type=int)
-    collect.add_argument("--command")
+    collect.add_argument("--command", dest="collector_command")
     collect.add_argument("--timeout-seconds", type=int)
 
     daemon = subcommands.add_parser("daemon", help="Run the controlled-source discovery loop forever")
@@ -81,17 +81,17 @@ def main() -> None:
             print(f"Database ready: {storage.db_path}")
         elif args.command == "seed":
             candidates = DiscoveryAgent(storage, "discovery-seed").ingest_reddit_items(SAMPLE_REDDIT_ITEMS)
-            changed = PoolManagerAgent(storage, "pool-manager").reconcile_candidates()
+            changed = RequirementMemoryAgent(storage, "requirement-memory").reconcile_candidates()
             print(f"Ingested {len(candidates)} candidates and reconciled {len(changed)} requirements")
         elif args.command == "ingest-json":
             items = json.loads(Path(args.path).read_text())
             if not isinstance(items, list):
                 raise SystemExit("JSON input must be an array of Reddit-like item objects")
             candidates = DiscoveryAgent(storage, "discovery-json").ingest_reddit_items(items)
-            changed = PoolManagerAgent(storage, "pool-manager").reconcile_candidates()
+            changed = RequirementMemoryAgent(storage, "requirement-memory").reconcile_candidates()
             print(f"Ingested {len(candidates)} candidates and reconciled {len(changed)} requirements")
         elif args.command == "run-cycle":
-            PoolManagerAgent(storage, "pool-manager").reconcile_candidates()
+            RequirementMemoryAgent(storage, "requirement-memory").reconcile_candidates()
             reopened = ChangeDetectionAgent(storage, "change-detector").evaluate_reopenings()
             run = DeepResearchAgent(storage, "research-agent-1").run_next()
             print(f"Reopened {len(reopened)} requirements")
@@ -105,7 +105,7 @@ def main() -> None:
                 raise SystemExit(f"Unknown task group: {args.task_group_id}")
             config = storage.get_app_config()
             collector = OpenCliRedditCollector(
-                command=args.command or config["collector_command"],
+                command=args.collector_command or config["collector_command"],
                 timeout_seconds=args.timeout_seconds or int(config["collector_timeout_seconds"]),
             )
             result = collector.collect_to_inbox(task_group, f"manual_{slugify(task_group.name)}", args.limit or int(config["collector_limit"]))

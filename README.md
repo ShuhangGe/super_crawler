@@ -6,10 +6,10 @@ The implementation is dependency-light Python and stores product memory in SQLit
 
 - Raw Reddit evidence is saved before summarization.
 - Discovery agents extract candidate requirements from Reddit-like items.
-- The pool manager deduplicates, merges, scores, prioritizes, and queues requirements.
+- Requirement memory deduplicates, merges, scores, preserves history, and queues every canonical requirement for deep research.
 - Change detection can reopen watched or previously researched requirements.
 - Deep research agents validate queued requirements and save structured research runs.
-- Report and dashboard views expose pool, queue, detail, evidence, history, and daily summaries.
+- Report and dashboard views expose requirement memory, queue, detail, evidence, history, and daily summaries.
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ Open `http://127.0.0.1:8000` for the dashboard.
 The dashboard has three main pages:
 
 - Running Status: Start, Stop, Run Once, frontend-editable resource limits, create general/domain task groups, and one separate three-column board per task group.
-- Possible Requirements: all non-rejected requirements as lineage rows from task group/search agents to queue/pool, deep research agents, conclusion, and saved pipeline snapshot.
+- Possible Requirements: all non-rejected requirements as lineage rows from task group/search agents to requirement memory, deep research agents, conclusion, and saved pipeline snapshot.
 - Rejected Requirements: rejected or archived requirements using the same lineage-row structure.
 
 Start runs the agent loop in the background, Stop halts it after the current cycle, and Run Once executes a single cycle immediately. Finished search/research lines are reviewed from the Possible Requirements and Rejected Requirements pages.
@@ -54,13 +54,23 @@ Put Reddit-like JSON arrays into each task group's input folder. Running task gr
 
 ## Reddit Collection With OpenCLI
 
-The dashboard can use OpenCLI as a replaceable Reddit collection layer before the existing JSON pipeline runs. In a task group's `Settings` page, enable `OpenCLI Collection` and keep the default command unless your local OpenCLI install uses a different command:
+The dashboard can use OpenCLI as a replaceable Reddit collection layer before the existing JSON pipeline runs. In a task group's inline `Settings` card, enable `OpenCLI Collection` and keep the default command unless your local OpenCLI install uses a different command:
+
+Install OpenCLI first:
+
+```bash
+npm install -g @jackwener/opencli
+```
+
+Then restart the dashboard so Python sees the updated `PATH`.
 
 ```bash
 opencli reddit search
 ```
 
-Each running task group uses its own settings plus its description/domain/name as the query, writes normalized Reddit-like JSON into that group's input folder, logs the collector command and item count, then runs the same discovery, pool, and deep research pipeline.
+OpenCLI's Reddit adapter uses its Browser Bridge. If collection fails with `BROWSER_CONNECT`, open Chrome/Chromium and connect the OpenCLI Browser Bridge extension, then retry the group.
+
+Each running task group uses its own settings plus its description/domain/name as the query, writes normalized Reddit-like JSON into that group's input folder, logs the collector command and item count, then runs the same discovery, requirement memory, and deep research pipeline.
 
 You can also collect manually:
 
@@ -75,11 +85,13 @@ If OpenCLI is not installed or Reddit blocks the command, the task group run log
 The app stores model choices in SQLite so experiments can record which model configuration was active. Defaults are:
 
 - Search/discovery: `deepseek-v4-flash`
-- Pool manager: `deepseek-v4-flash`
+- Requirement memory: `deepseek-v4-flash`
 - Deep research: `deepseek-v4-flash`
 - Report: `deepseek-v4-pro`
 
-These are currently configuration and experiment metadata. The MVP's agent logic is still deterministic heuristics until a live LLM client is connected.
+Search/discovery now calls DeepSeek when `DEEPSEEK_API_KEY` is available in `.env` or the environment. The LLM decides whether each Reddit item expresses a real user requirement and returns a requirement title, description, signals, audience, pain level, and confidence. If the API key is missing or the model call fails, discovery falls back to the deterministic signal rules.
+
+`Global Resource Allocation` controls how many search agents are allocated per scheduler cycle. If one task group is running and Search is set to `3`, that group receives three search agents with different problem-oriented queries such as `problem pain workflow`, `is there an app for ...`, and `best way to manage ...`.
 
 ## Ingest Custom Reddit Data
 

@@ -4,9 +4,11 @@ import html
 import json
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
 from .models import RequirementStatus, TaskGroupStatus, TaskGroupType
+from .search_planner import SearchPlannerAgent
 from .runtime import RuntimeController
 from .storage import Storage
 
@@ -71,6 +73,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             "/rejected",
                         )
                     )
+                elif parsed.path == "/todo":
+                    self._html(todo_page(storage))
                 elif parsed.path == "/queue":
                     self._html(queue_page(storage))
                 elif parsed.path == "/requirement":
@@ -115,6 +119,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._json([asdict(requirement) for requirement in storage.list_requirements()])
                 elif parsed.path == "/action":
                     self._handle_action(storage, parse_qs(parsed.query))
+                elif parsed.path == "/todo-action":
+                    self._handle_todo_action(storage, parse_qs(parsed.query))
                 elif parsed.path == "/task":
                     self._handle_task(storage, parse_qs(parsed.query))
                 elif parsed.path == "/resources":
@@ -124,7 +130,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     if query.get("action", [""])[0] == "save":
                         self._handle_group_settings(storage, query)
                     else:
-                        self._html(group_settings_page(storage, query.get("id", [""])[0]))
+                        task_group_id = query.get("id", [""])[0]
+                        self.send_response(303)
+                        self.send_header("Location", f"/#{task_group_anchor(task_group_id)}" if task_group_id else "/")
+                        self.end_headers()
                 else:
                     self.send_error(404)
 
@@ -178,6 +187,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Location", f"/requirement?id={requirement_id}")
         self.end_headers()
 
+    def _handle_todo_action(self, storage: Storage, query: dict[str, list[str]]) -> None:
+        action = query.get("action", [""])[0]
+        requirement_id = query.get("id", [""])[0]
+        if action == "add":
+            try:
+                storage.add_todo_job(requirement_id, query.get("note", [""])[0])
+            except ValueError:
+                self.send_error(404)
+                return
+            location = "/todo"
+        elif action in {"done", "open"}:
+            storage.update_todo_status(requirement_id, "done" if action == "done" else "open")
+            location = "/todo"
+        else:
+            self.send_error(400)
+            return
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.end_headers()
+
     def _handle_runtime(self, query: dict[str, list[str]]) -> None:
         action = query.get("action", [""])[0]
         if action == "start":
@@ -199,7 +228,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if action == "create":
             task_type = TaskGroupType(query.get("type", [TaskGroupType.GENERAL.value])[0])
             name = query.get("name", [""])[0].strip() or "Search Group"
-            description = query.get("description", [""])[0].strip()
+            raw_description = query.get("description", [""])[0].strip()
+            description = raw_description if task_type == TaskGroupType.DOMAIN else ""
             domain = description if task_type == TaskGroupType.DOMAIN and description else None
             input_dir = query.get("input_dir", [""])[0].strip()
             if not input_dir:
@@ -212,11 +242,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             storage.create_task_group(name, task_type, domain, input_dir, description, subreddits, keywords, negative_keywords)
         elif action == "start":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.RUNNING)
-            from .runner import AlwaysOnRunner
-
-            AlwaysOnRunner(storage, "data/reddit_inbox").run_task_group(task_group_id)
+            self.app_controller.start()
         elif action == "stop":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.STOPPED)
+            if not storage.list_task_groups([TaskGroupStatus.RUNNING.value]):
+                self.app_controller.stop()
         elif action == "delete":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.ARCHIVED)
         elif action == "run-once":
@@ -298,9 +328,13 @@ def layout(content: str) -> str:
     @keyframes pulse {{ 0%, 100% {{ transform: scale(.85); opacity: .55; }} 50% {{ transform: scale(1.25); opacity: 1; }} }}
     @keyframes shimmer {{ 0% {{ transform: translateX(-110%); }} 100% {{ transform: translateX(240%); }} }}
     .task-group-body {{ padding: 14px; }}
-    .group-records {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }}
+    .group-records {{ display: grid; grid-template-columns: repeat(4, minmax(86px, max-content)) minmax(180px, .8fr) minmax(280px, 1.6fr); gap: 10px; margin-bottom: 14px; align-items: stretch; }}
     .group-record {{ border: 1px solid #dce2e8; border-radius: 7px; padding: 10px; background: #fbfcfd; }}
+    .group-record.metric-record {{ min-width: 86px; text-align: center; }}
+    .group-record.text-record {{ min-width: 0; }}
     .group-record-value {{ font-weight: 750; font-size: 17px; margin-top: 2px; overflow-wrap: anywhere; }}
+    .metric-record .group-record-value {{ font-size: 22px; line-height: 1.1; }}
+    .text-record .group-record-value {{ font-size: 13px; font-weight: 650; line-height: 1.35; }}
     .notice {{ border: 1px solid #dce2e8; border-radius: 7px; padding: 10px 12px; margin-bottom: 14px; background: #fbfcfd; }}
     .notice.warning {{ border-color: #f0c36a; background: #fff8e6; color: #5f4300; }}
     .panel {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; min-height: 260px; }}
@@ -311,6 +345,12 @@ def layout(content: str) -> str:
     .controlbar {{ display: flex; align-items: center; justify-content: space-between; gap: 14px; background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; margin-bottom: 18px; }}
     .actions {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
     .stacked-form {{ display: grid; grid-template-columns: minmax(160px, 220px) minmax(180px, 260px) minmax(280px, 1fr) auto; gap: 10px; align-items: start; }}
+    .domain-description[hidden] {{ display: none; }}
+    .inline-settings {{ position: relative; }}
+    .inline-settings summary {{ cursor: pointer; list-style: none; }}
+    .inline-settings summary::-webkit-details-marker {{ display: none; }}
+    .settings-popout {{ position: absolute; right: 0; top: 42px; width: min(720px, calc(100vw - 44px)); z-index: 5; box-shadow: 0 16px 34px rgba(21, 32, 43, .16); }}
+    .settings-form {{ align-items: flex-start; }}
     input, select, textarea {{ border: 1px solid #cfd8df; border-radius: 6px; padding: 8px; min-height: 20px; font: inherit; }}
     textarea {{ min-height: 42px; resize: vertical; }}
     input[type="number"] {{ width: 80px; }}
@@ -334,10 +374,53 @@ def layout(content: str) -> str:
     .agent-chip {{ display: inline-block; margin: 2px 4px 2px 0; padding: 4px 8px; border-radius: 6px; background: #eef3f6; text-decoration: none; }}
     .lineage td:first-child {{ min-width: 220px; }}
     .lineage td {{ font-size: 13px; }}
+    .terminal-log {{ background: #101820; color: #e6edf3; border-radius: 8px; padding: 14px; margin-top: 12px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-x: auto; }}
+    .terminal-entry {{ border-bottom: 1px solid rgba(255, 255, 255, .12); padding: 9px 0; white-space: pre-wrap; }}
+    .terminal-entry:last-child {{ border-bottom: 0; }}
+    .terminal-meta {{ color: #8bd3ff; }}
+    .terminal-message {{ color: #f8fafc; }}
+    .terminal-payload {{ color: #b6e3a8; margin-top: 4px; }}
+    .terminal-error {{ color: #ffb4a8; margin-top: 4px; }}
+    .readable-log {{ display: grid; gap: 12px; margin: 12px 0 18px; }}
+    .readable-block {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 12px; }}
+    .readable-block h3 {{ margin-bottom: 8px; }}
+    .url-list {{ margin: 8px 0 0; padding-left: 18px; }}
+    .url-list li {{ margin-bottom: 5px; overflow-wrap: anywhere; }}
     .muted {{ color: #687782; }}
     a {{ color: #0d5c75; }}
     pre {{ white-space: pre-wrap; background: white; border: 1px solid #dce2e8; padding: 14px; border-radius: 8px; }}
+    @media (max-width: 760px) {{
+      .task-group-header {{ align-items: flex-start; flex-direction: column; }}
+      .group-actions {{ justify-content: flex-start; min-width: 0; }}
+      .settings-popout {{ position: static; width: auto; margin-top: 8px; }}
+      .stacked-form {{ grid-template-columns: 1fr; }}
+      .group-records {{ grid-template-columns: repeat(2, minmax(86px, 1fr)); }}
+      .group-record.text-record {{ grid-column: 1 / -1; }}
+    }}
   </style>
+  <script>
+    function updateTaskCreateFields() {{
+      var type = document.getElementById("task-type");
+      var descriptionBox = document.getElementById("domain-description");
+      var description = document.getElementById("task-description");
+      if (!type || !descriptionBox || !description) {{
+        return;
+      }}
+      var showDescription = type.value === "domain_search";
+      descriptionBox.hidden = !showDescription;
+      description.disabled = !showDescription;
+      if (!showDescription) {{
+        description.value = "";
+      }}
+    }}
+    document.addEventListener("DOMContentLoaded", function () {{
+      updateTaskCreateFields();
+      var type = document.getElementById("task-type");
+      if (type) {{
+        type.addEventListener("change", updateTaskCreateFields);
+      }}
+    }});
+  </script>
 </head>
 <body>
   <header>
@@ -345,6 +428,7 @@ def layout(content: str) -> str:
     <a href="/">Running Status</a>
     <a href="/possible">Possible Requirements</a>
     <a href="/rejected">Rejected Requirements</a>
+    <a href="/todo">Todo Jobs</a>
   </header>
   <main>{content}</main>
 </body>
@@ -401,62 +485,77 @@ def resource_allocation_panel(storage: Storage) -> str:
     """
 
 
-def agent_cards(storage: Storage, roles: list[str], ref: str | None = None) -> str:
-    logs = storage.list_activity_logs(200)
-    runtime_agents = []
-    for role in roles:
-        role_logs = [item for item in logs if item["agent_role"] == role]
-        if ref:
-            role_logs = [
-                item
-                for item in role_logs
-                if ref in {str(value) for value in item["input_refs"] + item["output_refs"]}
-            ]
-        latest = role_logs[0] if role_logs else None
-        runtime_agents.append(
-            {
-                "role": role,
-                "count": len(role_logs),
-                "latest_status": latest["status"] if latest else "idle",
-                "latest_task": latest["task_id"] if latest else "no task yet",
-                "latest_time": latest["completed_at"] if latest else "",
-            }
-        )
+def discovery_agent_card(storage: Storage, task_group: object) -> str:
+    if task_group.status != TaskGroupStatus.RUNNING:
+        return "<p class='muted'>No active discovery agent for this group.</p>"
+    latest = latest_task_group_activity(storage, task_group)
+    latest_plan = latest_search_plan(storage, task_group)
+    if latest_plan:
+        assignments = latest_plan["assignments"]
+    else:
+        plan = SearchPlannerAgent().plan(task_group, search_agent_count_for_group(storage, task_group), 1, [])
+        assignments = plan["assignments"]
     return "".join(
         f"""
-        <a class="item" href="/agent-log?role={html.escape(agent['role'])}{'&ref=' + html.escape(ref) if ref else ''}">
-          <div class="title">{html.escape(agent['role'].replace('_', ' ').title())}</div>
-          <div><span class="status running">{html.escape(agent['latest_status'])}</span></div>
-          <div class="summary">{html.escape(agent['latest_task'])}</div>
-          <div class="summary">{agent['count']} log event(s) {html.escape(str(agent['latest_time'] or ''))}</div>
+        <a class="item" href="/agent-log?role=discovery&agent_id={html.escape(str(assignment['agent_id']))}&ref={html.escape(task_group.task_group_id)}">
+          <div class="title">{html.escape(str(assignment['agent_id']).replace('-', ' ').title())}</div>
+          <div><span class="status running">running</span></div>
+          <div class="summary">Strategy: {html.escape(str(assignment.get('strategy', 'search')))}</div>
+          <div class="summary">Query: {html.escape(str(assignment.get('query', '')))}</div>
+          <div class="summary">{html.escape(latest)}</div>
         </a>
         """
-        for agent in runtime_agents
+        for assignment in assignments
     )
 
 
+def search_agent_count_for_group(storage: Storage, task_group: object) -> int:
+    running_groups = storage.list_task_groups([TaskGroupStatus.RUNNING.value])
+    allocations = allocate_search_slots_for_dashboard(len(running_groups), int(storage.get_resource_config().get("max_search_agents", 3)))
+    for index, running_group in enumerate(running_groups):
+        if running_group.task_group_id == task_group.task_group_id:
+            return allocations[index]
+    return 1
+
+
+def allocate_search_slots_for_dashboard(group_count: int, max_search_agents: int) -> list[int]:
+    if group_count <= 0:
+        return []
+    allocations = [1 for _ in range(group_count)]
+    remaining = max(max_search_agents - group_count, 0)
+    index = 0
+    while remaining > 0:
+        allocations[index % group_count] += 1
+        remaining -= 1
+        index += 1
+    return allocations
+
+
 def deep_research_agent_cards(storage: Storage, task_group: object, requirements: list[object]) -> str:
-    related_refs = {task_group.task_group_id}
-    for run in storage.list_task_group_runs(task_group.task_group_id, limit=50):
-        related_refs.add(run.task_group_run_id)
-    for requirement in requirements:
-        related_refs.add(requirement.requirement_id)
-        related_refs.update(requirement.research_history)
-    logs = []
-    for item in storage.list_agent_logs(agent_role="deep_research", limit=300):
-        refs = {str(value) for value in item["input_refs"] + item["output_refs"]}
-        if refs & related_refs:
-            logs.append(item)
-    latest = logs[0] if logs else None
-    status = latest["status"] if latest else "idle"
-    task = latest["task_id"] if latest else "no deep research for this group yet"
-    time = latest["completed_at"] if latest else ""
+    requirement_ids = {item.requirement_id for item in requirements}
+    queue_rows = [row for row in storage.list_queue() if row["requirement_id"] in requirement_ids]
+    if not queue_rows:
+        return "<p class='muted'>No active deep research agent for this group.</p>"
+    max_agents = max(int(storage.get_resource_config().get("max_deep_research_agents", 1)), 0)
+    if max_agents == 0:
+        return "<p class='muted'>Deep research is disabled by the global resource limit.</p>"
+    return "".join(
+        deep_research_agent_card(row, index, active_slot=True)
+        for index, row in enumerate(queue_rows[:max_agents], start=1)
+    )
+
+
+def deep_research_agent_card(row: dict[str, object], index: int, active_slot: bool = False) -> str:
+    running = bool(row.get("locked_by")) or active_slot
+    status = "running" if running else "queued"
+    agent = str(row.get("locked_by") or row.get("assigned_agent") or f"research-agent-{index}")
+    summary = "Researching now" if row.get("locked_by") else "Assigned to a deep research slot"
     return f"""
-    <a class="item" href="/agent-log?role=deep_research&ref={html.escape(task_group.task_group_id)}">
-      <div class="title">Deep Research</div>
-      <div><span class="status{' running' if status != 'idle' else ''}">{html.escape(str(status))}</span></div>
-      <div class="summary">{html.escape(str(task))}</div>
-      <div class="summary">{len(logs)} group log event(s) {html.escape(str(time or ''))}</div>
+    <a class="item" href="/agent-log?role=deep_research&ref={html.escape(str(row['requirement_id']))}">
+      <div class="title">Deep Research Agent {index}</div>
+      <div><span class="status{' running' if running else ''}">{html.escape(status)}</span></div>
+      <div class="summary">{html.escape(agent)} | {html.escape(summary)}</div>
+      <div class="summary">Requirement: {html.escape(str(row['requirement_id']))}</div>
     </a>
     """
 
@@ -503,7 +602,7 @@ def task_group_header(storage: Storage, task_group: object, requirements: list[o
         <form action="/task"><input type="hidden" name="action" value="start"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button">Start</button></form>
         <form action="/task"><input type="hidden" name="action" value="stop"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button stop">Stop</button></form>
         <form action="/task"><input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}"><button class="button danger">Delete</button></form>
-        <a class="button link-button secondary" href="/group-settings?id={html.escape(task_group.task_group_id)}">Settings</a>
+        {group_settings_inline(storage, task_group)}
         <a class="button link-button secondary" href="/experiment-log?task_group_id={html.escape(task_group.task_group_id)}">Details</a>
         <a href="/possible?task_group_id={html.escape(task_group.task_group_id)}">Possible</a>
         <a href="/rejected?task_group_id={html.escape(task_group.task_group_id)}">Rejected</a>
@@ -515,25 +614,55 @@ def task_group_header(storage: Storage, task_group: object, requirements: list[o
 def task_group_record_summary(storage: Storage, task_group: object, requirements: list[object]) -> str:
     requirement_ids = {item.requirement_id for item in requirements}
     queue = [row for row in storage.list_queue() if row["requirement_id"] in requirement_ids]
-    possible = [item for item in requirements if item.status not in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}]
+    generated_possible = [
+        item
+        for item in requirements
+        if item.status
+        in {
+            RequirementStatus.NEEDS_MORE_EVIDENCE,
+            RequirementStatus.QUEUED_FOR_RESEARCH,
+            RequirementStatus.RESEARCHING,
+            RequirementStatus.REOPENED,
+            RequirementStatus.VALIDATED,
+            RequirementStatus.WATCHING,
+        }
+    ]
+    accepted = [
+        item
+        for item in requirements
+        if item.status in {RequirementStatus.VALIDATED, RequirementStatus.WATCHING}
+        and storage.list_research_runs(item.requirement_id)
+    ]
     researching = [item for item in requirements if item.status == RequirementStatus.RESEARCHING]
-    rejected = [item for item in requirements if item.status in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}]
+    rejected = [
+        item
+        for item in requirements
+        if item.status in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}
+        and storage.list_research_runs(item.requirement_id)
+    ]
     runs = storage.list_task_group_runs(task_group.task_group_id, limit=1)
     last_run = runs[0].completed_at or runs[0].started_at if runs else "Never"
     last_summary = runs[0].summary if runs else "No cycle has completed yet."
-    records = [
-        ("Possible", len(possible)),
+    metric_records = [
+        ("Generated", len(generated_possible)),
         ("Queued", len(queue)),
         ("Researching", len(researching)),
+        ("Accepted", len(accepted)),
         ("Rejected", len(rejected)),
+    ]
+    text_records = [
         ("Last run", last_run),
         ("Last cycle", last_summary),
     ]
     return (
         "<section class='group-records'>"
         + "".join(
-            f"<div class='group-record'><div class='muted'>{html.escape(label)}</div><div class='group-record-value'>{html.escape(str(value))}</div></div>"
-            for label, value in records
+            f"<div class='group-record metric-record'><div class='muted'>{html.escape(label)}</div><div class='group-record-value'>{html.escape(str(value))}</div></div>"
+            for label, value in metric_records
+        )
+        + "".join(
+            f"<div class='group-record text-record'><div class='muted'>{html.escape(label)}</div><div class='group-record-value'>{html.escape(str(value))}</div></div>"
+            for label, value in text_records
         )
         + "</section>"
     )
@@ -572,36 +701,87 @@ def latest_task_group_activity(storage: Storage, task_group: object) -> str:
     return "No run yet."
 
 
+def opencli_install_hint() -> str:
+    return (
+        "<div class='summary'>Requires Node.js and OpenCLI on PATH. "
+        "<code>npm install -g @jackwener/opencli</code>, then restart the dashboard. "
+        "Reddit search also needs the OpenCLI Browser Bridge extension connected in Chrome/Chromium.</div>"
+    )
+
+
 def task_group_search_panel(storage: Storage, task_group: object) -> str:
     return (
-        "<section class='panel'><h2>Discovery Agents</h2>"
-        + agent_cards(storage, ["discovery"], task_group.task_group_id)
+        "<section class='panel'><h2>Search Planner</h2>"
+        + search_planner_card(storage, task_group)
+        + "<h2>Discovery Agents</h2>"
+        + discovery_agent_card(storage, task_group)
         + "</section>"
     )
+
+
+def latest_search_plan(storage: Storage, task_group: object) -> dict[str, object] | None:
+    plans = storage.list_search_plans(task_group.task_group_id, limit=1)
+    return plans[0] if plans else None
+
+
+def search_planner_card(storage: Storage, task_group: object) -> str:
+    plan = latest_search_plan(storage, task_group)
+    if plan:
+        assignments = plan["assignments"]
+        rows = "".join(
+            f"<li><strong>{html.escape(str(item.get('strategy', 'search')))}:</strong> {html.escape(str(item.get('query', '')))}</li>"
+            for item in assignments
+        )
+        return f"""
+        <a class="item" href="/agent-log?role=search_planner&ref={html.escape(task_group.task_group_id)}">
+          <div class="title">Search Planner Agent</div>
+          <div><span class="status">cycle {html.escape(str(plan['cycle_index']))}</span></div>
+          <div class="summary">{html.escape(str(plan['search_goal']))}</div>
+          <ul class="url-list">{rows}</ul>
+        </a>
+        """
+    preview = SearchPlannerAgent().plan(task_group, search_agent_count_for_group(storage, task_group), 1, [])
+    rows = "".join(
+        f"<li><strong>{html.escape(str(item.get('strategy', 'search')))}:</strong> {html.escape(str(item.get('query', '')))}</li>"
+        for item in preview["assignments"]
+    )
+    return f"""
+    <div class="item">
+      <div class="title">Search Planner Agent</div>
+      <div><span class="status">preview</span></div>
+      <div class="summary">{html.escape(str(preview['search_goal']))}</div>
+      <ul class="url-list">{rows}</ul>
+    </div>
+    """
 
 
 def waiting_requirements_panel(requirements: list[object]) -> str:
     items = "".join(requirement_card(item) for item in requirements[:12]) or "<p class='muted'>No found requirement is waiting for verification.</p>"
     return (
-        "<section class='panel'><h2>Found Requirements Waiting To Verify</h2>"
-        "<p class='muted'>These are the requirements found by search agents before, or while, deep research verifies them.</p>"
+        "<section class='panel'><h2>Possible Requirements Waiting For Deep Research</h2>"
+        "<p class='muted'>Discovery agents only do lightweight sample screening. Deep research decides whether each requirement is real.</p>"
         + items
         + "</section>"
     )
 
 
 def deep_research_agents_panel(storage: Storage) -> str:
-    items = agent_cards(storage, ["deep_research", "report"])
-    queue = storage.list_queue()
-    queue_text = "".join(
-        f"<div class='summary'>Consuming queue: {html.escape(row['requirement_id'])} priority {row['priority']}</div>"
-        for row in queue[:5]
-    )
+    active_queue = [row for row in storage.list_queue() if row.get("locked_by")]
+    items = "".join(
+        f"""
+        <a class="item" href="/agent-log?role=deep_research&ref={html.escape(str(row['requirement_id']))}">
+          <div class="title">Deep Research Agent</div>
+          <div><span class="status running">running</span></div>
+          <div class="summary">{html.escape(str(row.get('locked_by') or row.get('assigned_agent') or 'assigned'))}</div>
+          <div class="summary">Requirement: {html.escape(str(row['requirement_id']))}</div>
+        </a>
+        """
+        for row in active_queue
+    ) or "<p class='muted'>No active deep research agent.</p>"
     return (
         "<section class='panel'><h2>Running Deep Research Agents</h2>"
         "<p class='muted'>Deep research agents consume requirements from the queue and produce conclusions.</p>"
         + items
-        + queue_text
         + "</section>"
     )
 
@@ -609,37 +789,47 @@ def deep_research_agents_panel(storage: Storage) -> str:
 def task_group_deep_research_panel(storage: Storage, task_group: object, requirements: list[object]) -> str:
     requirement_ids = {item.requirement_id for item in requirements}
     queue = [row for row in storage.list_queue() if row["requirement_id"] in requirement_ids]
+    max_agents = max(int(storage.get_resource_config().get("max_deep_research_agents", 1)), 0)
+    backlog_count = max(len(queue) - max_agents, 0)
+    if task_group.status != TaskGroupStatus.RUNNING:
+        paused = f"<div class='summary'>{len(queue)} queued requirement(s) paused until this group starts.</div>" if queue else ""
+        return (
+            "<section class='panel'><h2>Running Deep Research Agents</h2>"
+            "<p class='muted'>No active deep research agent for this group.</p>"
+            + paused
+            + "</section>"
+        )
     queue_text = "".join(
-        f"<div class='summary'>Consuming queue: {html.escape(row['requirement_id'])} priority {row['priority']}</div>"
-        for row in queue[:5]
+        f"<div class='summary'>Next requirement: {html.escape(row['requirement_id'])} priority {row['priority']}</div>"
+        for row in queue[:max_agents]
     ) or "<p class='muted'>No deep research queue item for this task group.</p>"
+    backlog = f"<div class='summary'>{backlog_count} requirement(s) waiting behind active slots.</div>" if backlog_count else ""
     return (
         "<section class='panel'><h2>Running Deep Research Agents</h2>"
-        "<p class='muted'>Deep research agents consuming this task group's requirement queue.</p>"
+        "<p class='muted'>Deep research agents are created dynamically from queued requirements, up to the global Deep limit.</p>"
         + deep_research_agent_cards(storage, task_group, requirements)
         + queue_text
+        + backlog
         + "</section>"
     )
 
 
-def group_settings_page(storage: Storage, task_group_id: str) -> str:
-    task_group = storage.get_task_group(task_group_id)
-    if task_group is None:
-        return "<h1>Task group not found</h1>"
-    config = storage.get_task_group_config(task_group_id)
+def group_settings_inline(storage: Storage, task_group: object) -> str:
+    config = storage.get_task_group_config(task_group.task_group_id)
     checked = " checked" if config.get("collector_enabled") == "1" else ""
     return f"""
-    <h1>{html.escape(task_group.name)} Settings</h1>
-    <div class="linkbar"><a href="/#{html.escape(task_group_anchor(task_group_id))}">Back to Group</a></div>
-    <section class="card">
-      <h2>Reddit Collection</h2>
-      <form action="/group-settings" class="actions">
+    <details class="inline-settings" id="settings-{html.escape(task_group.task_group_id)}">
+      <summary class="button link-button secondary">Settings</summary>
+      <section class="card settings-popout">
+      <h3>{html.escape(task_group.name)} Settings</h3>
+      <form action="/group-settings" class="actions settings-form">
         <input type="hidden" name="action" value="save">
-        <input type="hidden" name="id" value="{html.escape(task_group_id)}">
+        <input type="hidden" name="id" value="{html.escape(task_group.task_group_id)}">
         <label>
           <input class="hidden-check" type="checkbox" name="collector_enabled" value="1"{checked}>
           <span class="button toggle-button">OpenCLI Collection</span>
         </label>
+        {opencli_install_hint()}
         <label>Results per run <input type="number" min="1" name="collector_limit" value="{html.escape(config["collector_limit"])}"></label>
         <label>Default model {model_select("model_search", config["model_search"])}</label>
         <label>Deep research model {model_select("model_deep_research", config["model_deep_research"])}</label>
@@ -648,13 +838,14 @@ def group_settings_page(storage: Storage, task_group_id: str) -> str:
           <div class="actions">
             <label>Command <input name="collector_command" value="{html.escape(config["collector_command"])}"></label>
             <label>Timeout <input type="number" min="1" name="collector_timeout_seconds" value="{html.escape(config["collector_timeout_seconds"])}"></label>
-            <label>Pool model {model_select("model_pool", config["model_pool"])}</label>
+            <label>Memory model {model_select("model_pool", config["model_pool"])}</label>
             <label>Report model {model_select("model_report", config["model_report"])}</label>
           </div>
         </details>
         <button class="button">Save Settings</button>
       </form>
-    </section>
+      </section>
+    </details>
     """
 
 
@@ -694,12 +885,20 @@ def pipeline_history_compact(pipelines: list[dict[str, object]]) -> str:
 
 
 def possible_requirements(storage: Storage) -> list[object]:
-    rejected_statuses = {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}
-    return [item for item in storage.list_requirements() if item.status not in rejected_statuses]
+    accepted_statuses = {RequirementStatus.VALIDATED, RequirementStatus.WATCHING}
+    return [
+        item
+        for item in storage.list_requirements()
+        if item.status in accepted_statuses and storage.list_research_runs(item.requirement_id)
+    ]
 
 
 def rejected_requirements(storage: Storage) -> list[object]:
-    return [item for item in storage.list_requirements() if item.status in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}]
+    return [
+        item
+        for item in storage.list_requirements()
+        if item.status in {RequirementStatus.REJECTED, RequirementStatus.ARCHIVED} and storage.list_research_runs(item.requirement_id)
+    ]
 
 
 def requirement_list_page(storage: Storage, title: str, requirements: list[object], selected_task_group_id: str, page_path: str) -> str:
@@ -708,6 +907,39 @@ def requirement_list_page(storage: Storage, title: str, requirements: list[objec
         + task_group_filter(storage, selected_task_group_id, page_path)
         + "<p class='muted'>Each row preserves the whole line from requirement search to conclusion so it can be evaluated later.</p>"
         + grouped_requirement_lineage(storage, requirements, selected_task_group_id)
+    )
+
+
+def todo_page(storage: Storage) -> str:
+    rows = []
+    for job in storage.list_todo_jobs():
+        requirement = storage.get_requirement(str(job["requirement_id"]))
+        score = requirement.current_scores.get("overall_score", 0) if requirement else 0
+        task_groups = task_group_labels(storage, requirement) if requirement else "Task group: unknown"
+        action = "done" if job["status"] == "open" else "open"
+        action_label = "Mark done" if action == "done" else "Reopen"
+        rows.append(
+            f"""
+            <tr>
+              <td>
+                <a href="/requirement?id={html.escape(str(job['requirement_id']))}"><strong>{html.escape(str(job['title']))}</strong></a>
+                <div class="summary">{html.escape(task_groups)}</div>
+                <div class="summary">Requirement: {html.escape(str(job['requirement_id']))} | Score {html.escape(str(score))}</div>
+              </td>
+              <td><span class="status">{html.escape(str(job['status']))}</span><div class="summary">From {html.escape(str(job['source_status']))}</div></td>
+              <td>{html.escape(str(job['note']))}</td>
+              <td>{html.escape(str(job['created_at']))}<div class="summary">Updated {html.escape(str(job['updated_at']))}</div></td>
+              <td><a class="agent-chip" href="/todo-action?action={action}&id={html.escape(str(job['requirement_id']))}">{action_label}</a></td>
+            </tr>
+            """
+        )
+    body = "".join(rows) or "<tr><td colspan='5' class='muted'>No todo jobs yet. Move possible requirements here when you want to track follow-up work.</td></tr>"
+    return (
+        "<h1>Todo Jobs</h1>"
+        "<p class='muted'>Todo jobs are requirements selected for follow-up work. They preserve links back to the full search, sample-analysis, pool, and deep-research lifecycle.</p>"
+        "<table><thead><tr><th>Requirement</th><th>Status</th><th>Note</th><th>Created</th><th>Action</th></tr></thead><tbody>"
+        + body
+        + "</tbody></table>"
     )
 
 
@@ -729,8 +961,8 @@ def grouped_requirement_lineage(storage: Storage, requirements: list[object], se
             f"<p class='muted'>{html.escape(task_group.task_type.value)} | {html.escape(task_group.domain or 'general')} | Input {html.escape(task_group.input_dir)}</p>"
             + requirement_lineage_table(storage, group_requirements)
         )
-    ungrouped = [item for item in requirements if item.requirement_id not in used_ids]
-    if ungrouped:
+    ungrouped = [item for item in requirements if item.requirement_id not in used_ids and not item.task_group_ids]
+    if selected_task_group_id == "__ungrouped__" and ungrouped:
         sections.append("<h2>Ungrouped / Legacy</h2>" + requirement_lineage_table(storage, ungrouped))
     return "".join(sections) if sections else requirement_lineage_table(storage, [])
 
@@ -744,9 +976,9 @@ def task_group_filter(storage: Storage, selected_task_group_id: str, page_path: 
     selected = " selected" if selected_task_group_id == "__ungrouped__" else ""
     options.append(f"<option value='__ungrouped__'{selected}>Ungrouped / Legacy</option>")
     return (
-        "<form class='controlbar' action='" + html.escape(page_path) + "'>"
+        "<form class='controlbar' method='get' action='" + html.escape(page_path) + "'>"
         "<strong>Task Group</strong>"
-        "<select name='task_group_id'>" + "".join(options) + "</select>"
+        "<select name='task_group_id' onchange='this.form.submit()'>" + "".join(options) + "</select>"
         "<button class='button secondary'>Show Group</button>"
         "</form>"
     )
@@ -755,10 +987,10 @@ def task_group_filter(storage: Storage, selected_task_group_id: str, page_path: 
 def requirement_lineage_table(storage: Storage, requirements: list[object]) -> str:
     rows = "".join(requirement_lineage_row(storage, item) for item in requirements)
     if not rows:
-        rows = "<tr><td colspan='6' class='muted'>No requirements in this page yet.</td></tr>"
+        rows = "<tr><td colspan='7' class='muted'>No requirements in this page yet.</td></tr>"
     return (
         "<table class='lineage'><thead><tr>"
-        "<th>Requirement</th><th>Search Agents</th><th>Queue / Pool</th><th>Deep Research Agents</th><th>Conclusion</th><th>Saved Line</th>"
+        "<th>Requirement</th><th>Search Agents</th><th>Queue / Pool</th><th>Deep Research Agents</th><th>Conclusion</th><th>Saved Line</th><th>Todo</th>"
         "</tr></thead><tbody>"
         + rows
         + "</tbody></table>"
@@ -769,10 +1001,12 @@ def requirement_lineage_row(storage: Storage, requirement: object) -> str:
     runs = storage.list_research_runs(requirement.requirement_id)
     latest_run = runs[0] if runs else None
     conclusion = latest_run.recommendation if latest_run else requirement.latest_recommendation or "Waiting for deep research conclusion"
+    rejection_reason = rejection_summary_html(requirement, latest_run)
     search_agents = agent_links_for_requirement(storage, requirement, ["discovery"])
-    pool_agents = agent_links_for_requirement(storage, requirement, ["pool_manager", "change_detection"])
+    pool_agents = agent_links_for_requirement(storage, requirement, ["requirement_memory", "pool_manager", "change_detection"])
     deep_agents = agent_links_for_requirement(storage, requirement, ["deep_research", "report"])
     saved_line = latest_pipeline_for_requirement(storage, requirement.requirement_id)
+    todo = todo_action_for_requirement(storage, requirement)
     status_class = " rejected" if requirement.status == RequirementStatus.REJECTED else ""
     return f"""
     <tr>
@@ -785,10 +1019,46 @@ def requirement_lineage_row(storage: Storage, requirement: object) -> str:
       <td>{search_agents}</td>
       <td>{pool_agents}<div class="summary">Times detected {requirement.times_detected}</div></td>
       <td>{deep_agents}<div class="summary">{len(runs)} research run(s)</div></td>
-      <td>{html.escape(conclusion)}</td>
+      <td>{html.escape(conclusion)}{rejection_reason}</td>
       <td>{saved_line}</td>
+      <td>{todo}</td>
     </tr>
     """
+
+
+def rejection_summary_text(requirement: object, latest_run: object | None) -> str:
+    if requirement.status != RequirementStatus.REJECTED:
+        return ""
+    summary = ""
+    if latest_run:
+        summary = str(
+            latest_run.findings.get("rejection_summary")
+            or latest_run.findings.get("why_noise")
+            or latest_run.findings.get("realness_reason")
+            or ""
+        )
+    if not summary:
+        summary = str(requirement.latest_recommendation or "Rejected because the deep research evidence was not strong enough.")
+    if not summary.lower().startswith("rejected"):
+        summary = f"Rejected because {summary.rstrip('.')}."
+    return summary
+
+
+def rejection_summary_html(requirement: object, latest_run: object | None) -> str:
+    summary = rejection_summary_text(requirement, latest_run)
+    if not summary:
+        return ""
+    return f"<div class='summary'><strong>Reason:</strong> {html.escape(summary)}</div>"
+
+
+def todo_action_for_requirement(storage: Storage, requirement: object) -> str:
+    todo = storage.get_todo_job(requirement.requirement_id)
+    if todo:
+        return (
+            f"<a class='agent-chip' href='/todo'>Todo: {html.escape(str(todo['status']))}</a>"
+            f"<div class='summary'>{html.escape(str(todo['updated_at']))}</div>"
+        )
+    return f"<a class='agent-chip' href='/todo-action?action=add&id={html.escape(requirement.requirement_id)}'>Move to todo list</a>"
 
 
 def task_create_panel() -> str:
@@ -797,12 +1067,14 @@ def task_create_panel() -> str:
       <h2>Create Task Group</h2>
       <form action="/task" class="stacked-form">
         <input type="hidden" name="action" value="create">
-        <select name="type" aria-label="Task group type">
+        <select id="task-type" name="type" aria-label="Task group type">
           <option value="general_search">General Search</option>
           <option value="domain_search">Domain Specific</option>
         </select>
         <input name="name" placeholder="Group name">
-        <textarea name="description" placeholder="What are we planning to search?"></textarea>
+        <span id="domain-description" class="domain-description" hidden>
+          <textarea id="task-description" name="description" placeholder="Domain search plan" disabled></textarea>
+        </span>
         <button class="button">Create</button>
       </form>
     </section>
@@ -853,10 +1125,8 @@ def parse_int(value: str, default: int) -> int:
 
 def waiting_statuses() -> set[RequirementStatus]:
     return {
-        RequirementStatus.NEW_CANDIDATE,
-        RequirementStatus.NEEDS_MORE_EVIDENCE,
         RequirementStatus.QUEUED_FOR_RESEARCH,
-        RequirementStatus.WATCHING,
+        RequirementStatus.RESEARCHING,
         RequirementStatus.REOPENED,
     }
 
@@ -876,7 +1146,7 @@ def lineage_task_groups(storage: Storage, requirements: list[object]) -> list[ob
 
 def filter_requirements_by_group(requirements: list[object], task_group_id: str) -> list[object]:
     if not task_group_id:
-        return requirements
+        return [item for item in requirements if item.task_group_ids]
     if task_group_id == "__ungrouped__":
         return [item for item in requirements if not item.task_group_ids]
     return [item for item in requirements if task_group_id in item.task_group_ids]
@@ -899,9 +1169,26 @@ def related_log_count(storage: Storage, requirement: object, role: str) -> int:
         log_refs = {str(ref) for ref in item["input_refs"] + item["output_refs"]}
         if refs & log_refs:
             count += 1
+    if role == "deep_research":
+        count += len(storage.list_research_runs(requirement.requirement_id))
+        count += len([event for event in storage.list_requirement_events(requirement.requirement_id) if event["agent_role"] == "deep_research"])
+        count += len(requirement_experiment_logs(storage, requirement, role))
     if count == 0 and role == "discovery" and requirement.evidence_ids:
         return len(logs)
     return count
+
+
+def requirement_experiment_logs(storage: Storage, requirement: object, role: str | None = None) -> list[dict[str, object]]:
+    logs_by_id: dict[int, dict[str, object]] = {}
+    for task_group_id in requirement.task_group_ids:
+        for item in storage.list_experiment_logs(task_group_id=task_group_id, agent_role=role, limit=500):
+            payload = item["payload_json"]
+            if (
+                payload.get("requirement_id") == requirement.requirement_id
+                or str(requirement.requirement_id) in str(item.get("message", ""))
+            ):
+                logs_by_id[int(item["log_id"])] = item
+    return sorted(logs_by_id.values(), key=lambda item: int(item["log_id"]), reverse=True)
 
 
 def latest_pipeline_for_requirement(storage: Storage, requirement_id: str) -> str:
@@ -1009,8 +1296,11 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
     report = ""
     if latest:
         findings = latest.findings
+        rejection_summary = rejection_summary_text(requirement, latest)
+        rejected_reason = f"<p><strong>Rejected reason:</strong> {html.escape(rejection_summary)}</p>" if rejection_summary else ""
         report = (
             "<h2>Research Report</h2>"
+            f"{rejected_reason}"
             f"<p><strong>Why real:</strong> {html.escape(findings['why_real'])}</p>"
             f"<p><strong>Why noise:</strong> {html.escape(findings['why_noise'])}</p>"
             f"<p><strong>Recommendation:</strong> {html.escape(latest.recommendation)}</p>"
@@ -1023,6 +1313,7 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
       <a href="/agent-log?role=discovery&ref={html.escape(requirement.requirement_id)}">Requirement Search Agent Log</a>
       <a href="/agent-log?role=deep_research&ref={html.escape(requirement.requirement_id)}">Deep Research Agent Log</a>
       <a href="/requirement-samples?requirement_id={html.escape(requirement.requirement_id)}">Pool Samples</a>
+      <a href="/todo-action?action=add&id={html.escape(requirement.requirement_id)}">Move to todo list</a>
       <a href="/possible">Back to Possible Requirements</a>
       <a href="/rejected">Back to Rejected Requirements</a>
     </div>
@@ -1045,7 +1336,7 @@ def detail_page(storage: Storage, requirement_id: str) -> str:
     <pre>{html.escape(json.dumps(requirement.decision_history, indent=2))}</pre>
     <h2>Workflow Timeline</h2>
     <table><thead><tr><th>Time</th><th>Agent</th><th>Event</th><th>Message</th></tr></thead><tbody>{event_rows}</tbody></table>
-    <h2>Pool Manager Sample Sentences</h2>
+    <h2>Requirement Memory Sample Sentences</h2>
     <table><thead><tr><th>Time</th><th>Sample</th><th>Status</th><th>Task Group Run</th></tr></thead><tbody>{sample_rows}</tbody></table>
     <h2>Research History</h2>
     <table><thead><tr><th>Run</th><th>Agent</th><th>Completed</th><th>Recommendation</th></tr></thead><tbody>{run_rows}</tbody></table>
@@ -1072,49 +1363,35 @@ def agent_log_page(storage: Storage, role: str, agent_id: str, ref: str = "") ->
             if related_refs & refs:
                 filtered.append(item)
         logs = filtered
-        experiment_logs = storage.list_experiment_logs(task_group_id=ref, agent_role=role or None, limit=100)
+        if requirement:
+            experiment_logs = requirement_experiment_logs(storage, requirement, role or None)
+        else:
+            experiment_logs = storage.list_experiment_logs(task_group_id=ref, agent_role=role or None, limit=100)
+        if agent_id:
+            experiment_logs = [
+                item
+                for item in experiment_logs
+                if item["payload_json"].get("agent_id") == agent_id
+                or agent_id in {str(value) for value in item["payload_json"].get("agent_ids", [])}
+            ]
     title = role.replace("_", " ").title() if role else agent_id or "Agent"
-    rows = "".join(
-        f"""
-        <tr>
-          <td>{html.escape(str(item['id']))}</td>
-          <td>{html.escape(str(item['completed_at'] or item['started_at']))}</td>
-          <td>{html.escape(str(item['agent_role']))}</td>
-          <td>{html.escape(str(item['agent_id']))}</td>
-          <td>{html.escape(str(item['task_id']))}</td>
-          <td>{html.escape(str(item['status']))}</td>
-          <td>{html.escape(str(item['error'] or ''))}</td>
-        </tr>
-        """
-        for item in logs
-    )
-    experiment_rows = "".join(
-        f"""
-        <tr>
-          <td>{html.escape(str(item['log_id']))}</td>
-          <td>{html.escape(str(item['created_at']))}</td>
-          <td>{html.escape(str(item['agent_role']))}</td>
-          <td>{html.escape(str(item['step_name']))}</td>
-          <td>{html.escape(str(item['message']))}</td>
-        </tr>
-        """
-        for item in experiment_logs
-    )
-    full_logs = html.escape(json.dumps(logs, indent=2, default=str))
-    full_experiment_logs = html.escape(json.dumps(experiment_logs, indent=2, default=str))
+    terminal_entries = terminal_log_stream(logs, experiment_logs)
+    readable_title = "Search Log"
+    if role == "deep_research":
+        readable_title = "Deep Research Log"
+        readable_entries = readable_deep_research_log_sections(experiment_logs)
+    else:
+        readable_entries = readable_search_log_sections(experiment_logs)
     ref_text = f" Related to {ref}." if ref else ""
     summary = f"{len(logs)} activity log event(s), {len(experiment_logs)} experiment log event(s). Latest status: {logs[0]['status'] if logs else 'none'}.{ref_text}"
     return f"""
     <h1>{html.escape(title)} Log</h1>
     <p class="muted">{html.escape(summary)}</p>
     <div class="linkbar"><a href="/">Running Status</a><a href="/possible">Possible Requirements</a><a href="/rejected">Rejected Requirements</a></div>
-    <table><thead><tr><th>ID</th><th>Time</th><th>Role</th><th>Agent</th><th>Task</th><th>Status</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>
-    <h2>Experiment Steps</h2>
-    <table><thead><tr><th>ID</th><th>Time</th><th>Role</th><th>Step</th><th>Message</th></tr></thead><tbody>{experiment_rows or "<tr><td colspan='5' class='muted'>No experiment steps for this filter.</td></tr>"}</tbody></table>
-    <h2>Full Log Payload</h2>
-    <pre>{full_logs}</pre>
-    <h2>Full Experiment Payload</h2>
-    <pre>{full_experiment_logs}</pre>
+    <h2>{html.escape(readable_title)}</h2>
+    {readable_entries}
+    <h2>Raw Terminal Log</h2>
+    {terminal_entries}
     """
 
 
@@ -1131,6 +1408,8 @@ def experiment_log_page(storage: Storage, task_group_id: str = "", task_group_ru
         title_parts.append(task.name if task else task_group_id)
     if agent_role:
         title_parts.append(agent_role.replace("_", " ").title())
+    terminal_entries = terminal_log_stream([], logs)
+    readable_entries = readable_log_sections([], logs)
     rows = "".join(
         f"""
         <tr>
@@ -1146,8 +1425,402 @@ def experiment_log_page(storage: Storage, task_group_id: str = "", task_group_ru
     return f"""
     <h1>{html.escape(' - '.join(title_parts))}</h1>
     <div class="linkbar"><a href="/">Running Status</a><a href="/possible">Possible Requirements</a><a href="/rejected">Rejected Requirements</a></div>
+    <h2>Readable Log</h2>
+    {readable_entries}
+    <h2>Terminal Style Log</h2>
+    {terminal_entries}
     <table><thead><tr><th>Time</th><th>Agent</th><th>Step</th><th>Message</th><th>Payload</th></tr></thead><tbody>{rows}</tbody></table>
     """
+
+
+def terminal_log_stream(activity_logs: list[dict[str, object]], experiment_logs: list[dict[str, object]]) -> str:
+    entries = []
+    for item in activity_logs:
+        entries.append(
+            {
+                "time": str(item.get("completed_at") or item.get("started_at") or ""),
+                "role": str(item.get("agent_role") or ""),
+                "name": str(item.get("agent_id") or ""),
+                "step": str(item.get("task_id") or ""),
+                "message": f"status={item.get('status')}",
+                "payload": {
+                    "input_refs": item.get("input_refs", []),
+                    "output_refs": item.get("output_refs", []),
+                    "retry_count": item.get("retry_count", 0),
+                    "cost_estimate": item.get("cost_estimate", 0),
+                },
+                "error": str(item.get("error") or ""),
+            }
+        )
+    for item in experiment_logs:
+        entries.append(
+            {
+                "time": str(item.get("created_at") or ""),
+                "role": str(item.get("agent_role") or ""),
+                "name": str(item.get("task_group_run_id") or item.get("task_group_id") or ""),
+                "step": str(item.get("step_name") or ""),
+                "message": str(item.get("message") or ""),
+                "payload": item.get("payload_json", {}),
+                "error": "",
+            }
+        )
+    entries.sort(key=lambda item: item["time"])
+    if not entries:
+        return "<div class='terminal-log'><div class='terminal-entry terminal-message'>No log lines for this filter.</div></div>"
+    return (
+        "<div class='terminal-log'>"
+        + "".join(terminal_log_entry(item) for item in entries)
+        + "</div>"
+    )
+
+
+def readable_log_sections(activity_logs: list[dict[str, object]], experiment_logs: list[dict[str, object]]) -> str:
+    search_blocks = [readable_search_agent_block(item) for item in experiment_logs if item.get("step_name") == "search_agent_completed"]
+    analysis_blocks = [readable_item_analysis_block(item) for item in experiment_logs if item.get("step_name") in {"item_analyzed", "sample_analyzed"}]
+    lifecycle_blocks = [readable_lifecycle_block(item) for item in experiment_logs if item.get("step_name") in {"requirements_generated", "pool_requirement_sample", "requirements_queued", "deep_research_output", "run_completed"}]
+    activity_blocks = [readable_activity_block(item) for item in activity_logs]
+    content = "".join(search_blocks + analysis_blocks + lifecycle_blocks + activity_blocks)
+    if not content:
+        content = "<section class='readable-block'><p class='muted'>No readable log entries for this filter yet.</p></section>"
+    return f"<div class='readable-log'>{content}</div>"
+
+
+def readable_search_log_sections(experiment_logs: list[dict[str, object]]) -> str:
+    planner_entries = unique_search_plan_entries(
+        item for item in experiment_logs if item.get("step_name") == "search_plan_created"
+    )
+    search_entries = unique_search_log_entries(
+        item for item in experiment_logs if item.get("step_name") == "search_agent_completed"
+    )
+    analysis_entries = unique_search_log_entries(
+        item for item in experiment_logs if item.get("step_name") in {"item_analyzed", "sample_analyzed"}
+    )
+    planner_blocks = [readable_search_plan_block(item) for item in planner_entries]
+    search_blocks = [readable_search_agent_block(item) for item in search_entries]
+    analysis_blocks = [readable_item_analysis_block(item) for item in analysis_entries]
+    content = "".join(planner_blocks + search_blocks + analysis_blocks)
+    if not content:
+        content = "<section class='readable-block'><p class='muted'>No search log entries for this agent yet.</p></section>"
+    return f"<div class='readable-log'>{content}</div>"
+
+
+def readable_deep_research_log_sections(experiment_logs: list[dict[str, object]]) -> str:
+    started_blocks = [
+        readable_deep_research_started_block(item)
+        for item in experiment_logs
+        if item.get("step_name") == "deep_research_started"
+    ]
+    plan_blocks = [
+        readable_deep_research_plan_block(item)
+        for item in experiment_logs
+        if item.get("step_name") == "deep_research_plan_created"
+    ]
+    search_blocks = [
+        readable_deep_research_search_block(item)
+        for item in experiment_logs
+        if item.get("step_name") in {"deep_research_search_started", "deep_research_search_completed", "deep_research_search_failed"}
+    ]
+    analysis_blocks = [
+        readable_deep_research_item_block(item)
+        for item in experiment_logs
+        if item.get("step_name") == "deep_research_item_analyzed"
+    ]
+    evidence_blocks = [
+        readable_deep_research_evidence_block(item)
+        for item in experiment_logs
+        if item.get("step_name") == "deep_research_evidence_collected"
+    ]
+    output_blocks = [
+        readable_deep_research_output_block(item)
+        for item in experiment_logs
+        if item.get("step_name") == "deep_research_output"
+    ]
+    content = "".join(started_blocks + plan_blocks + search_blocks + analysis_blocks + evidence_blocks + output_blocks)
+    if not content:
+        content = (
+            "<section class='readable-block'>"
+            "<h3>Waiting For Deep Research</h3>"
+            "<p class='muted'>No deep research output has been recorded for this requirement yet. "
+            "If this requirement is queued, its log will appear after a deep research slot processes it.</p>"
+            "</section>"
+        )
+    return f"<div class='readable-log'>{content}</div>"
+
+
+def readable_deep_research_plan_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    rows = "".join(
+        f"<li><strong>{html.escape(str(task.get('strategy', 'research')))}:</strong> "
+        f"{html.escape(str(task.get('question', '')))}<br>"
+        f"<span class='summary'>Query: {html.escape(str(task.get('query', '')))}"
+        f"{' | Subreddit: ' + html.escape(str(task.get('subreddit'))) if task.get('subreddit') else ''}</span></li>"
+        for task in payload.get("plan", [])
+        if isinstance(task, dict)
+    )
+    return f"""
+    <section class="readable-block">
+      <h3>Deep Research Plan</h3>
+      <ul class="url-list">{rows or "<li>No search tasks recorded.</li>"}</ul>
+    </section>
+    """
+
+
+def readable_deep_research_search_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    urls = "".join(
+        f"<li><a href=\"{html.escape(str(url))}\">{html.escape(str(url))}</a></li>"
+        for url in payload.get("urls", [])[:8]
+    )
+    error = f"<div><strong>Error:</strong> {html.escape(str(payload.get('error')))}</div>" if payload.get("error") else ""
+    return f"""
+    <section class="readable-block">
+      <h3>{html.escape(str(item.get('step_name', '')).replace('_', ' ').title())}</h3>
+      <div><strong>Question:</strong> {html.escape(str(payload.get('question', '')))}</div>
+      <div><strong>Query:</strong> {html.escape(str(payload.get('query', '')))}</div>
+      <div><strong>Subreddit:</strong> {html.escape(str(payload.get('subreddit', '') or 'any'))}</div>
+      <div><strong>Returned / analyzed / added:</strong> {html.escape(str(payload.get('items_returned', '')))} / {html.escape(str(payload.get('items_analyzed', '')))} / {html.escape(str(payload.get('evidence_added', '')))}</div>
+      {error}
+      <ul class="url-list">{urls}</ul>
+    </section>
+    """
+
+
+def readable_deep_research_item_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    url = str(payload.get("url", ""))
+    link = f"<a href=\"{html.escape(url)}\">{html.escape(url)}</a>" if url else ""
+    return f"""
+    <section class="readable-block">
+      <h3>Evidence Item Analysis</h3>
+      <div><strong>Title:</strong> {html.escape(str(payload.get('title', '')))}</div>
+      <div><strong>URL:</strong> {link}</div>
+      <div><strong>Relevant:</strong> {html.escape(str(payload.get('is_relevant_evidence', '')))}</div>
+      <div><strong>Type:</strong> {html.escape(str(payload.get('evidence_type', '')))}</div>
+      <div><strong>Analysis:</strong> {html.escape(str(payload.get('analysis_summary', '')))}</div>
+      <div><strong>Signals:</strong> {html.escape(', '.join(str(signal) for signal in payload.get('signals', [])))}</div>
+    </section>
+    """
+
+
+def readable_deep_research_evidence_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    return f"""
+    <section class="readable-block">
+      <h3>Evidence Collected</h3>
+      <div><strong>Items analyzed:</strong> {html.escape(str(payload.get('items_analyzed', 0)))}</div>
+      <div><strong>New evidence:</strong> {html.escape(str(len(payload.get('evidence_ids', []))))}</div>
+      <div><strong>Evidence IDs:</strong> {html.escape(', '.join(str(eid) for eid in payload.get('evidence_ids', [])))}</div>
+    </section>
+    """
+
+
+def readable_deep_research_started_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    return f"""
+    <section class="readable-block">
+      <h3>Deep Research Started</h3>
+      <div><strong>Requirement:</strong> {html.escape(str(payload.get('requirement_id', '')))}</div>
+      <div><strong>Agent:</strong> {html.escape(str(payload.get('agent_id', '')))}</div>
+      <div><strong>Time:</strong> {html.escape(str(item.get('created_at', '')))}</div>
+    </section>
+    """
+
+
+def readable_deep_research_output_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    scores = payload.get("scores", {})
+    score_text = ""
+    if isinstance(scores, dict):
+        score_text = ", ".join(
+            f"{key}: {value}"
+            for key, value in scores.items()
+            if key in {"overall_score", "overall_label", "pain_intensity_score", "engagement_score", "monetization_score"}
+        )
+    regions = payload.get("country_area_distribution", [])
+    region_text = json.dumps(regions, default=str) if regions else "No geography inferred."
+    return f"""
+    <section class="readable-block">
+      <h3>Deep Research Output</h3>
+      <div><strong>Requirement:</strong> {html.escape(str(payload.get('requirement_id', '')))}</div>
+      <div><strong>Run:</strong> {html.escape(str(payload.get('research_run_id', '')))}</div>
+      <div><strong>Agent:</strong> {html.escape(str(payload.get('agent_id', '')))}</div>
+      <div><strong>Is real requirement:</strong> {html.escape(str(payload.get('is_real_requirement', '')))}</div>
+      <div><strong>Status:</strong> {html.escape(str(payload.get('status', '')))}</div>
+      <div><strong>Scale:</strong> {html.escape(str(payload.get('requirement_scale', '')))}</div>
+      <div><strong>Recommendation:</strong> {html.escape(str(payload.get('recommendation', '')))}</div>
+      <div><strong>Reason:</strong> {html.escape(str(payload.get('realness_reason', '')))}</div>
+      <div><strong>Scores:</strong> {html.escape(score_text)}</div>
+      <div><strong>Country / area:</strong> {html.escape(region_text)}</div>
+    </section>
+    """
+
+
+def unique_search_plan_entries(entries: Iterable[dict[str, object]]) -> list[dict[str, object]]:
+    unique: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in entries:
+        payload = item.get("payload_json", {})
+        key = (
+            str(payload.get("plan_id", "")),
+            str(payload.get("cycle_index", "")),
+            str(item.get("task_group_run_id", "")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def unique_search_log_entries(entries: Iterable[dict[str, object]]) -> list[dict[str, object]]:
+    unique: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for item in entries:
+        payload = item.get("payload_json", {})
+        key = (
+            str(item.get("step_name", "")),
+            str(payload.get("agent_id", "")),
+            str(payload.get("query") or payload.get("search_query") or ""),
+            str(payload.get("url") or payload.get("output_path") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def readable_search_plan_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    assignments = payload.get("assignments", [])
+    if not isinstance(assignments, list):
+        assignments = []
+    rows = "".join(readable_search_plan_assignment(assignment) for assignment in assignments if isinstance(assignment, dict))
+    if not rows:
+        queries = payload.get("queries", [])
+        if isinstance(queries, list):
+            rows = "".join(
+                f"<tr><td></td><td>All Reddit</td><td>{html.escape(str(query))}</td><td></td><td></td></tr>"
+                for query in queries
+            )
+    if not rows:
+        rows = "<tr><td colspan='5' class='muted'>No planned searches recorded.</td></tr>"
+    search_brief = payload.get("search_brief", {})
+    if not isinstance(search_brief, dict):
+        search_brief = {}
+    coverage = search_brief.get("coverage_targets", [])
+    if not isinstance(coverage, list):
+        coverage = []
+    return f"""
+    <section class="readable-block">
+      <h3>Search Plan Cycle {html.escape(str(payload.get('cycle_index', '')))}</h3>
+      <div><strong>Planner:</strong> {html.escape(str(payload.get('planner_agent_id', item.get('agent_role', 'search_planner'))))}</div>
+      <div><strong>User description:</strong> {html.escape(str(payload.get('input_description', '')))}</div>
+      <div><strong>Search goal:</strong> {html.escape(str(payload.get('search_goal', '')))}</div>
+      <div><strong>Domain:</strong> {html.escape(str(search_brief.get('domain', '')))}</div>
+      <div><strong>Coverage:</strong> {html.escape(', '.join(str(value) for value in coverage))}</div>
+      <table>
+        <thead><tr><th>Search Agent</th><th>Subreddit</th><th>Question / Query</th><th>Strategy</th><th>Why</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </section>
+    """
+
+
+def readable_search_plan_assignment(assignment: dict[str, object]) -> str:
+    return f"""
+    <tr>
+      <td>{html.escape(str(assignment.get('agent_id', '')))}</td>
+      <td>{html.escape(str(assignment.get('subreddit', '') or 'All Reddit'))}</td>
+      <td>{html.escape(str(assignment.get('query', '')))}</td>
+      <td>{html.escape(str(assignment.get('strategy', '')))}</td>
+      <td>{html.escape(str(assignment.get('why', '')))}</td>
+    </tr>
+    """
+
+
+def readable_search_agent_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    urls = payload.get("urls", [])
+    titles = payload.get("titles", [])
+    if len(titles) < len(urls):
+        titles = [*titles, *urls[len(titles) :]]
+    url_rows = "".join(
+        f"<li><a href='{html.escape(str(url))}'>{html.escape(str(title or url))}</a></li>"
+        for url, title in zip(urls, titles)
+    ) or "<li class='muted'>No URLs collected.</li>"
+    return f"""
+    <section class="readable-block">
+      <h3>{html.escape(str(payload.get('agent_id', item.get('agent_role', 'Search Agent'))))}</h3>
+      <div><strong>Query:</strong> {html.escape(str(payload.get('query', '')))}</div>
+      <div><strong>Subreddit:</strong> {html.escape(str(payload.get('subreddit', '') or 'All Reddit'))}</div>
+      <div><strong>Strategy:</strong> {html.escape(str(payload.get('strategy', '')))}</div>
+      <div><strong>Items collected:</strong> {html.escape(str(payload.get('items_collected', 0)))}</div>
+      <div><strong>Output file:</strong> {html.escape(str(payload.get('output_path', '')))}</div>
+      <ul class="url-list">{url_rows}</ul>
+    </section>
+    """
+
+
+def readable_item_analysis_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    is_possible = payload.get("is_possible_requirement", payload.get("is_requirement"))
+    decision = "Possible Requirement" if is_possible else "Sample Rejected"
+    reason = payload.get("sample_analysis") or payload.get("analysis_summary") or payload.get("sample_rejection_reason") or payload.get("rejection_reason") or "No sample analysis recorded."
+    query = payload.get("search_query")
+    return f"""
+    <section class="readable-block">
+      <h3>{html.escape(decision)} Sample Analysis</h3>
+      <div><strong>Agent:</strong> {html.escape(str(payload.get('agent_id', '')))}</div>
+      {f'<div><strong>Query:</strong> {html.escape(str(query))}</div>' if query else ''}
+      <div><strong>URL:</strong> <a href="{html.escape(str(payload.get('url', '')))}">{html.escape(str(payload.get('url', '')))}</a></div>
+      <div><strong>Title:</strong> {html.escape(str(payload.get('title', '')))}</div>
+      <div><strong>Subreddit:</strong> {html.escape(str(payload.get('subreddit', '')))}</div>
+      <div><strong>Signals:</strong> {html.escape(', '.join(str(signal) for signal in payload.get('signals', [])))}</div>
+      <div><strong>Confidence:</strong> {html.escape(str(payload.get('confidence') or ''))}</div>
+      <div><strong>Sample analysis:</strong> {html.escape(str(reason))}</div>
+      <div><strong>Sample result:</strong> {html.escape(str(payload.get('requirement_title') or payload.get('sample_rejection_reason') or payload.get('rejection_reason') or decision))}</div>
+    </section>
+    """
+
+
+def readable_lifecycle_block(item: dict[str, object]) -> str:
+    payload = item["payload_json"]
+    payload_text = json.dumps(payload, indent=2, sort_keys=True, default=str)
+    return f"""
+    <section class="readable-block">
+      <h3>{html.escape(str(item.get('step_name', '')).replace('_', ' ').title())}</h3>
+      <div>{html.escape(str(item.get('message', '')))}</div>
+      <pre>{html.escape(payload_text)}</pre>
+    </section>
+    """
+
+
+def readable_activity_block(item: dict[str, object]) -> str:
+    return f"""
+    <section class="readable-block">
+      <h3>{html.escape(str(item.get('agent_id', 'Agent')))}</h3>
+      <div><strong>Status:</strong> {html.escape(str(item.get('status', '')))}</div>
+      <div><strong>Task:</strong> {html.escape(str(item.get('task_id', '')))}</div>
+      <div><strong>Inputs:</strong> {html.escape(', '.join(str(ref) for ref in item.get('input_refs', [])))}</div>
+      <div><strong>Outputs:</strong> {html.escape(', '.join(str(ref) for ref in item.get('output_refs', [])))}</div>
+    </section>
+    """
+
+
+def terminal_log_entry(item: dict[str, object]) -> str:
+    meta = f"[{item['time']}] {item['role']} {item['name']} :: {item['step']}".strip()
+    payload = item.get("payload")
+    payload_text = json.dumps(payload, indent=2, sort_keys=True, default=str) if payload else ""
+    error = str(item.get("error") or "")
+    return (
+        "<div class='terminal-entry'>"
+        f"<div class='terminal-meta'>{html.escape(meta)}</div>"
+        f"<div class='terminal-message'>{html.escape(str(item.get('message') or ''))}</div>"
+        + (f"<div class='terminal-payload'>{html.escape(payload_text)}</div>" if payload_text and payload_text != "{}" else "")
+        + (f"<div class='terminal-error'>{html.escape(error)}</div>" if error else "")
+        + "</div>"
+    )
 
 
 def requirement_samples_page(
@@ -1181,7 +1854,7 @@ def requirement_samples_page(
     ) or "<tr><td colspan='6' class='muted'>No requirement samples yet.</td></tr>"
     return f"""
     <h1>{html.escape(title)}</h1>
-    <p class="muted">One short sentence for every requirement generated or updated by the pool manager.</p>
+    <p class="muted">One short sentence for every requirement generated or updated by requirement memory.</p>
     <div class="linkbar"><a href="/">Running Status</a><a href="/possible">Possible Requirements</a><a href="/rejected">Rejected Requirements</a></div>
     <table><thead><tr><th>Time</th><th>Requirement</th><th>Sample</th><th>Status</th><th>Task Group</th><th>Run</th></tr></thead><tbody>{rows}</tbody></table>
     """
