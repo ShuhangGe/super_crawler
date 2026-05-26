@@ -679,6 +679,13 @@ class Storage:
         self.conn.execute("DELETE FROM research_queue WHERE requirement_id=?", (requirement_id,))
         self.conn.commit()
 
+    def unlock_research(self, requirement_id: str) -> None:
+        self.conn.execute(
+            "UPDATE research_queue SET locked_by=NULL, updated_at=? WHERE requirement_id=?",
+            (utc_now(), requirement_id),
+        )
+        self.conn.commit()
+
     def update_queue_priority(self, requirement_id: str, priority: int) -> None:
         self.conn.execute(
             "UPDATE research_queue SET priority=?, updated_at=? WHERE requirement_id=?",

@@ -586,6 +586,8 @@ class RequirementMemoryAgent(BaseAgent):
         requirement.current_scores = scores
         if requirement.status == RequirementStatus.RESEARCHING:
             return requirement
+        if requirement.status in {RequirementStatus.VALIDATED, RequirementStatus.WATCHING, RequirementStatus.REJECTED, RequirementStatus.ARCHIVED}:
+            return requirement
         requirement.status = RequirementStatus.QUEUED_FOR_RESEARCH
         return requirement
 
@@ -654,7 +656,12 @@ class DeepResearchAgent(BaseAgent):
         if requirement is None:
             self.log("run_next", "failed", [requirement_id], [], "requirement not found")
             return None
-        return self.research(requirement)
+        try:
+            return self.research(requirement)
+        except Exception as exc:
+            self._mark_research_failed(requirement, str(exc))
+            self.log("run_next", "failed", [requirement_id], [], str(exc))
+            return None
 
     def research(self, requirement: RequirementRecord) -> ResearchRun:
         started = utc_now()
@@ -859,7 +866,7 @@ class DeepResearchAgent(BaseAgent):
             for item in productive
             if item.get("query")
         ]
-        if not suggested and run.recommendation != "reject as noise":
+        if not suggested and self._status_from_scores(run.scores) != RequirementStatus.REJECTED:
             compact = " ".join(requirement.canonical_requirement.replace("Users need", "").replace("users need", "").split())
             suggested.append(
                 {
@@ -887,6 +894,34 @@ class DeepResearchAgent(BaseAgent):
                 "avoid exact queries that returned analyzed items but no relevant evidence",
             ],
         }
+
+    def _mark_research_failed(self, requirement: RequirementRecord, error: str) -> None:
+        requirement.status = RequirementStatus.QUEUED_FOR_RESEARCH
+        requirement.assigned_to = None
+        requirement.decision_history.append({"at": utc_now(), "decision": "deep_research_failed", "error": error})
+        self.storage.upsert_requirement(requirement)
+        self.storage.unlock_research(requirement.requirement_id)
+        task_group_id = requirement.task_group_ids[-1] if requirement.task_group_ids else None
+        task_group_run_id = requirement.task_group_run_ids[-1] if requirement.task_group_run_ids else None
+        self.storage.log_requirement_event(
+            requirement.requirement_id,
+            task_group_id,
+            task_group_run_id,
+            self.agent_id,
+            self.role,
+            "deep_research_failed",
+            f"Deep research failed for {requirement.requirement_id}: {error}",
+            {"error": error},
+        )
+        if task_group_id or task_group_run_id:
+            self.storage.log_experiment(
+                task_group_id,
+                task_group_run_id,
+                self.role,
+                "deep_research_failed",
+                f"Deep research failed for {requirement.requirement_id}: {error}",
+                {"requirement_id": requirement.requirement_id, "agent_id": self.agent_id, "error": error},
+            )
 
     def _run_active_research(
         self,

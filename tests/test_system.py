@@ -601,6 +601,141 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Rejected because", rejected_html)
             self.assertIn("Rejected reason:", detail_html)
 
+    def test_rejected_deep_research_does_not_create_followup_search_suggestion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            now = utc_now()
+            requirement = RequirementRecord(
+                requirement_id="req-rejected-insight",
+                canonical_requirement="Users need a better vague thing",
+                description="Thin evidence.",
+                status=RequirementStatus.QUEUED_FOR_RESEARCH,
+                first_seen=now,
+                last_seen=now,
+                times_detected=1,
+                evidence_count=0,
+                subreddit_count=0,
+                geo_distribution=[],
+                audience_segments=[],
+                current_scores={},
+                previous_scores={},
+                research_history=[],
+                decision_history=[],
+                reopen_events=[],
+                latest_recommendation=None,
+                evidence_ids=[],
+                task_group_ids=[],
+                task_group_run_ids=[],
+            )
+            storage.upsert_requirement(requirement)
+            storage.enqueue_research(requirement.requirement_id, 1, "test weak signal", 0, None)
+
+            run = DeepResearchAgent(storage, "research-agent-1").run_next()
+            insights = storage.list_search_insights(limit=1)
+
+            self.assertIsNotNone(run)
+            self.assertEqual(storage.get_requirement(requirement.requirement_id).status, RequirementStatus.REJECTED)
+            self.assertEqual(insights[0]["payload_json"]["suggested_searches"], [])
+
+    def test_requirement_memory_preserves_finalized_requirement_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Photo",
+                task_type=TaskGroupType.DOMAIN,
+                domain="photo workflow",
+                input_dir=str(Path(directory) / "photo"),
+            )
+            first = DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(
+                [
+                    {
+                        "source_url": "https://reddit.com/photo-one",
+                        "subreddit": "photography",
+                        "title": "Is there an app for client photo gallery delivery?",
+                        "body": "I am tired of manual spreadsheets for client gallery delivery.",
+                        "score": 12,
+                        "comment_count": 4,
+                    }
+                ],
+                task_group.task_group_id,
+                "run-1",
+            )
+            self.assertEqual(len(first), 1)
+            requirement = RequirementMemoryAgent(storage, "memory-test").reconcile_candidates()[0]
+            storage.update_requirement_status(requirement.requirement_id, RequirementStatus.WATCHING, "already researched")
+            storage.dequeue_research(requirement.requirement_id)
+
+            second = DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(
+                [
+                    {
+                        "source_url": "https://reddit.com/photo-two",
+                        "subreddit": "photography",
+                        "title": "Need an app for client photo gallery delivery",
+                        "body": "Manual spreadsheet delivery is annoying for client galleries.",
+                        "score": 8,
+                        "comment_count": 3,
+                    }
+                ],
+                task_group.task_group_id,
+                "run-2",
+            )
+            self.assertEqual(len(second), 1)
+            changed = RequirementMemoryAgent(storage, "memory-test").reconcile_candidates()
+            updated = storage.get_requirement(requirement.requirement_id)
+
+            self.assertEqual(updated.status, RequirementStatus.WATCHING)
+            self.assertEqual(storage.list_queue(), [])
+            self.assertEqual(changed[0].requirement_id, requirement.requirement_id)
+
+    def test_deep_research_failure_unlocks_queue_item(self) -> None:
+        class FailingStorage(Storage):
+            def save_search_insight(self, *args, **kwargs):
+                raise RuntimeError("search insight write failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = FailingStorage(db_path)
+            storage.migrate()
+            now = utc_now()
+            storage.upsert_requirement(
+                RequirementRecord(
+                    requirement_id="req-fail",
+                    canonical_requirement="Users need a better vague thing",
+                    description="Thin evidence.",
+                    status=RequirementStatus.QUEUED_FOR_RESEARCH,
+                    first_seen=now,
+                    last_seen=now,
+                    times_detected=1,
+                    evidence_count=0,
+                    subreddit_count=0,
+                    geo_distribution=[],
+                    audience_segments=[],
+                    current_scores={},
+                    previous_scores={},
+                    research_history=[],
+                    decision_history=[],
+                    reopen_events=[],
+                    latest_recommendation=None,
+                    evidence_ids=[],
+                    task_group_ids=[],
+                    task_group_run_ids=[],
+                )
+            )
+            storage.enqueue_research("req-fail", 1, "test failure", 0, None)
+
+            run = DeepResearchAgent(storage, "research-agent-1").run_next()
+            row = storage.list_queue()[0]
+            requirement = storage.get_requirement("req-fail")
+
+            self.assertIsNone(run)
+            self.assertIsNone(row["locked_by"])
+            self.assertEqual(requirement.status, RequirementStatus.QUEUED_FOR_RESEARCH)
+            self.assertIn("deep_research_failed", [event["event_type"] for event in storage.list_requirement_events("req-fail")])
+
     def test_possible_requirement_can_move_to_todo_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
