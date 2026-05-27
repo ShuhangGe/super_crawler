@@ -10,7 +10,7 @@ from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, ReportAgent,
 from super_crawler.collectors import OpenCliRedditCollector, build_requirement_search_queries, normalize_reddit_item, parse_opencli_output
 from super_crawler.dashboard import agent_log_page, detail_page, experiment_log_page, filter_requirements_by_group, grouped_requirement_lineage, home_page, possible_requirements, rejected_requirements, requirement_list_page, visible_task_groups, search_agent_count_for_group, todo_page
 from super_crawler.models import RequirementRecord, RequirementStatus, ResearchRun, TaskGroupStatus, TaskGroupType, utc_now
-from super_crawler.runner import allocate_search_slots
+from super_crawler.runner import DeviceHealth, allocate_search_slots, plan_adaptive_resources
 from super_crawler.runtime import RuntimeController
 from super_crawler.seed import SAMPLE_REDDIT_ITEMS
 from super_crawler.search_planner import SearchPlannerAgent
@@ -1190,6 +1190,55 @@ class SystemTests(unittest.TestCase):
             self.assertIn("photography workflow pain problem pain workflow", queries)
             self.assertIn("is there an app for photography", queries)
             self.assertIn("best way to manage photography", queries)
+
+    def test_adaptive_resources_throttle_search_when_backlog_is_high(self) -> None:
+        resources = {"max_search_agents": 3, "max_deep_research_agents": 2}
+
+        high_backlog = plan_adaptive_resources(
+            resources,
+            backlog_count=85,
+            device_health=DeviceHealth(cpu_load_ratio=0.2, memory_available_bytes=8_000_000_000, status="healthy"),
+        )
+        medium_backlog = plan_adaptive_resources(
+            resources,
+            backlog_count=30,
+            device_health=DeviceHealth(cpu_load_ratio=0.2, memory_available_bytes=8_000_000_000, status="healthy"),
+        )
+        low_backlog = plan_adaptive_resources(
+            resources,
+            backlog_count=5,
+            device_health=DeviceHealth(cpu_load_ratio=0.2, memory_available_bytes=8_000_000_000, status="healthy"),
+        )
+
+        self.assertEqual(high_backlog.search_slots, 1)
+        self.assertEqual(high_backlog.collector_limit, 8)
+        self.assertEqual(high_backlog.deep_research_slots, 2)
+        self.assertEqual(medium_backlog.search_slots, 2)
+        self.assertEqual(medium_backlog.collector_limit, 12)
+        self.assertEqual(low_backlog.search_slots, 3)
+        self.assertIsNone(low_backlog.collector_limit)
+
+    def test_adaptive_resources_respect_busy_device_and_disabled_search(self) -> None:
+        busy = plan_adaptive_resources(
+            {"max_search_agents": 3, "max_deep_research_agents": 4},
+            backlog_count=85,
+            device_health=DeviceHealth(cpu_load_ratio=0.8, memory_available_bytes=8_000_000_000, status="busy"),
+        )
+        very_busy = plan_adaptive_resources(
+            {"max_search_agents": 3, "max_deep_research_agents": 4},
+            backlog_count=85,
+            device_health=DeviceHealth(cpu_load_ratio=1.3, memory_available_bytes=8_000_000_000, status="very_busy"),
+        )
+        search_disabled = plan_adaptive_resources(
+            {"max_search_agents": 0, "max_deep_research_agents": 2},
+            backlog_count=10,
+            device_health=DeviceHealth(cpu_load_ratio=0.2, memory_available_bytes=8_000_000_000, status="healthy"),
+        )
+
+        self.assertEqual(busy.deep_research_slots, 1)
+        self.assertEqual(very_busy.deep_research_slots, 0)
+        self.assertEqual(search_disabled.search_slots, 0)
+        self.assertEqual(search_disabled.deep_research_slots, 2)
 
     def test_collected_items_keep_search_agent_identity(self) -> None:
         class FakeCollector(OpenCliRedditCollector):

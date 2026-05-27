@@ -1,14 +1,51 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, RequirementMemoryAgent, one_sentence_requirement
 from .collectors import OpenCliRedditCollector
 from .models import AgentActivityLog, TaskGroup, TaskGroupRun, TaskGroupStatus, TaskGroupType, utc_now
 from .search_planner import SearchPlannerAgent
 from .storage import Storage
+
+
+TARGET_RESEARCH_BACKLOG = 20
+MAX_RESEARCH_BACKLOG = 50
+MEDIUM_BACKLOG_COLLECTOR_LIMIT = 12
+HIGH_BACKLOG_COLLECTOR_LIMIT = 8
+MIN_AVAILABLE_MEMORY_BYTES = 2 * 1024 * 1024 * 1024
+
+
+@dataclass(slots=True)
+class DeviceHealth:
+    cpu_load_ratio: float | None
+    memory_available_bytes: int | None
+    status: str
+
+
+@dataclass(slots=True)
+class AdaptiveResourcePlan:
+    search_slots: int
+    deep_research_slots: int
+    collector_limit: int | None
+    backlog_count: int
+    device_status: str
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "search_slots": self.search_slots,
+            "deep_research_slots": self.deep_research_slots,
+            "collector_limit": self.collector_limit,
+            "backlog_count": self.backlog_count,
+            "device_status": self.device_status,
+            "reason": self.reason,
+        }
 
 
 class AlwaysOnRunner:
@@ -26,15 +63,19 @@ class AlwaysOnRunner:
 
     def run_once(self) -> dict[str, int | str | None]:
         resources = self.storage.get_resource_config()
+        device_health = measure_device_health()
+        backlog_count = len(self.storage.list_queue())
+        adaptive_plan = plan_adaptive_resources(resources, backlog_count, device_health)
         groups = self.storage.list_task_groups([TaskGroupStatus.RUNNING.value])
         if groups:
-            return self.run_task_groups(groups[: resources.get("max_search_agents", 3)])
+            return self.run_task_groups(groups[: adaptive_plan.search_slots], adaptive_plan)
 
         items = load_json_items(self.input_dir)
         candidates = DiscoveryAgent(self.storage, "discovery-daemon").ingest_reddit_items(items) if items else []
         changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates()
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
-        research_runs = self._run_deep_research_slots(resources.get("max_deep_research_agents", 1))
+        adaptive_plan = plan_adaptive_resources(resources, len(self.storage.list_queue()), device_health)
+        research_runs = self._run_deep_research_slots(adaptive_plan.deep_research_slots)
         return {
             "items_loaded": len(items),
             "candidates": len(candidates),
@@ -42,6 +83,7 @@ class AlwaysOnRunner:
             "reopened": len(reopened),
             "research_run": research_runs[0] if research_runs else None,
             "research_runs": ",".join(research_runs),
+            "adaptive_resources": json.dumps(adaptive_plan.as_dict(), sort_keys=True),
         }
 
     def run_task_group(self, task_group_id: str) -> dict[str, int | str | None]:
@@ -50,23 +92,35 @@ class AlwaysOnRunner:
             raise ValueError(f"Unknown task group: {task_group_id}")
         return self.run_task_groups([task_group])
 
-    def run_task_groups(self, task_groups: list[TaskGroup]) -> dict[str, int | str | None]:
+    def run_task_groups(
+        self,
+        task_groups: list[TaskGroup],
+        adaptive_plan: AdaptiveResourcePlan | None = None,
+    ) -> dict[str, int | str | None]:
         resources = self.storage.get_resource_config()
-        search_slots = max(int(resources.get("max_search_agents", 3)), 1)
-        slot_allocations = allocate_search_slots(len(task_groups), search_slots)
+        if adaptive_plan is None:
+            adaptive_plan = plan_adaptive_resources(resources, len(self.storage.list_queue()), measure_device_health())
+        search_slots = max(int(adaptive_plan.search_slots), 0)
+        active_task_groups = task_groups if search_slots > 0 else []
+        slot_allocations = allocate_search_slots(len(active_task_groups), search_slots)
         total_items = 0
         total_candidates = 0
         total_changed = 0
         task_runs: list[str] = []
-        for index, task_group in enumerate(task_groups):
-            result = self._run_search_task_group(task_group, search_agent_count=slot_allocations[index])
+        for index, task_group in enumerate(active_task_groups):
+            result = self._run_search_task_group(
+                task_group,
+                search_agent_count=slot_allocations[index],
+                collector_limit_override=adaptive_plan.collector_limit,
+            )
             total_items += int(result["items_loaded"] or 0)
             total_candidates += int(result["candidates"] or 0)
             total_changed += int(result["requirements_changed"] or 0)
             task_runs.append(str(result["task_group_run_id"]))
 
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
-        research_runs = self._run_deep_research_slots(resources.get("max_deep_research_agents", 1))
+        deep_plan = plan_adaptive_resources(resources, len(self.storage.list_queue()), measure_device_health())
+        research_runs = self._run_deep_research_slots(deep_plan.deep_research_slots)
         return {
             "items_loaded": total_items,
             "candidates": total_candidates,
@@ -76,6 +130,13 @@ class AlwaysOnRunner:
             "research_runs": ",".join(research_runs),
             "task_group_runs": len(task_runs),
             "task_group_run_ids": ",".join(task_runs),
+            "adaptive_resources": json.dumps(
+                {
+                    "search": adaptive_plan.as_dict(),
+                    "deep_research": deep_plan.as_dict(),
+                },
+                sort_keys=True,
+            ),
         }
 
     def _run_deep_research_slots(self, limit: int) -> list[str]:
@@ -87,7 +148,12 @@ class AlwaysOnRunner:
             run_ids.append(run.research_run_id)
         return run_ids
 
-    def _run_search_task_group(self, task_group: TaskGroup, search_agent_count: int = 1) -> dict[str, int | str | None]:
+    def _run_search_task_group(
+        self,
+        task_group: TaskGroup,
+        search_agent_count: int = 1,
+        collector_limit_override: int | None = None,
+    ) -> dict[str, int | str | None]:
         started_at = utc_now()
         task_group_run_id = f"tgr_{task_group.task_group_id}_{started_at.replace('-', '').replace(':', '').replace('+', 'Z')}"
         self.storage.log_experiment(
@@ -100,10 +166,11 @@ class AlwaysOnRunner:
                 "task_group_name": task_group.name,
                 "input_dir": task_group.input_dir,
                 "search_agent_count": search_agent_count,
+                "collector_limit_override": collector_limit_override,
                 "model_config": self.storage.get_task_group_config(task_group.task_group_id),
             },
         )
-        collection_result = self._collect_for_task_group(task_group, task_group_run_id, search_agent_count)
+        collection_result = self._collect_for_task_group(task_group, task_group_run_id, search_agent_count, collector_limit_override)
         if collection_result and collection_result.get("search_agents"):
             output_paths = [agent["output_path"] for agent in collection_result["search_agents"] if agent.get("output_path")]
             scan = load_json_files_with_report(output_paths)
@@ -247,7 +314,13 @@ class AlwaysOnRunner:
             "task_group_run_id": task_group_run_id,
         }
 
-    def _collect_for_task_group(self, task_group: TaskGroup, task_group_run_id: str, search_agent_count: int = 1) -> dict[str, object] | None:
+    def _collect_for_task_group(
+        self,
+        task_group: TaskGroup,
+        task_group_run_id: str,
+        search_agent_count: int = 1,
+        collector_limit_override: int | None = None,
+    ) -> dict[str, object] | None:
         config = self.storage.get_task_group_config(task_group.task_group_id)
         if config.get("collector_enabled") != "1":
             self.storage.log_experiment(
@@ -306,7 +379,8 @@ class AlwaysOnRunner:
         )
         assignments = list(plan["assignments"])
         queries = [str(query) for query in plan["queries"]]
-        limit = parse_int(config.get("collector_limit"), 25)
+        configured_limit = parse_int(config.get("collector_limit"), 25)
+        limit = min(configured_limit, collector_limit_override) if collector_limit_override else configured_limit
         limit_per_query = max(1, limit // max(len(queries), 1))
         def log_collector_event(step_name: str, message: str, payload: dict[str, object]) -> None:
             self.storage.log_experiment(
@@ -428,3 +502,87 @@ def allocate_search_slots(group_count: int, max_search_agents: int) -> list[int]
         remaining -= 1
         index += 1
     return allocations
+
+
+def plan_adaptive_resources(
+    resources: dict[str, int],
+    backlog_count: int,
+    device_health: DeviceHealth,
+) -> AdaptiveResourcePlan:
+    configured_search = max(int(resources.get("max_search_agents", 3)), 0)
+    configured_deep = max(int(resources.get("max_deep_research_agents", 1)), 0)
+    if backlog_count > MAX_RESEARCH_BACKLOG:
+        search_slots = min(configured_search, 1)
+        collector_limit = HIGH_BACKLOG_COLLECTOR_LIMIT
+        reason = "research backlog is above the maximum target, so search intake is throttled"
+    elif backlog_count > TARGET_RESEARCH_BACKLOG:
+        search_slots = min(configured_search, 2)
+        collector_limit = MEDIUM_BACKLOG_COLLECTOR_LIMIT
+        reason = "research backlog is above target, so search intake is reduced"
+    else:
+        search_slots = configured_search
+        collector_limit = None
+        reason = "research backlog is within target, so configured search intake is allowed"
+
+    if configured_search > 0:
+        search_slots = max(search_slots, 1)
+
+    if device_health.status == "very_busy":
+        deep_slots = 0
+        reason += "; device is very busy, so deep research is paused this cycle"
+    elif device_health.status == "busy":
+        deep_slots = min(configured_deep, 1)
+        reason += "; device is busy, so deep research is limited"
+    else:
+        deep_slots = min(configured_deep, backlog_count)
+        reason += "; device is healthy, so deep research may consume queued work"
+
+    return AdaptiveResourcePlan(
+        search_slots=search_slots,
+        deep_research_slots=max(deep_slots, 0),
+        collector_limit=collector_limit,
+        backlog_count=backlog_count,
+        device_status=device_health.status,
+        reason=reason,
+    )
+
+
+def measure_device_health() -> DeviceHealth:
+    cpu_ratio = current_cpu_load_ratio()
+    memory_available = current_memory_available_bytes()
+    memory_low = memory_available is not None and memory_available < MIN_AVAILABLE_MEMORY_BYTES
+    if (cpu_ratio is not None and cpu_ratio >= 1.2) or memory_low:
+        status = "very_busy"
+    elif cpu_ratio is not None and cpu_ratio >= 0.7:
+        status = "busy"
+    else:
+        status = "healthy"
+    return DeviceHealth(cpu_load_ratio=cpu_ratio, memory_available_bytes=memory_available, status=status)
+
+
+def current_cpu_load_ratio() -> float | None:
+    if not hasattr(os, "getloadavg"):
+        return None
+    try:
+        load_1m = os.getloadavg()[0]
+    except OSError:
+        return None
+    cpu_count = os.cpu_count() or 1
+    return round(load_1m / cpu_count, 2)
+
+
+def current_memory_available_bytes() -> int | None:
+    page_size = _sysconf_int("SC_PAGE_SIZE")
+    available_pages = _sysconf_int("SC_AVPHYS_PAGES")
+    if page_size is None or available_pages is None:
+        return None
+    return page_size * available_pages
+
+
+def _sysconf_int(name: str) -> int | None:
+    if name not in getattr(os, "sysconf_names", {}):
+        return None
+    try:
+        return int(os.sysconf(name))
+    except (OSError, ValueError):
+        return None
