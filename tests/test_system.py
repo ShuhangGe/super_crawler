@@ -302,6 +302,20 @@ class SystemTests(unittest.TestCase):
                             "why": "Deep research found relevant warranty evidence.",
                         }
                     ],
+                    "productive_dimensions": {
+                        "subreddits": ["techsupport"],
+                        "query_terms": ["phone", "battery", "warranty"],
+                        "strategies": ["support_gap"],
+                    },
+                    "unproductive_dimensions": {
+                        "subreddits": ["BuyItForLife"],
+                        "query_terms": ["regret", "buying", "broke"],
+                        "strategies": ["purchase_regret"],
+                    },
+                    "recommended_allocation_change": {
+                        "increase": ["support_gap"],
+                        "decrease": ["purchase_regret"],
+                    },
                 },
             )
 
@@ -316,6 +330,111 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(plan["assignments"][0]["query"], "phone battery warranty pain")
             self.assertEqual(plan["assignments"][0]["strategy"], "learned_support_gap")
             self.assertNotIn("regret buying laptop phone headphones charger broke warranty", plan["queries"])
+
+    def test_search_planner_keeps_baseline_slot_with_structured_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C product search",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(Path(directory) / "3c"),
+                description="I'm selling 3C products",
+            )
+            now = utc_now()
+            storage.upsert_requirement(
+                RequirementRecord(
+                    requirement_id="REQ-2026-000002",
+                    canonical_requirement="Users need better electronics warranty support",
+                    description="Users complain about repair and warranty support.",
+                    status=RequirementStatus.WATCHING,
+                    first_seen=now,
+                    last_seen=now,
+                    times_detected=1,
+                    evidence_count=1,
+                    subreddit_count=1,
+                    geo_distribution=[],
+                    audience_segments=[],
+                    current_scores={},
+                    previous_scores={},
+                    research_history=[],
+                    decision_history=[],
+                    reopen_events=[],
+                    latest_recommendation=None,
+                    aliases=[],
+                    evidence_ids=[],
+                    task_group_ids=[task_group.task_group_id],
+                    task_group_run_ids=["run-1"],
+                )
+            )
+            storage.upsert_research_run(
+                ResearchRun(
+                    research_run_id="research-run-2",
+                    requirement_id="REQ-2026-000002",
+                    agent_id="research-agent-1",
+                    started_at=now,
+                    completed_at=now,
+                    input_evidence_ids=[],
+                    research_questions=[],
+                    findings={},
+                    scores={},
+                    geo_analysis=[],
+                    market_signal_analysis={},
+                    existing_solution_analysis={},
+                    recommendation="keep tracking",
+                    limitations=[],
+                    changed_since_last_run={},
+                )
+            )
+            storage.save_search_insight(
+                task_group.task_group_id,
+                "run-1",
+                "REQ-2026-000002",
+                "research-run-2",
+                "research-agent-1",
+                "deep_research_feedback",
+                {
+                    "productive_queries": ["phone battery warranty pain"],
+                    "noisy_queries": ["regret buying laptop phone headphones charger broke warranty"],
+                    "suggested_searches": [
+                        {
+                            "query": "phone battery warranty pain",
+                            "subreddit": "techsupport",
+                            "strategy": "learned_support_gap",
+                            "why": "Deep research found relevant warranty evidence.",
+                        }
+                    ],
+                    "productive_dimensions": {
+                        "subreddits": ["techsupport"],
+                        "query_terms": ["phone", "battery", "warranty", "repair"],
+                        "strategies": ["support_gap"],
+                    },
+                    "unproductive_dimensions": {
+                        "subreddits": ["BuyItForLife"],
+                        "query_terms": ["regret", "buying"],
+                        "strategies": ["purchase_regret"],
+                    },
+                    "recommended_allocation_change": {
+                        "increase": ["support_gap"],
+                        "decrease": ["purchase_regret"],
+                    },
+                },
+            )
+
+            plan = SearchPlannerAgent().plan(
+                task_group,
+                3,
+                cycle_index=1,
+                recent_queries=[],
+                search_insights=storage.list_search_insights(task_group.task_group_id),
+            )
+
+            strategies = [assignment["strategy"] for assignment in plan["assignments"]]
+            self.assertEqual(plan["assignments"][0]["query"], "phone battery warranty pain")
+            self.assertTrue(any(strategy.startswith("learned_support_gap") for strategy in strategies))
+            self.assertIn("advice_pain", strategies)
+            self.assertNotIn("purchase_regret", strategies)
 
     def test_search_planner_log_lists_each_planned_search(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -541,6 +660,13 @@ class SystemTests(unittest.TestCase):
             self.assertIn("deep_research_search_completed", step_names)
             self.assertIn("deep_research_item_analyzed", step_names)
             self.assertIn("deep_research_evidence_collected", step_names)
+            insights = storage.list_search_insights(task_group.task_group_id, limit=1)
+            self.assertTrue(insights)
+            feedback = insights[0]["payload_json"]
+            self.assertIn("productive_dimensions", feedback)
+            self.assertIn("recommended_allocation_change", feedback)
+            self.assertIn("repeat_pain_validation", feedback["productive_dimensions"]["strategies"])
+            self.assertIn("repeat_pain_validation", feedback["recommended_allocation_change"]["increase"])
             deep_log_html = agent_log_page(storage, "deep_research", "", changed[0].requirement_id)
             self.assertIn("Deep Research Plan", deep_log_html)
             self.assertIn("Evidence Item Analysis", deep_log_html)

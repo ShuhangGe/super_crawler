@@ -854,6 +854,12 @@ class DeepResearchAgent(BaseAgent):
         searches = [item for item in active_research.get("searches", []) if isinstance(item, dict)]
         productive = [item for item in searches if int(item.get("evidence_added", 0) or 0) > 0]
         noisy = [item for item in searches if int(item.get("evidence_added", 0) or 0) == 0 and not item.get("error")]
+        productive_terms = search_feedback_terms(productive)
+        noisy_terms = search_feedback_terms(noisy)
+        productive_strategies = sorted({str(item.get("strategy", "")) for item in productive if item.get("strategy")})
+        noisy_strategies = sorted({str(item.get("strategy", "")) for item in noisy if item.get("strategy")})
+        productive_subreddits = sorted({str(item.get("subreddit", "")) for item in productive if item.get("subreddit")})
+        noisy_subreddits = sorted({str(item.get("subreddit", "")) for item in noisy if item.get("subreddit")})
         suggested = [
             {
                 "query": str(item.get("query", "")),
@@ -886,6 +892,20 @@ class DeepResearchAgent(BaseAgent):
             "productive_queries": [str(item.get("query", "")) for item in productive if item.get("query")],
             "noisy_queries": [str(item.get("query", "")) for item in noisy if item.get("query")],
             "suggested_searches": suggested[:3],
+            "productive_dimensions": {
+                "subreddits": productive_subreddits,
+                "query_terms": productive_terms,
+                "strategies": productive_strategies,
+            },
+            "unproductive_dimensions": {
+                "subreddits": noisy_subreddits,
+                "query_terms": noisy_terms,
+                "strategies": noisy_strategies,
+            },
+            "recommended_allocation_change": {
+                "increase": productive_strategies,
+                "decrease": [strategy for strategy in noisy_strategies if strategy not in productive_strategies],
+            },
             "deepen_when": [
                 "repeat similar searches when evidence_added is greater than zero",
                 "prefer subreddits and query terms that produced relevant deep research evidence",
@@ -1027,6 +1047,7 @@ class DeepResearchAgent(BaseAgent):
                 "query": task["query"],
                 "question": task["question"],
                 "subreddit": task.get("subreddit", ""),
+                "strategy": task.get("strategy", "deep_research"),
                 "command": result.get("command", []),
                 "stderr": result.get("stderr", ""),
                 "items_returned": len(result["items"]),
@@ -1438,6 +1459,32 @@ def find_payment_signals(evidence: list[RawEvidence]) -> list[str]:
             if term in text:
                 signals.append(term)
     return sorted(set(signals))
+
+
+def search_feedback_terms(searches: list[dict[str, Any]]) -> list[str]:
+    stop_words = {
+        "with",
+        "that",
+        "this",
+        "from",
+        "users",
+        "need",
+        "needs",
+        "problem",
+        "pain",
+        "workaround",
+        "alternative",
+        "solution",
+    }
+    terms: Counter[str] = Counter()
+    for search in searches:
+        query = str(search.get("query", "")).lower().replace("/", " ").replace("-", " ")
+        for raw in query.split():
+            term = raw.strip(".,:;!?()[]{}\"'")
+            if len(term) < 4 or term in stop_words:
+                continue
+            terms[term] += 1
+    return [term for term, _count in terms.most_common(8)]
 
 
 def summarize_why_real(evidence: list[RawEvidence]) -> str:

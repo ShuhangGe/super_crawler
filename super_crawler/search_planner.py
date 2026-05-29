@@ -24,26 +24,23 @@ class SearchPlannerAgent:
         if not description:
             description = "user workflow pain"
         brief = build_search_brief(description, task_group)
-        candidates = apply_search_insights(build_query_candidates(brief), search_insights or [])
+        insights = search_insights or []
+        default_candidates = build_query_candidates(brief)
+        feedback_candidates = build_feedback_candidates(insights)
+        candidates = merge_candidates(feedback_candidates + default_candidates)
         recent = set(recent_queries or [])
-        avoid = avoided_queries(search_insights or [])
+        avoid = avoided_queries(insights)
+        avoid_strategies = avoided_strategies(insights)
         offset = ((cycle_index - 1) * max(search_agent_count, 1)) % max(len(candidates), 1)
         ordered = candidates[offset:] + candidates[:offset]
-        selected: list[dict[str, str]] = []
-        for candidate in ordered:
-            if candidate["query"] in avoid and len(selected) + len(avoid) < len(candidates):
-                continue
-            if candidate["query"] in recent and len(selected) + len(recent) < len(candidates):
-                continue
-            selected.append(candidate)
-            if len(selected) >= max(search_agent_count, 1):
-                break
-        if len(selected) < max(search_agent_count, 1):
-            for candidate in ordered:
-                if candidate not in selected:
-                    selected.append(candidate)
-                if len(selected) >= max(search_agent_count, 1):
-                    break
+        selected = select_search_candidates(
+            ordered,
+            default_candidates,
+            max(search_agent_count, 1),
+            recent,
+            avoid,
+            avoid_strategies,
+        )
         assignments = [
             {
                 "agent_id": f"search-agent-{index}",
@@ -128,6 +125,10 @@ def build_search_brief(description: str, task_group: TaskGroup) -> dict[str, Any
 
 
 def apply_search_insights(candidates: list[dict[str, str]], insights: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return merge_candidates(build_feedback_candidates(insights) + candidates)
+
+
+def build_feedback_candidates(insights: list[dict[str, Any]]) -> list[dict[str, str]]:
     learned: list[dict[str, str]] = []
     for insight in insights:
         payload = insight.get("payload_json", insight)
@@ -149,15 +150,100 @@ def apply_search_insights(candidates: list[dict[str, str]], insights: list[dict[
                     "why": str(item.get("why") or "Deep research found this direction worth another search."),
                 }
             )
+        dimensions = payload.get("productive_dimensions", {})
+        if isinstance(dimensions, dict):
+            query_terms = [str(term) for term in dimensions.get("query_terms", []) if str(term).strip()]
+            strategies = [str(strategy) for strategy in dimensions.get("strategies", []) if str(strategy).strip()]
+            subreddits = [str(subreddit) for subreddit in dimensions.get("subreddits", []) if str(subreddit).strip()]
+            if query_terms:
+                learned.append(
+                    {
+                        "strategy": f"learned_{strategies[0]}_adjacent" if strategies else "learned_adjacent",
+                        "query": " ".join(query_terms[:6] + ["problem", "alternative"]),
+                        "subreddit": subreddits[0] if subreddits else "",
+                        "sort": "relevance",
+                        "time": "year",
+                        "why": "Deep research found these terms, subreddit, or strategy productive; run an adjacent follow-up search.",
+                    }
+                )
+    return merge_candidates(learned)
+
+
+def merge_candidates(candidates: list[dict[str, str]]) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen: set[str] = set()
-    for item in learned + candidates:
+    for item in candidates:
         query = item["query"]
         if query in seen:
             continue
         seen.add(query)
         result.append(item)
     return result
+
+
+def select_search_candidates(
+    ordered: list[dict[str, str]],
+    default_candidates: list[dict[str, str]],
+    count: int,
+    recent: set[str],
+    avoid: set[str],
+    avoid_strategies: set[str],
+) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    for candidate in ordered:
+        if should_skip_candidate(candidate, selected, ordered, recent, avoid, avoid_strategies):
+            continue
+        selected.append(candidate)
+        if len(selected) >= count:
+            break
+    if count >= 3 and selected and default_candidates and not any(item in default_candidates for item in selected):
+        baseline = first_eligible_default(default_candidates, selected, recent, avoid, avoid_strategies)
+        if baseline is not None:
+            selected[-1] = baseline
+    if len(selected) < count:
+        for candidate in ordered:
+            if candidate not in selected:
+                selected.append(candidate)
+            if len(selected) >= count:
+                break
+    return selected
+
+
+def should_skip_candidate(
+    candidate: dict[str, str],
+    selected: list[dict[str, str]],
+    candidates: list[dict[str, str]],
+    recent: set[str],
+    avoid: set[str],
+    avoid_strategies: set[str],
+) -> bool:
+    query = candidate["query"]
+    strategy = candidate.get("strategy", "")
+    if query in avoid and len(selected) + len(avoid) < len(candidates):
+        return True
+    if strategy in avoid_strategies and len(selected) + len(avoid_strategies) < len(candidates):
+        return True
+    if query in recent and len(selected) + len(recent) < len(candidates):
+        return True
+    return False
+
+
+def first_eligible_default(
+    default_candidates: list[dict[str, str]],
+    selected: list[dict[str, str]],
+    recent: set[str],
+    avoid: set[str],
+    avoid_strategies: set[str],
+) -> dict[str, str] | None:
+    for candidate in default_candidates:
+        if candidate in selected:
+            continue
+        if candidate["query"] in avoid or candidate["query"] in recent:
+            continue
+        if candidate.get("strategy", "") in avoid_strategies:
+            continue
+        return candidate
+    return None
 
 
 def avoided_queries(insights: list[dict[str, Any]]) -> set[str]:
@@ -169,6 +255,26 @@ def avoided_queries(insights: list[dict[str, Any]]) -> set[str]:
             continue
         productive.update(str(query) for query in payload.get("productive_queries", []) if query)
         avoid.update(str(query) for query in payload.get("noisy_queries", []) if query)
+    return avoid - productive
+
+
+def avoided_strategies(insights: list[dict[str, Any]]) -> set[str]:
+    avoid: set[str] = set()
+    productive: set[str] = set()
+    for insight in insights:
+        payload = insight.get("payload_json", insight)
+        if not isinstance(payload, dict):
+            continue
+        allocation = payload.get("recommended_allocation_change", {})
+        if isinstance(allocation, dict):
+            productive.update(str(strategy) for strategy in allocation.get("increase", []) if strategy)
+            avoid.update(str(strategy) for strategy in allocation.get("decrease", []) if strategy)
+        productive_dimensions = payload.get("productive_dimensions", {})
+        if isinstance(productive_dimensions, dict):
+            productive.update(str(strategy) for strategy in productive_dimensions.get("strategies", []) if strategy)
+        unproductive_dimensions = payload.get("unproductive_dimensions", {})
+        if isinstance(unproductive_dimensions, dict):
+            avoid.update(str(strategy) for strategy in unproductive_dimensions.get("strategies", []) if strategy)
     return avoid - productive
 
 
