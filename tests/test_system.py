@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from super_crawler.agents import DeepResearchAgent, DiscoveryAgent, ReportAgent, RequirementMemoryAgent, normalize_llm_requirement_analysis, search_relevance_check
+from super_crawler.agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, ReportAgent, RequirementMemoryAgent, normalize_llm_requirement_analysis, search_relevance_check
 from super_crawler.collectors import OpenCliRedditCollector, build_requirement_search_queries, normalize_reddit_item, parse_opencli_output
 from super_crawler.dashboard import agent_log_page, detail_page, experiment_log_page, filter_requirements_by_group, grouped_requirement_lineage, home_page, possible_requirements, rejected_requirements, requirement_list_page, visible_task_groups, search_agent_count_for_group, todo_page
 from super_crawler.models import RequirementRecord, RequirementStatus, ResearchRun, TaskGroupStatus, TaskGroupType, utc_now
@@ -43,6 +43,23 @@ class SystemTests(unittest.TestCase):
                     for item in storage.list_requirements()
                 )
             )
+
+    def test_completed_deep_research_sets_change_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+
+            DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(SAMPLE_REDDIT_ITEMS)
+            RequirementMemoryAgent(storage, "memory-test").reconcile_candidates()
+            run = DeepResearchAgent(storage, "research-test").run_next()
+
+            self.assertIsNotNone(run)
+            requirement = storage.get_requirement(run.requirement_id)
+            self.assertIsNotNone(requirement)
+            self.assertEqual(requirement.previous_scores, requirement.current_scores)
+
+            reopened = ChangeDetectionAgent(storage, "change-test").evaluate_reopenings()
+            self.assertNotIn(run.requirement_id, [item.requirement_id for item in reopened])
 
     def test_dashboard_counts_include_product_stores(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

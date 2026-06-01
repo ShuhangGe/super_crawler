@@ -780,6 +780,7 @@ class DeepResearchAgent(BaseAgent):
         requirement.research_history.append(run.research_run_id)
         requirement.latest_recommendation = recommendation
         requirement.current_scores = scores
+        requirement.previous_scores = scores
         requirement.decision_history.append({"at": utc_now(), "decision": requirement.status.value, "research_run": run_id})
         self.storage.upsert_requirement(requirement)
         self.storage.dequeue_research(requirement.requirement_id)
