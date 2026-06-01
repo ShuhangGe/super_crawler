@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
+from .llm import DeepSeekClient
 from .models import TaskGroup
-from .text import keywords
+
+
+DEFAULT_SEARCH_MODEL = "deepseek-v4-flash"
 
 
 class SearchPlannerAgent:
     role = "search_planner"
 
-    def __init__(self, agent_id: str = "search-planner"):
+    def __init__(
+        self,
+        agent_id: str = "search-planner",
+        llm_client: DeepSeekClient | None = None,
+        model_name: str = DEFAULT_SEARCH_MODEL,
+    ):
         self.agent_id = agent_id
+        self.llm_client = llm_client
+        self.model_name = model_name
 
     def plan(
         self,
@@ -20,404 +31,284 @@ class SearchPlannerAgent:
         recent_queries: list[str] | None = None,
         search_insights: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        requested_count = max(int(search_agent_count), 1)
         description = (task_group.description or task_group.domain or task_group.name).strip()
-        if not description:
-            description = "user workflow pain"
-        brief = build_search_brief(description, task_group)
-        insights = search_insights or []
-        default_candidates = build_query_candidates(brief)
-        feedback_candidates = build_feedback_candidates(insights)
-        candidates = merge_candidates(feedback_candidates + default_candidates)
-        recent = set(recent_queries or [])
-        avoid = avoided_queries(insights)
-        avoid_strategies = avoided_strategies(insights)
-        offset = ((cycle_index - 1) * max(search_agent_count, 1)) % max(len(candidates), 1)
-        ordered = candidates[offset:] + candidates[:offset]
-        selected = select_search_candidates(
-            ordered,
-            default_candidates,
-            max(search_agent_count, 1),
-            recent,
-            avoid,
-            avoid_strategies,
-        )
-        assignments = [
-            {
-                "agent_id": f"search-agent-{index}",
-                "strategy": item["strategy"],
-                "query": item["query"],
-                "subreddit": item.get("subreddit", ""),
-                "sort": item.get("sort", "relevance"),
-                "time": item.get("time", "year"),
-                "why": item["why"],
-            }
-            for index, item in enumerate(selected, start=1)
-        ]
-        return {
-            "planner_agent_id": self.agent_id,
-            "cycle_index": cycle_index,
-            "task_group_id": task_group.task_group_id,
-            "input_description": description,
-            "search_goal": brief["search_goal"],
-            "search_brief": brief,
-            "search_insights": [item.get("payload_json", {}) for item in (search_insights or [])],
-            "assignments": assignments,
-            "queries": [item["query"] for item in assignments],
-        }
+        insights = normalize_search_insights(search_insights or [])
+        recent = [str(query) for query in (recent_queries or []) if str(query).strip()]
+        llm = self.llm_client if self.llm_client is not None else DeepSeekClient()
+        if not llm.available():
+            return unavailable_plan(self.agent_id, task_group, cycle_index, description, requested_count, recent, insights)
+
+        try:
+            parsed = llm.json_chat(
+                self.model_name,
+                planner_system_prompt(),
+                planner_user_prompt(task_group, requested_count, cycle_index, recent, insights),
+            )
+        except Exception as exc:  # noqa: BLE001 - planning failure should be explicit in the saved plan.
+            return unavailable_plan(
+                self.agent_id,
+                task_group,
+                cycle_index,
+                description,
+                requested_count,
+                recent,
+                insights,
+                error=str(exc),
+            )
+        return normalize_llm_plan(parsed, self.agent_id, task_group, cycle_index, description, requested_count, recent, insights)
 
 
-def build_search_brief(description: str, task_group: TaskGroup) -> dict[str, Any]:
-    lower = description.lower()
-    domain_terms = keywords(description, limit=8) or keywords(task_group.name, limit=8)
-    if "3c" in lower or "consumer electronics" in lower:
-        domain = "consumer electronics / 3C products"
-        audiences = ["electronics buyers", "online shoppers", "product reviewers", "small electronics sellers"]
-        coverage = ["phones", "laptops", "headphones", "chargers", "smart devices", "accessories", "after-sales support"]
-        known_tools = ["Amazon", "Best Buy", "AliExpress", "Temu", "Reddit reviews", "YouTube reviews"]
-        subreddits = ["BuyItForLife", "HeadphoneAdvice", "buildapc", "techsupport", "amazonprime", "smarthome", "UsbCHardware", "SuggestALaptop"]
-        product_terms = [
-            "phone",
-            "iphone",
-            "android",
-            "laptop",
-            "headphone",
-            "earbud",
-            "charger",
-            "cable",
-            "usb-c",
-            "monitor",
-            "keyboard",
-            "mouse",
-            "camera",
-            "router",
-            "ssd",
-            "gpu",
-            "rtx",
-            "smart home",
-            "amazon",
-            "warranty",
-            "refund",
-        ]
-    elif "photo" in lower or "photograph" in lower:
-        domain = "photography"
-        audiences = ["photographers", "wedding photographers", "freelance photographers", "clients"]
-        coverage = ["client galleries", "photo proofing", "booking", "editing backlog", "file delivery", "client feedback"]
-        known_tools = ["Pixieset", "SmugMug", "Google Drive", "Dropbox", "Lightroom"]
-        subreddits = ["photography", "WeddingPhotography", "AskPhotography", "Lightroom", "photographybusiness"]
-        product_terms = ["photo", "photography", "camera", "lens", "client", "gallery", "proofing", "editing", "lightroom", "wedding"]
-    else:
-        domain = task_group.domain or " ".join(domain_terms[:3]) or task_group.name
-        audiences = [f"{domain} users", f"{domain} customers", f"{domain} operators"]
-        coverage = domain_terms[:6] or [domain, "workflow", "buying", "support", "comparison"]
-        known_tools = ["spreadsheet", "manual workflow", "apps", "marketplaces", "forums"]
-        subreddits = []
-        product_terms = domain_terms[:10]
+def planner_system_prompt() -> str:
+    return (
+        "You are a senior search planning agent for a Reddit requirement discovery pipeline. "
+        "Planning is a heavy reasoning step. You must understand the user's original business/product requirement, "
+        "read prior search plans, and use deep research feedback to decide what to search next. "
+        "Do not use hard-coded domain assumptions. Infer the domain from the user input and evidence feedback. "
+        "Prefer English Reddit search queries even when the user input is Chinese. "
+        "Use productive deep research dimensions to deepen promising directions and use noisy dimensions to avoid bad directions. "
+        "Return only JSON."
+    )
+
+
+def planner_user_prompt(
+    task_group: TaskGroup,
+    search_agent_count: int,
+    cycle_index: int,
+    recent_queries: list[str],
+    search_insights: list[dict[str, Any]],
+) -> str:
+    return json.dumps(
+        {
+            "task": {
+                "task_group_id": task_group.task_group_id,
+                "name": task_group.name,
+                "type": task_group.task_type.value,
+                "domain": task_group.domain,
+                "description": task_group.description,
+                "user_keywords": task_group.keywords,
+                "user_negative_keywords": task_group.negative_keywords,
+                "user_subreddits": task_group.subreddits,
+            },
+            "planning_context": {
+                "cycle_index": cycle_index,
+                "search_agent_count": search_agent_count,
+                "recent_queries_to_avoid_repeating": recent_queries,
+                "deep_research_feedback": search_insights,
+            },
+            "instructions": {
+                "goal": "Create a search plan that finds Reddit posts expressing real user needs related to the user's stated product/domain.",
+                "deep_research_usage": [
+                    "Continue or broaden dimensions that produced relevant evidence.",
+                    "Avoid exact noisy queries and explain how the new plan avoids them.",
+                    "If feedback conflicts with the original user requirement, prioritize the original user requirement and mark conflicting feedback as noisy.",
+                ],
+                "query_requirements": [
+                    "Each query should be specific enough for Reddit search.",
+                    "Queries must not simply paste the user's original paragraph.",
+                    "Queries should be in English unless a non-English query is clearly needed.",
+                    "Use subreddit only when it improves precision; otherwise leave it empty.",
+                ],
+                "expected_json": {
+                    "search_goal": "human-readable goal",
+                    "search_brief": {
+                        "domain_understanding": "what the user is actually trying to discover",
+                        "target_users": ["who is likely to have this need"],
+                        "product_or_problem_scope": ["scope items"],
+                        "must_match": ["semantic criteria for relevant results"],
+                        "reject_if": ["semantic criteria for noisy results"],
+                        "deep_research_lessons": ["how feedback changed this plan"],
+                        "planning_method": "llm",
+                    },
+                    "assignments": [
+                        {
+                            "strategy": "short snake_case strategy name",
+                            "query": "reddit search query",
+                            "subreddit": "optional subreddit without r/ prefix",
+                            "sort": "relevance | top | new | comments",
+                            "time": "day | week | month | year | all",
+                            "why": "why this search should find relevant requirements",
+                        }
+                    ],
+                },
+            },
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def normalize_llm_plan(
+    parsed: dict[str, Any],
+    agent_id: str,
+    task_group: TaskGroup,
+    cycle_index: int,
+    description: str,
+    requested_count: int,
+    recent_queries: list[str],
+    search_insights: list[dict[str, Any]],
+) -> dict[str, Any]:
+    brief = parsed.get("search_brief")
+    if not isinstance(brief, dict):
+        brief = {}
+    brief = {
+        "domain_understanding": str(brief.get("domain_understanding") or task_group.domain or task_group.name),
+        "target_users": string_list(brief.get("target_users")),
+        "product_or_problem_scope": string_list(brief.get("product_or_problem_scope")),
+        "must_match": string_list(brief.get("must_match")),
+        "reject_if": string_list(brief.get("reject_if")),
+        "deep_research_lessons": string_list(brief.get("deep_research_lessons")),
+        "planning_method": "llm",
+        "model": DEFAULT_SEARCH_MODEL,
+    }
+    assignments = normalize_assignments(parsed.get("assignments"), requested_count)
     return {
-        "domain": domain,
-        "audiences": audiences,
-        "coverage_targets": coverage,
-        "known_tools": known_tools,
-        "subreddits": subreddits,
-        "product_terms": product_terms,
-        "pain_terms": ["problem", "pain", "annoying", "complaint", "tired of", "hard to", "manual"],
-        "search_goal": f"Find possible product requirements and user pain points for {domain}.",
+        "planner_agent_id": agent_id,
+        "cycle_index": cycle_index,
+        "task_group_id": task_group.task_group_id,
+        "input_description": description,
+        "search_goal": str(parsed.get("search_goal") or f"Find relevant Reddit requirement signals for {task_group.name}."),
+        "search_brief": {
+            **brief,
+            "recent_queries_considered": recent_queries,
+            "deep_research_feedback_considered": search_insights,
+        },
+        "search_insights": search_insights,
+        "assignments": [
+            {
+                **assignment,
+                "agent_id": f"search-agent-{index}",
+            }
+            for index, assignment in enumerate(assignments, start=1)
+        ],
+        "queries": [assignment["query"] for assignment in assignments],
     }
 
 
-def apply_search_insights(candidates: list[dict[str, str]], insights: list[dict[str, Any]]) -> list[dict[str, str]]:
-    return merge_candidates(build_feedback_candidates(insights) + candidates)
-
-
-def build_feedback_candidates(insights: list[dict[str, Any]]) -> list[dict[str, str]]:
-    learned: list[dict[str, str]] = []
-    for insight in insights:
-        payload = insight.get("payload_json", insight)
-        if not isinstance(payload, dict):
+def normalize_assignments(value: object, requested_count: int) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    assignments: list[dict[str, str]] = []
+    seen_queries: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
             continue
-        for item in payload.get("suggested_searches", []):
-            if not isinstance(item, dict):
-                continue
-            query = str(item.get("query") or "").strip()
-            if not query:
-                continue
-            learned.append(
-                {
-                    "strategy": str(item.get("strategy") or "learned_followup"),
-                    "query": query,
-                    "subreddit": str(item.get("subreddit") or ""),
-                    "sort": str(item.get("sort") or "relevance"),
-                    "time": str(item.get("time") or "year"),
-                    "why": str(item.get("why") or "Deep research found this direction worth another search."),
-                }
-            )
-        dimensions = payload.get("productive_dimensions", {})
-        if isinstance(dimensions, dict):
-            query_terms = [str(term) for term in dimensions.get("query_terms", []) if str(term).strip()]
-            strategies = [str(strategy) for strategy in dimensions.get("strategies", []) if str(strategy).strip()]
-            subreddits = [str(subreddit) for subreddit in dimensions.get("subreddits", []) if str(subreddit).strip()]
-            if query_terms:
-                learned.append(
-                    {
-                        "strategy": f"learned_{strategies[0]}_adjacent" if strategies else "learned_adjacent",
-                        "query": " ".join(query_terms[:6] + ["problem", "alternative"]),
-                        "subreddit": subreddits[0] if subreddits else "",
-                        "sort": "relevance",
-                        "time": "year",
-                        "why": "Deep research found these terms, subreddit, or strategy productive; run an adjacent follow-up search.",
-                    }
-                )
-    return merge_candidates(learned)
-
-
-def merge_candidates(candidates: list[dict[str, str]]) -> list[dict[str, str]]:
-    result: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for item in candidates:
-        query = item["query"]
-        if query in seen:
+        query = str(item.get("query") or "").strip()
+        if not query or query in seen_queries:
             continue
-        seen.add(query)
-        result.append(item)
-    return result
-
-
-def select_search_candidates(
-    ordered: list[dict[str, str]],
-    default_candidates: list[dict[str, str]],
-    count: int,
-    recent: set[str],
-    avoid: set[str],
-    avoid_strategies: set[str],
-) -> list[dict[str, str]]:
-    selected: list[dict[str, str]] = []
-    for candidate in ordered:
-        if should_skip_candidate(candidate, selected, ordered, recent, avoid, avoid_strategies):
-            continue
-        selected.append(candidate)
-        if len(selected) >= count:
+        seen_queries.add(query)
+        assignments.append(
+            {
+                "strategy": safe_strategy(item.get("strategy")),
+                "query": query,
+                "subreddit": clean_subreddit(item.get("subreddit")),
+                "sort": clean_choice(item.get("sort"), {"relevance", "top", "new", "comments"}, "relevance"),
+                "time": clean_choice(item.get("time"), {"day", "week", "month", "year", "all"}, "year"),
+                "why": str(item.get("why") or "Planned by LLM from user requirement and deep research feedback.").strip(),
+            }
+        )
+        if len(assignments) >= requested_count:
             break
-    if count >= 3 and selected and default_candidates and not any(item in default_candidates for item in selected):
-        baseline = first_eligible_default(default_candidates, selected, recent, avoid, avoid_strategies)
-        if baseline is not None:
-            selected[-1] = baseline
-    if len(selected) < count:
-        for candidate in ordered:
-            if candidate not in selected:
-                selected.append(candidate)
-            if len(selected) >= count:
-                break
-    return selected
+    return assignments
 
 
-def should_skip_candidate(
-    candidate: dict[str, str],
-    selected: list[dict[str, str]],
-    candidates: list[dict[str, str]],
-    recent: set[str],
-    avoid: set[str],
-    avoid_strategies: set[str],
-) -> bool:
-    query = candidate["query"]
-    strategy = candidate.get("strategy", "")
-    if query in avoid and len(selected) + len(avoid) < len(candidates):
-        return True
-    if strategy in avoid_strategies and len(selected) + len(avoid_strategies) < len(candidates):
-        return True
-    if query in recent and len(selected) + len(recent) < len(candidates):
-        return True
-    return False
-
-
-def first_eligible_default(
-    default_candidates: list[dict[str, str]],
-    selected: list[dict[str, str]],
-    recent: set[str],
-    avoid: set[str],
-    avoid_strategies: set[str],
-) -> dict[str, str] | None:
-    for candidate in default_candidates:
-        if candidate in selected:
-            continue
-        if candidate["query"] in avoid or candidate["query"] in recent:
-            continue
-        if candidate.get("strategy", "") in avoid_strategies:
-            continue
-        return candidate
-    return None
-
-
-def avoided_queries(insights: list[dict[str, Any]]) -> set[str]:
-    avoid: set[str] = set()
-    productive: set[str] = set()
+def normalize_search_insights(insights: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
     for insight in insights:
         payload = insight.get("payload_json", insight)
         if not isinstance(payload, dict):
             continue
-        productive.update(str(query) for query in payload.get("productive_queries", []) if query)
-        avoid.update(str(query) for query in payload.get("noisy_queries", []) if query)
-    return avoid - productive
+        normalized.append(
+            {
+                "requirement_id": str(payload.get("requirement_id") or insight.get("requirement_id") or ""),
+                "research_run_id": str(payload.get("research_run_id") or insight.get("research_run_id") or ""),
+                "recommendation": str(payload.get("recommendation") or ""),
+                "status_after_research": str(payload.get("status_after_research") or ""),
+                "productive_queries": string_list(payload.get("productive_queries")),
+                "noisy_queries": string_list(payload.get("noisy_queries")),
+                "suggested_searches": dict_list(payload.get("suggested_searches")),
+                "productive_dimensions": dict_value(payload.get("productive_dimensions")),
+                "unproductive_dimensions": dict_value(payload.get("unproductive_dimensions")),
+                "recommended_allocation_change": dict_value(payload.get("recommended_allocation_change")),
+            }
+        )
+    return normalized
 
 
-def avoided_strategies(insights: list[dict[str, Any]]) -> set[str]:
-    avoid: set[str] = set()
-    productive: set[str] = set()
-    for insight in insights:
-        payload = insight.get("payload_json", insight)
-        if not isinstance(payload, dict):
-            continue
-        allocation = payload.get("recommended_allocation_change", {})
-        if isinstance(allocation, dict):
-            productive.update(str(strategy) for strategy in allocation.get("increase", []) if strategy)
-            avoid.update(str(strategy) for strategy in allocation.get("decrease", []) if strategy)
-        productive_dimensions = payload.get("productive_dimensions", {})
-        if isinstance(productive_dimensions, dict):
-            productive.update(str(strategy) for strategy in productive_dimensions.get("strategies", []) if strategy)
-        unproductive_dimensions = payload.get("unproductive_dimensions", {})
-        if isinstance(unproductive_dimensions, dict):
-            avoid.update(str(strategy) for strategy in unproductive_dimensions.get("strategies", []) if strategy)
-    return avoid - productive
-
-
-def build_query_candidates(brief: dict[str, Any]) -> list[dict[str, str]]:
-    domain = str(brief["domain"])
-    audiences = [str(item) for item in brief["audiences"]]
-    coverage = [str(item) for item in brief["coverage_targets"]]
-    tools = [str(item) for item in brief["known_tools"]]
-    subreddits = [str(item) for item in brief.get("subreddits", [])]
-    primary_audience = audiences[0]
-    primary_target = coverage[0]
-    second_target = coverage[1] if len(coverage) > 1 else primary_target
-    primary_tool = tools[0]
-    if "3C products" in domain or "consumer electronics" in domain:
-        return [
-            {
-                "strategy": "purchase_regret",
-                "query": "regret buying laptop phone headphones charger broke warranty",
-                "subreddit": "BuyItForLife",
-                "sort": "relevance",
-                "time": "year",
-                "why": "Find durable-goods complaints and purchase regret from electronics buyers.",
-            },
-            {
-                "strategy": "advice_pain",
-                "query": "confused choosing laptop overheating battery warranty",
-                "subreddit": "SuggestALaptop",
-                "sort": "relevance",
-                "time": "year",
-                "why": "Find concrete laptop buying pains and decision criteria.",
-            },
-            {
-                "strategy": "headphone_problem",
-                "query": "headphones earbuds uncomfortable noise cancelling connection problem",
-                "subreddit": "HeadphoneAdvice",
-                "sort": "relevance",
-                "time": "year",
-                "why": "Find accessory pain from users asking for better alternatives.",
-            },
-            {
-                "strategy": "pc_hardware_problem",
-                "query": "monitor gpu ssd laptop dock compatibility problem return",
-                "subreddit": "buildapc",
-                "sort": "relevance",
-                "time": "year",
-                "why": "Find compatibility and setup problems in PC hardware buying.",
-            },
-            {
-                "strategy": "support_gap",
-                "query": "phone laptop headphones warranty repair refund support problem",
-                "subreddit": "techsupport",
-                "sort": "relevance",
-                "time": "year",
-                "why": "Find after-sales support and repair pain.",
-            },
-            {
-                "strategy": "ecommerce_trust",
-                "query": "Amazon electronics wrong item refund denied phone laptop gpu",
-                "subreddit": "amazonprime",
-                "sort": "relevance",
-                "time": "year",
-                "why": "Find trust, delivery, refund, and fraud requirements around online electronics purchases.",
-            },
-            {
-                "strategy": "smart_home_privacy",
-                "query": "smart camera doorbell subscription privacy alternative problem",
-                "subreddit": "smarthome",
-                "sort": "relevance",
-                "time": "year",
-                "why": "Find smart device privacy, subscription, and reliability pain.",
-            },
-            {
-                "strategy": "charging_cable_problem",
-                "query": "usb c charger cable unsafe failed compatibility problem",
-                "subreddit": "UsbCHardware",
-                "sort": "relevance",
-                "time": "year",
-                "why": "Find charger, cable, and compatibility issues.",
-            },
-        ]
-    return [
+def unavailable_plan(
+    agent_id: str,
+    task_group: TaskGroup,
+    cycle_index: int,
+    description: str,
+    requested_count: int,
+    recent_queries: list[str],
+    search_insights: list[dict[str, Any]],
+    error: str | None = None,
+) -> dict[str, Any]:
+    reason = error or "LLM planner is unavailable because no API key is configured."
+    assignments = [
         {
-            "strategy": "broad_pain",
-            "query": f"{primary_audience} {primary_target} problem pain",
-            "subreddit": subreddits[0] if subreddits else "",
+            "agent_id": f"search-agent-{index}",
+            "strategy": "waiting_for_llm_planner",
+            "query": "",
+            "subreddit": "",
             "sort": "relevance",
             "time": "year",
-            "why": "Find broad user pain and unmet needs.",
-        },
-        {
-            "strategy": "buying_intent",
-            "query": f"best {domain} for {second_target} buying advice problem",
-            "subreddit": subreddits[1] if len(subreddits) > 1 else "",
-            "sort": "relevance",
-            "time": "year",
-            "why": "Find product-selection pain and purchase criteria.",
-        },
-        {
-            "strategy": "alternative_comparison",
-            "query": f"alternative to {primary_tool} for {domain}",
-            "subreddit": subreddits[2] if len(subreddits) > 2 else "",
-            "sort": "relevance",
-            "time": "year",
-            "why": "Find dissatisfaction with current alternatives.",
-        },
-        {
-            "strategy": "complaint_reviews",
-            "query": f"{domain} review complaint annoying problem",
-            "subreddit": subreddits[3] if len(subreddits) > 3 else "",
-            "sort": "relevance",
-            "time": "year",
-            "why": "Find complaints in reviews and discussion threads.",
-        },
-        {
-            "strategy": "feature_request",
-            "query": f"is there an app or tool for {domain} {primary_target}",
-            "subreddit": subreddits[4] if len(subreddits) > 4 else "",
-            "sort": "relevance",
-            "time": "year",
-            "why": "Find explicit requests for tools or features.",
-        },
-        {
-            "strategy": "manual_workaround",
-            "query": f"{primary_audience} {primary_target} spreadsheet manual workflow",
-            "subreddit": subreddits[5] if len(subreddits) > 5 else "",
-            "sort": "relevance",
-            "time": "year",
-            "why": "Find workaround behavior that suggests product opportunity.",
-        },
-        {
-            "strategy": "community_question",
-            "query": f"how do people handle {domain} {second_target}",
-            "subreddit": subreddits[6] if len(subreddits) > 6 else "",
-            "sort": "relevance",
-            "time": "year",
-            "why": "Find open-ended community questions.",
-        },
-        {
-            "strategy": "support_gap",
-            "query": f"{domain} after sales support warranty return problem",
-            "subreddit": subreddits[7] if len(subreddits) > 7 else "",
-            "sort": "relevance",
-            "time": "year",
-            "why": "Find service and support requirement signals.",
-        },
+            "why": reason,
+        }
+        for index in range(1, requested_count + 1)
     ]
+    return {
+        "planner_agent_id": agent_id,
+        "cycle_index": cycle_index,
+        "task_group_id": task_group.task_group_id,
+        "input_description": description,
+        "search_goal": "Search planning requires an available LLM planner.",
+        "search_brief": {
+            "domain_understanding": task_group.domain or task_group.name,
+            "target_users": [],
+            "product_or_problem_scope": [],
+            "must_match": [],
+            "reject_if": [],
+            "deep_research_lessons": [],
+            "planning_method": "llm_unavailable",
+            "planner_error": reason,
+            "requested_search_agents": requested_count,
+            "recent_queries_considered": recent_queries,
+            "deep_research_feedback_considered": search_insights,
+        },
+        "search_insights": search_insights,
+        "assignments": assignments,
+        "queries": [],
+    }
+
+
+def string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def dict_list(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def dict_value(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def clean_subreddit(value: object) -> str:
+    subreddit = str(value or "").strip()
+    return subreddit[2:] if subreddit.startswith("r/") else subreddit
+
+
+def clean_choice(value: object, allowed: set[str], default: str) -> str:
+    candidate = str(value or "").strip().lower()
+    return candidate if candidate in allowed else default
+
+
+def safe_strategy(value: object) -> str:
+    strategy = str(value or "llm_planned_search").strip().lower().replace("-", "_").replace(" ", "_")
+    return "".join(ch for ch in strategy if ch.isalnum() or ch == "_") or "llm_planned_search"

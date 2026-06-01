@@ -17,6 +17,35 @@ from super_crawler.search_planner import SearchPlannerAgent
 from super_crawler.storage import Storage
 
 
+class FakePlannerLLM:
+    def __init__(self, response: dict[str, object]):
+        self.response = response
+        self.prompts: list[str] = []
+
+    def available(self) -> bool:
+        return True
+
+    def json_chat(self, model: str, system: str, user: str) -> dict[str, object]:
+        self.prompts.append(user)
+        return self.response
+
+
+def planner_response(assignments: list[dict[str, object]], domain: str = "Creator camera support accessories") -> dict[str, object]:
+    return {
+        "search_goal": f"Find Reddit pain points for {domain}.",
+        "search_brief": {
+            "domain_understanding": domain,
+            "target_users": ["content creators", "photographers"],
+            "product_or_problem_scope": ["camera stands", "fill lights", "phone mounts"],
+            "must_match": ["creator setup or camera support accessory pain"],
+            "reject_if": ["unrelated software workflow or generic electronics posts"],
+            "deep_research_lessons": ["Use validated directions and avoid noisy queries from prior deep research."],
+            "planning_method": "llm",
+        },
+        "assignments": assignments,
+    }
+
+
 class SystemTests(unittest.TestCase):
     def test_end_to_end_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -206,14 +235,34 @@ class SystemTests(unittest.TestCase):
                 description="I'm selling 3C products",
             )
 
-            first = SearchPlannerAgent().plan(task_group, 3, cycle_index=1, recent_queries=[])
-            second = SearchPlannerAgent().plan(task_group, 3, cycle_index=2, recent_queries=first["queries"])
+            first_llm = FakePlannerLLM(
+                planner_response(
+                    [
+                        {"strategy": "setup_pain", "query": "camera tripod unstable creator setup problem", "subreddit": "videography", "why": "Find creator setup pain."},
+                        {"strategy": "lighting_mount", "query": "ring light stand broke hard to adjust", "subreddit": "contentcreation", "why": "Find lighting stand complaints."},
+                        {"strategy": "phone_mount", "query": "phone mount filming overhead shots problem", "subreddit": "photography", "why": "Find phone mount setup problems."},
+                    ]
+                )
+            )
+            second_llm = FakePlannerLLM(
+                planner_response(
+                    [
+                        {"strategy": "desk_mount", "query": "desk camera mount shaky problem", "subreddit": "videography", "why": "Try a different creator accessory angle."},
+                        {"strategy": "quick_release", "query": "tripod quick release annoying camera rig", "subreddit": "photography", "why": "Find friction in camera rig changes."},
+                        {"strategy": "portable_lighting", "query": "portable fill light stand too heavy creator", "subreddit": "contentcreation", "why": "Find portability pain."},
+                    ]
+                )
+            )
 
-            self.assertIn("consumer electronics", first["search_brief"]["domain"])
+            first = SearchPlannerAgent(llm_client=first_llm).plan(task_group, 3, cycle_index=1, recent_queries=[])
+            second = SearchPlannerAgent(llm_client=second_llm).plan(task_group, 3, cycle_index=2, recent_queries=first["queries"])
+
+            self.assertEqual(first["search_brief"]["planning_method"], "llm")
+            self.assertIn("camera support", first["search_brief"]["domain_understanding"])
             self.assertEqual(len(first["assignments"]), 3)
-            self.assertTrue(any("laptop" in query or "headphone" in query or "charger" in query for query in first["queries"]))
+            self.assertTrue(any("tripod" in query or "ring light" in query or "phone mount" in query for query in first["queries"]))
             self.assertTrue(all(assignment["subreddit"] for assignment in first["assignments"]))
-            self.assertIn(first["assignments"][0]["subreddit"], first["search_brief"]["subreddits"])
+            self.assertIn("deep_research_feedback", first_llm.prompts[0])
             self.assertNotEqual(first["queries"], second["queries"])
 
     def test_saved_search_plan_shows_on_group_dashboard(self) -> None:
@@ -228,7 +277,15 @@ class SystemTests(unittest.TestCase):
                 input_dir=str(Path(directory) / "3c"),
                 description="I'm selling 3C products",
             )
-            plan = SearchPlannerAgent().plan(task_group, 2, cycle_index=1, recent_queries=[])
+            llm = FakePlannerLLM(
+                planner_response(
+                    [
+                        {"strategy": "setup_pain", "query": "camera tripod unstable creator setup problem", "subreddit": "videography", "why": "Find creator setup pain."},
+                        {"strategy": "lighting_mount", "query": "ring light stand broke hard to adjust", "subreddit": "contentcreation", "why": "Find lighting stand complaints."},
+                    ]
+                )
+            )
+            plan = SearchPlannerAgent(llm_client=llm).plan(task_group, 2, cycle_index=1, recent_queries=[])
             storage.save_search_plan(
                 task_group.task_group_id,
                 "run-1",
@@ -243,7 +300,7 @@ class SystemTests(unittest.TestCase):
             html = home_page(storage, controller)
 
             self.assertIn("Search Planner Agent", html)
-            self.assertIn("consumer electronics", html)
+            self.assertIn("Creator camera support accessories", html)
             self.assertIn(str(plan["assignments"][0]["query"]), html)
 
     def test_search_planner_uses_deep_research_insights(self) -> None:
@@ -336,7 +393,26 @@ class SystemTests(unittest.TestCase):
                 },
             )
 
-            plan = SearchPlannerAgent().plan(
+            llm = FakePlannerLLM(
+                planner_response(
+                    [
+                        {
+                            "query": "phone battery warranty pain",
+                            "subreddit": "techsupport",
+                            "strategy": "learned_support_gap",
+                            "why": "Deep research found relevant warranty evidence.",
+                        },
+                        {
+                            "query": "phone battery replacement support denied",
+                            "subreddit": "mobilerepair",
+                            "strategy": "battery_repair_followup",
+                            "why": "Deepen the productive battery warranty direction.",
+                        },
+                    ],
+                    domain="Phone warranty support",
+                )
+            )
+            plan = SearchPlannerAgent(llm_client=llm).plan(
                 task_group,
                 2,
                 cycle_index=1,
@@ -347,6 +423,7 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(plan["assignments"][0]["query"], "phone battery warranty pain")
             self.assertEqual(plan["assignments"][0]["strategy"], "learned_support_gap")
             self.assertNotIn("regret buying laptop phone headphones charger broke warranty", plan["queries"])
+            self.assertIn("phone battery warranty pain", llm.prompts[0])
 
     def test_search_planner_keeps_baseline_slot_with_structured_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -439,7 +516,32 @@ class SystemTests(unittest.TestCase):
                 },
             )
 
-            plan = SearchPlannerAgent().plan(
+            llm = FakePlannerLLM(
+                planner_response(
+                    [
+                        {
+                            "query": "phone battery warranty pain",
+                            "subreddit": "techsupport",
+                            "strategy": "learned_support_gap",
+                            "why": "Deep research found relevant warranty evidence.",
+                        },
+                        {
+                            "query": "phone battery repair denied warranty",
+                            "subreddit": "mobilerepair",
+                            "strategy": "learned_support_gap_adjacent",
+                            "why": "Broaden the productive support-gap direction.",
+                        },
+                        {
+                            "query": "phone manufacturer warranty support battery issue",
+                            "subreddit": "techsupport",
+                            "strategy": "warranty_support_baseline",
+                            "why": "Maintain one LLM-chosen baseline search grounded in the original requirement.",
+                        },
+                    ],
+                    domain="Electronics warranty support",
+                )
+            )
+            plan = SearchPlannerAgent(llm_client=llm).plan(
                 task_group,
                 3,
                 cycle_index=1,
@@ -450,7 +552,7 @@ class SystemTests(unittest.TestCase):
             strategies = [assignment["strategy"] for assignment in plan["assignments"]]
             self.assertEqual(plan["assignments"][0]["query"], "phone battery warranty pain")
             self.assertTrue(any(strategy.startswith("learned_support_gap") for strategy in strategies))
-            self.assertIn("advice_pain", strategies)
+            self.assertIn("warranty_support_baseline", strategies)
             self.assertNotIn("purchase_regret", strategies)
 
     def test_search_planner_log_lists_each_planned_search(self) -> None:
@@ -464,7 +566,16 @@ class SystemTests(unittest.TestCase):
                 input_dir=str(Path(directory) / "3c"),
                 description="I'm selling 3C products",
             )
-            plan = SearchPlannerAgent().plan(task_group, 3, cycle_index=3, recent_queries=[])
+            llm = FakePlannerLLM(
+                planner_response(
+                    [
+                        {"strategy": "setup_pain", "query": "camera tripod unstable creator setup problem", "subreddit": "videography", "why": "Find creator setup pain."},
+                        {"strategy": "lighting_mount", "query": "ring light stand broke hard to adjust", "subreddit": "contentcreation", "why": "Find lighting stand complaints."},
+                        {"strategy": "phone_mount", "query": "phone mount filming overhead shots problem", "subreddit": "photography", "why": "Find phone mount setup problems."},
+                    ]
+                )
+            )
+            plan = SearchPlannerAgent(llm_client=llm).plan(task_group, 3, cycle_index=3, recent_queries=[])
             storage.log_experiment(
                 task_group.task_group_id,
                 "run-1",

@@ -171,7 +171,7 @@ class AlwaysOnRunner:
             },
         )
         collection_result = self._collect_for_task_group(task_group, task_group_run_id, search_agent_count, collector_limit_override)
-        if collection_result and collection_result.get("search_agents"):
+        if collection_result is not None and "search_agents" in collection_result:
             output_paths = [agent["output_path"] for agent in collection_result["search_agents"] if agent.get("output_path")]
             scan = load_json_files_with_report(output_paths)
         else:
@@ -377,7 +377,7 @@ class AlwaysOnRunner:
             command=config.get("collector_command", "opencli reddit search"),
             timeout_seconds=parse_int(config.get("collector_timeout_seconds"), 120),
         )
-        assignments = list(plan["assignments"])
+        assignments = [assignment for assignment in plan["assignments"] if str(assignment.get("query", "")).strip()]
         queries = [str(query) for query in plan["queries"]]
         configured_limit = parse_int(config.get("collector_limit"), 25)
         limit = min(configured_limit, collector_limit_override) if collector_limit_override else configured_limit
