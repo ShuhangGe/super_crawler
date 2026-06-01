@@ -1645,7 +1645,7 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(locked, "req-running")
             rows = {row["requirement_id"]: row for row in storage.list_queue()}
             self.assertIsNone(rows["req-stopped"]["locked_by"])
-            self.assertEqual(rows["req-running"]["locked_by"], "research-agent-1")
+            self.assertNotIn("req-running", rows)
 
     def test_collected_items_keep_search_agent_identity(self) -> None:
         class FakeCollector(OpenCliRedditCollector):

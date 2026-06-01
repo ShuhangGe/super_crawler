@@ -650,18 +650,20 @@ class DeepResearchAgent(BaseAgent):
         self.llm_client = llm_client
 
     def run_next(self, eligible_task_group_ids: list[str] | None = None) -> ResearchRun | None:
-        requirement_id = self.storage.lock_next_research(self.agent_id, eligible_task_group_ids)
-        if requirement_id is None:
+        queue_item = self.storage.claim_next_research(self.agent_id, eligible_task_group_ids)
+        if queue_item is None:
             self.log("run_next", "skipped", [], [])
             return None
+        requirement_id = str(queue_item["requirement_id"])
         requirement = self.storage.get_requirement(requirement_id)
         if requirement is None:
+            self._requeue_claimed_research(queue_item)
             self.log("run_next", "failed", [requirement_id], [], "requirement not found")
             return None
         try:
             return self.research(requirement)
         except Exception as exc:
-            self._mark_research_failed(requirement, str(exc))
+            self._mark_research_failed(requirement, str(exc), queue_item)
             self.log("run_next", "failed", [requirement_id], [], str(exc))
             return None
 
@@ -785,7 +787,6 @@ class DeepResearchAgent(BaseAgent):
         requirement.previous_scores = scores
         requirement.decision_history.append({"at": utc_now(), "decision": requirement.status.value, "research_run": run_id})
         self.storage.upsert_requirement(requirement)
-        self.storage.dequeue_locked_research(requirement.requirement_id, self.agent_id)
         self.storage.log_requirement_event(
             requirement.requirement_id,
             task_group_id,
@@ -918,12 +919,25 @@ class DeepResearchAgent(BaseAgent):
             ],
         }
 
-    def _mark_research_failed(self, requirement: RequirementRecord, error: str) -> None:
+    def _requeue_claimed_research(self, queue_item: dict[str, Any]) -> None:
+        self.storage.enqueue_research(
+            str(queue_item["requirement_id"]),
+            int(queue_item.get("priority", 1) or 1),
+            str(queue_item.get("reason") or "deep research retry"),
+            int(queue_item.get("new_evidence_count", 0) or 0),
+            str(queue_item["previous_research_status"]) if queue_item.get("previous_research_status") is not None else None,
+            str(queue_item["task_group_id"]) if queue_item.get("task_group_id") is not None else None,
+            float(queue_item.get("estimated_cost", 0.25) or 0.25),
+            int(queue_item.get("expected_completion_minutes", 20) or 20),
+        )
+
+    def _mark_research_failed(self, requirement: RequirementRecord, error: str, queue_item: dict[str, Any] | None = None) -> None:
         requirement.status = RequirementStatus.QUEUED_FOR_RESEARCH
         requirement.assigned_to = None
         requirement.decision_history.append({"at": utc_now(), "decision": "deep_research_failed", "error": error})
         self.storage.upsert_requirement(requirement)
-        self.storage.unlock_research(requirement.requirement_id, self.agent_id)
+        if queue_item is not None:
+            self._requeue_claimed_research(queue_item)
         task_group_id = requirement.task_group_ids[-1] if requirement.task_group_ids else None
         task_group_run_id = requirement.task_group_run_ids[-1] if requirement.task_group_run_ids else None
         self.storage.log_requirement_event(

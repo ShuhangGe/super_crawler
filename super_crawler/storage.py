@@ -661,23 +661,35 @@ class Storage:
         )
         self.conn.commit()
 
-    def lock_next_research(self, agent_id: str, eligible_task_group_ids: list[str] | None = None) -> str | None:
+    def claim_next_research(self, agent_id: str, eligible_task_group_ids: list[str] | None = None) -> dict[str, Any] | None:
         if self.conn.in_transaction:
-            return self._lock_next_research_in_current_transaction(agent_id, eligible_task_group_ids)
+            return self._claim_next_research_in_current_transaction(agent_id, eligible_task_group_ids)
         try:
             self.conn.execute("BEGIN IMMEDIATE")
-            requirement_id = self._lock_next_research_in_current_transaction(agent_id, eligible_task_group_ids)
+            row = self._claim_next_research_in_current_transaction(agent_id, eligible_task_group_ids)
             self.conn.commit()
-            return requirement_id
+            return row
         except Exception:
             self.conn.rollback()
             raise
+
+    def lock_next_research(self, agent_id: str, eligible_task_group_ids: list[str] | None = None) -> str | None:
+        row = self.claim_next_research(agent_id, eligible_task_group_ids)
+        return None if row is None else str(row["requirement_id"])
 
     def _lock_next_research_in_current_transaction(
         self,
         agent_id: str,
         eligible_task_group_ids: list[str] | None = None,
     ) -> str | None:
+        row = self._claim_next_research_in_current_transaction(agent_id, eligible_task_group_ids)
+        return None if row is None else str(row["requirement_id"])
+
+    def _claim_next_research_in_current_transaction(
+        self,
+        agent_id: str,
+        eligible_task_group_ids: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         params: list[Any] = []
         group_filter = ""
         if eligible_task_group_ids is not None:
@@ -688,7 +700,7 @@ class Storage:
             params.extend(eligible_task_group_ids)
         row = self.conn.execute(
             f"""
-            SELECT research_queue.requirement_id
+            SELECT research_queue.rowid AS queue_rowid, research_queue.*
             FROM research_queue
             WHERE research_queue.locked_by IS NULL
             {group_filter}
@@ -699,13 +711,11 @@ class Storage:
         ).fetchone()
         if row is None:
             return None
-        requirement_id = row["requirement_id"]
-        now = utc_now()
-        self.conn.execute(
-            "UPDATE research_queue SET locked_by=?, assigned_agent=?, updated_at=? WHERE requirement_id=?",
-            (agent_id, agent_id, now, requirement_id),
-        )
-        return requirement_id
+        item = dict(row)
+        item["assigned_agent"] = agent_id
+        item["locked_by"] = agent_id
+        self.conn.execute("DELETE FROM research_queue WHERE rowid=?", (row["queue_rowid"],))
+        return item
 
     def dequeue_research(self, requirement_id: str, task_group_id: str | None = None) -> None:
         if task_group_id is None:
