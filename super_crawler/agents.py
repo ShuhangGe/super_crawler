@@ -30,13 +30,13 @@ from .text import (
 
 
 RESEARCH_QUESTIONS = [
-    "How often does this requirement appear?",
-    "How many subreddits discuss it?",
-    "Are users emotionally invested in the problem?",
-    "Are users already paying for solutions?",
-    "What are current alternatives?",
-    "What do users dislike about existing solutions?",
-    "Is this a product, content, service, affiliate, or community opportunity?",
+    "这个需求出现的频率如何？",
+    "有多少个子版块在讨论它？",
+    "用户是否对这个问题有情感投入？",
+    "用户是否已经在为解决方案付费？",
+    "目前有哪些替代方案？",
+    "用户对现有解决方案有什么不满？",
+    "这是产品、内容、服务、联盟还是社区的机会？",
 ]
 
 
@@ -212,18 +212,18 @@ class DiscoveryAgent(BaseAgent):
         system = (
             "You are a discovery search agent. Your job is lightweight sample screening, not final validation. "
             "Decide whether this Reddit post is worth saving as a possible requirement candidate for a deep "
-            "research agent. Return only JSON."
+            "research agent. Respond in Chinese (简体中文) for all text fields. Return only JSON."
         )
         user = json.dumps(
             {
                 "instructions": {
                     "is_possible_requirement": "true for plausible user pain, unmet need, workaround, buying intent, or request for a better way; false only for clear noise",
                     "reject": "news, memes, generic photos, facts, entertainment, celebrity posts, or topic mentions without any user problem",
-                    "requirement_title": "one sentence beginning with 'Users need'",
-                    "requirement_description": "short explanation grounded in the post",
+                    "requirement_title": '用中文写一句话，以"用户需要"开头',
+                    "requirement_description": "用中文简短解释，基于帖子内容",
                     "signals": "short labels like tool_request, complaint, workaround, alternative, workflow_pain",
-                    "sample_analysis": "concise observable evidence for why this sample may be worth deep research; not hidden chain-of-thought",
-                    "sample_rejection_reason": "short reason if is_possible_requirement is false",
+                    "sample_analysis": "用中文简明说明为什么这个样本值得深入研究",
+                    "sample_rejection_reason": "如果 is_possible_requirement 为 false，用中文简短说明原因",
                     "pain_level": "low, medium, or high",
                     "confidence": "number from 0 to 1",
                 },
@@ -421,6 +421,83 @@ def normalize_deep_research_item_analysis(parsed: dict[str, Any]) -> dict[str, A
         "country_area_hints": [str(region) for region in regions],
         "existing_solutions": [str(solution) for solution in solutions],
         "confidence": round(confidence, 2),
+    }
+
+
+def normalize_deep_research_plan(parsed: dict[str, Any], fallback: list[dict[str, str]]) -> dict[str, Any]:
+    tracks = parsed.get("search_tracks")
+    tasks: list[dict[str, str]] = []
+    if isinstance(tracks, list):
+        for track in tracks:
+            if not isinstance(track, dict):
+                continue
+            source = str(track.get("source") or track.get("platform") or track.get("track") or "web").strip() or "web"
+            strategy = str(track.get("track") or track.get("strategy") or source).strip() or source
+            question = str(track.get("question") or track.get("success_criteria") or "验证这个需求是否真实").strip()
+            queries = track.get("queries")
+            if not isinstance(queries, list):
+                queries = [track.get("query")]
+            for query in queries:
+                query_text = str(query or "").strip()
+                if not query_text:
+                    continue
+                tasks.append(
+                    {
+                        "question": question,
+                        "query": query_text,
+                        "subreddit": str(track.get("subreddit") or "").strip(),
+                        "strategy": strategy,
+                        "source": source,
+                        "sort": str(track.get("sort") or "relevance").strip(),
+                        "time": str(track.get("time") or "year").strip(),
+                    }
+                )
+    if not tasks:
+        tasks = fallback
+    return {
+        "requirement_rewrite": str(parsed.get("requirement_rewrite") or parsed.get("requirement_summary") or ""),
+        "target_users": [str(item) for item in parsed.get("target_users", [])] if isinstance(parsed.get("target_users"), list) else [],
+        "hypotheses": [str(item) for item in parsed.get("hypotheses", [])] if isinstance(parsed.get("hypotheses"), list) else [],
+        "search_tracks": tasks[:8],
+        "planning_method": "llm" if isinstance(tracks, list) and tracks else "fallback",
+    }
+
+
+def normalize_deep_research_synthesis(parsed: dict[str, Any]) -> dict[str, Any]:
+    status = str(parsed.get("final_decision") or parsed.get("status") or "needs_more_research").lower().strip()
+    status = {
+        "accept": "validated",
+        "accepted": "validated",
+        "validate": "validated",
+        "validated": "validated",
+        "watch": "watching",
+        "watching": "watching",
+        "needs_more_research": "needs_more_research",
+        "more_research": "needs_more_research",
+        "reject": "rejected",
+        "rejected": "rejected",
+    }.get(status, "needs_more_research")
+    try:
+        confidence = max(0.0, min(float(parsed.get("confidence", 0.5)), 1.0))
+    except (TypeError, ValueError):
+        confidence = 0.5
+
+    def list_of_strings(key: str) -> list[str]:
+        value = parsed.get(key)
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value]
+
+    return {
+        "final_decision": status,
+        "confidence": round(confidence, 2),
+        "why_real": str(parsed.get("why_real") or ""),
+        "why_noise": str(parsed.get("why_noise") or ""),
+        "strongest_evidence": list_of_strings("strongest_evidence"),
+        "weakest_assumptions": list_of_strings("weakest_assumptions"),
+        "existing_solutions": list_of_strings("existing_solutions"),
+        "market_gap": str(parsed.get("market_gap") or ""),
+        "recommended_next_step": str(parsed.get("recommended_next_step") or ""),
     }
 
 
@@ -723,7 +800,11 @@ class DeepResearchAgent(BaseAgent):
         alternatives = infer_existing_solutions(evidence)
         opportunities = infer_opportunities(requirement, evidence)
         validation = validate_requirement(requirement, evidence, scores, alternatives)
-        final_status = self._status_from_scores(scores)
+        synthesis = self._synthesize_research_decision(requirement, evidence, scores, validation, alternatives, active_research)
+        final_status = self._status_from_synthesis(synthesis, requirement, evidence, scores)
+        validation["is_real_requirement"] = final_status != RequirementStatus.REJECTED
+        if synthesis.get("why_real"):
+            validation["realness_reason"] = str(synthesis["why_real"])
         rejection_summary = one_sentence_rejection_summary(requirement, evidence, validation)
         recommendation = make_recommendation(scores, final_status, validation, rejection_summary)
         run_id = f"run_{hashlib.sha1((requirement.requirement_id + started).encode()).hexdigest()[:12]}"
@@ -741,15 +822,19 @@ class DeepResearchAgent(BaseAgent):
                 "is_real_requirement": validation["is_real_requirement"],
                 "realness_reason": validation["realness_reason"],
                 "rejection_summary": rejection_summary if final_status == RequirementStatus.REJECTED else "",
-                "why_real": summarize_why_real(positives),
-                "why_noise": summarize_why_noise(requirement, evidence),
+                "why_real": synthesis.get("why_real") or summarize_why_real(positives),
+                "why_noise": synthesis.get("why_noise") or summarize_why_noise(requirement, evidence),
                 "audience": requirement.audience_segments,
                 "country_area_distribution": validation["country_area_distribution"],
                 "pain_intensity": classify_pain(scores["pain_intensity_score"]),
                 "willingness_to_pay_signals": find_payment_signals(evidence),
                 "product_opportunities": opportunities["product"],
                 "content_opportunities": opportunities["content"],
-                "suggested_next_validation_step": next_validation_step(scores),
+                "suggested_next_validation_step": synthesis.get("recommended_next_step") or next_validation_step(scores),
+                "llm_synthesis": synthesis,
+                "strongest_evidence": synthesis.get("strongest_evidence", []),
+                "weakest_assumptions": synthesis.get("weakest_assumptions", []),
+                "market_gap": synthesis.get("market_gap", ""),
             },
             scores=scores,
             geo_analysis=geo,
@@ -830,6 +915,7 @@ class DeepResearchAgent(BaseAgent):
                     "country_area_distribution": validation["country_area_distribution"],
                     "scores": scores,
                     "active_research": active_research,
+                    "llm_synthesis": synthesis,
                     "search_insight_id": insight_id,
                     "search_insight": search_insight,
                 },
@@ -864,15 +950,15 @@ class DeepResearchAgent(BaseAgent):
         noisy = [item for item in searches if int(item.get("evidence_added", 0) or 0) == 0 and not item.get("error")]
         productive_terms = search_feedback_terms(productive)
         noisy_terms = search_feedback_terms(noisy)
-        productive_strategies = sorted({str(item.get("strategy", "")) for item in productive if item.get("strategy")})
-        noisy_strategies = sorted({str(item.get("strategy", "")) for item in noisy if item.get("strategy")})
+        productive_strategies = sorted({canonical_research_strategy(str(item.get("strategy", ""))) for item in productive if item.get("strategy")})
+        noisy_strategies = sorted({canonical_research_strategy(str(item.get("strategy", ""))) for item in noisy if item.get("strategy")})
         productive_subreddits = sorted({str(item.get("subreddit", "")) for item in productive if item.get("subreddit")})
         noisy_subreddits = sorted({str(item.get("subreddit", "")) for item in noisy if item.get("subreddit")})
         suggested = [
             {
                 "query": str(item.get("query", "")),
                 "subreddit": str(item.get("subreddit", "")),
-                "strategy": f"learned_{item.get('strategy', 'deep_research')}",
+                "strategy": f"learned_{canonical_research_strategy(str(item.get('strategy', 'deep_research')))}",
                 "sort": "relevance",
                 "time": "year",
                 "why": f"Deep research added {item.get('evidence_added', 0)} relevant evidence item(s).",
@@ -923,6 +1009,112 @@ class DeepResearchAgent(BaseAgent):
             ],
         }
 
+    def _synthesize_research_decision(
+        self,
+        requirement: RequirementRecord,
+        evidence: list[RawEvidence],
+        scores: dict[str, Any],
+        validation: dict[str, Any],
+        alternatives: dict[str, Any],
+        active_research: dict[str, Any],
+    ) -> dict[str, Any]:
+        fallback_status = self._status_from_scores(scores).value
+        fallback = {
+            "final_decision": fallback_status,
+            "confidence": 0.55,
+            "why_real": validation.get("realness_reason", ""),
+            "why_noise": summarize_why_noise(requirement, evidence),
+            "strongest_evidence": [item.title for item in evidence[:3]],
+            "weakest_assumptions": [] if evidence else ["没有找到足够的支持性证据"],
+            "existing_solutions": alternatives.get("existing_solutions", []),
+            "market_gap": "; ".join(alternatives.get("common_complaints", [])),
+            "recommended_next_step": next_validation_step(scores),
+            "decision_source": "score_fallback",
+        }
+        config = self.storage.get_task_group_config(requirement.task_group_ids[-1]) if requirement.task_group_ids else self.storage.get_app_config()
+        model_name = config.get("model_deep_research", "deepseek-v4-flash")
+        llm = self.llm_client if self.llm_client is not None else DeepSeekClient()
+        if not llm.available():
+            return fallback
+        evidence_summary = [
+            {
+                "title": item.title,
+                "body": item.body[:700],
+                "source": item.source,
+                "subreddit": item.subreddit,
+                "signals": item.matched_patterns,
+                "score": item.score,
+                "comment_count": item.comment_count,
+            }
+            for item in evidence[:12]
+        ]
+        system = (
+            "You are a senior product research analyst. Synthesize cross-source evidence and decide whether a "
+            "requirement is validated, should be watched, needs more research, or should be rejected. Use the evidence, "
+            "not only numeric scores. Respond in Chinese (简体中文) for all text fields. Return only JSON."
+        )
+        user = json.dumps(
+            {
+                "requirement": {
+                    "requirement_id": requirement.requirement_id,
+                    "title": requirement.canonical_requirement,
+                    "description": requirement.description,
+                    "audience_segments": requirement.audience_segments,
+                },
+                "scores": scores,
+                "rule_validation": validation,
+                "active_research": {
+                    "sources": active_research.get("sources", []),
+                    "queries": active_research.get("queries", []),
+                    "items_analyzed": active_research.get("items_analyzed", 0),
+                    "evidence_added": len(active_research.get("evidence_ids", [])),
+                    "research_plan": active_research.get("research_plan", {}),
+                },
+                "evidence": evidence_summary,
+                "expected_json": {
+                    "final_decision": "validated | watching | needs_more_research | rejected",
+                    "confidence": "0 to 1",
+                    "why_real": "需求真实的证据总结",
+                    "why_noise": "噪音或不确定性的证据总结",
+                    "strongest_evidence": ["最强证据"],
+                    "weakest_assumptions": ["最弱假设"],
+                    "existing_solutions": ["已有解决方案或竞品"],
+                    "market_gap": "现有方案缺口",
+                    "recommended_next_step": "下一步建议",
+                },
+            },
+            ensure_ascii=False,
+        )
+        try:
+            parsed = llm.json_chat(model_name, system, user)
+        except Exception as exc:  # noqa: BLE001 - score fallback keeps the agent deterministic.
+            return {**fallback, "synthesis_error": str(exc)}
+        synthesis = normalize_deep_research_synthesis(parsed)
+        synthesis["decision_source"] = "llm"
+        return {**fallback, **synthesis}
+
+    def _status_from_synthesis(
+        self,
+        synthesis: dict[str, Any],
+        requirement: RequirementRecord,
+        evidence: list[RawEvidence],
+        scores: dict[str, Any],
+    ) -> RequirementStatus:
+        decision = str(synthesis.get("final_decision", "")).lower()
+        status = {
+            "validated": RequirementStatus.VALIDATED,
+            "watching": RequirementStatus.WATCHING,
+            "needs_more_research": RequirementStatus.WATCHING,
+            "rejected": RequirementStatus.REJECTED,
+        }.get(decision, self._status_from_scores(scores))
+        if not evidence:
+            return RequirementStatus.REJECTED
+        if status == RequirementStatus.VALIDATED and (requirement.evidence_count < 3 or requirement.subreddit_count < 2):
+            return RequirementStatus.WATCHING
+        if status == RequirementStatus.REJECTED and (scores.get("overall_score", 0) >= 72 or find_payment_signals(evidence)):
+            return RequirementStatus.WATCHING
+        return status
+
     def _requeue_claimed_research(self, queue_item: dict[str, Any]) -> None:
         self.storage.enqueue_research(
             str(queue_item["requirement_id"]),
@@ -971,14 +1163,17 @@ class DeepResearchAgent(BaseAgent):
         task_group_run_id: str | None,
     ) -> dict[str, Any]:
         config = self.storage.get_task_group_config(task_group_id) if task_group_id else self.storage.get_app_config()
-        plan = self._plan_active_research(requirement)
+        model_name = config.get("model_deep_research", "deepseek-v4-flash")
+        llm = self.llm_client if self.llm_client is not None else DeepSeekClient()
+        plan_payload = self._plan_active_research(requirement, model_name, llm)
+        plan = plan_payload["search_tracks"]
         self._log_deep_research_step(
             requirement,
             task_group_id,
             task_group_run_id,
             "deep_research_plan_created",
             f"Created {len(plan)} deep research search task(s) for {requirement.requirement_id}",
-            {"requirement_id": requirement.requirement_id, "agent_id": self.agent_id, "plan": plan},
+            {"requirement_id": requirement.requirement_id, "agent_id": self.agent_id, "plan": plan, "research_plan": plan_payload},
         )
         if config.get("collector_enabled") != "1":
             self._log_deep_research_step(
@@ -995,8 +1190,6 @@ class DeepResearchAgent(BaseAgent):
             command=config.get("collector_command", "opencli reddit search"),
             timeout_seconds=parse_int(config.get("collector_timeout_seconds"), 120),
         )
-        model_name = config.get("model_deep_research", "deepseek-v4-flash")
-        llm = self.llm_client if self.llm_client is not None else DeepSeekClient()
         evidence_ids: list[str] = []
         searches: list[dict[str, Any]] = []
         items_analyzed = 0
@@ -1038,6 +1231,7 @@ class DeepResearchAgent(BaseAgent):
                     "search_query": task["query"],
                     "search_subreddit": task.get("subreddit", ""),
                     "search_strategy": task.get("strategy", "deep_research"),
+                    "search_source": task.get("source", "reddit"),
                     "deep_research_question": task["question"],
                     "task_group_id": task_group_id,
                     "task_group_run_id": task_group_run_id,
@@ -1069,6 +1263,7 @@ class DeepResearchAgent(BaseAgent):
                 "question": task["question"],
                 "subreddit": task.get("subreddit", ""),
                 "strategy": task.get("strategy", "deep_research"),
+                "source": task.get("source", "reddit"),
                 "command": result.get("command", []),
                 "stderr": result.get("stderr", ""),
                 "items_returned": len(result["items"]),
@@ -1089,6 +1284,8 @@ class DeepResearchAgent(BaseAgent):
 
         summary = {
             "queries": [item["query"] for item in plan],
+            "sources": sorted({str(item.get("source", "reddit")) for item in plan}),
+            "research_plan": plan_payload,
             "evidence_ids": evidence_ids,
             "items_analyzed": items_analyzed,
             "searches": searches,
@@ -1103,39 +1300,114 @@ class DeepResearchAgent(BaseAgent):
         )
         return summary
 
-    def _plan_active_research(self, requirement: RequirementRecord) -> list[dict[str, str]]:
+    def _plan_active_research(
+        self,
+        requirement: RequirementRecord,
+        model_name: str,
+        llm: DeepSeekClient,
+    ) -> dict[str, Any]:
         base = requirement.canonical_requirement.strip()
         compact = " ".join(base.replace("Users need", "").replace("users need", "").split())
         evidence = self.storage.list_evidence(requirement.evidence_ids)
         subreddits = [item.subreddit for item in evidence if item.subreddit and item.subreddit != "unknown"]
         primary_subreddit = subreddits[0] if subreddits else ""
         audience = " ".join(requirement.audience_segments[:2]) or "users"
-        return [
+        fallback = [
             {
-                "question": "Do more users describe the same pain or workaround?",
+                "question": "是否有更多用户描述了相同的痛点或临时解决方案？",
                 "query": f"{compact} problem pain workaround",
                 "subreddit": primary_subreddit,
                 "strategy": "repeat_pain_validation",
+                "source": "reddit",
                 "sort": "relevance",
                 "time": "year",
             },
             {
-                "question": "Are users looking for alternatives or existing solutions?",
-                "query": f"{compact} alternative app tool solution",
+                "question": "用户是否在寻找替代方案或现有解决方案？",
+                "query": f"{compact} alternative app tool solution reviews",
                 "subreddit": "",
                 "strategy": "existing_solution_scan",
+                "source": "google_web",
                 "sort": "relevance",
                 "time": "year",
             },
             {
-                "question": "Is there buying intent, payment frustration, or switching intent?",
+                "question": "是否存在购买意向、付费不满或转换意向？",
                 "query": f"{audience} {compact} pay buy subscription refund warranty",
                 "subreddit": primary_subreddit,
                 "strategy": "market_signal_scan",
+                "source": "reddit",
+                "sort": "relevance",
+                "time": "year",
+            },
+            {
+                "question": "产品评论或用户评论中是否出现同类痛点？",
+                "query": f"{compact} reviews complaints alternatives",
+                "subreddit": "",
+                "strategy": "product_review_scan",
+                "source": "product_reviews",
+                "sort": "relevance",
+                "time": "year",
+            },
+            {
+                "question": "视频、教程或问答内容是否说明用户在主动寻找解决方式？",
+                "query": f"{compact} how to fix best way youtube forum quora",
+                "subreddit": "",
+                "strategy": "content_and_forum_scan",
+                "source": "youtube_forums",
                 "sort": "relevance",
                 "time": "year",
             },
         ]
+        if not llm.available():
+            return normalize_deep_research_plan({}, fallback)
+        system = (
+            "You are a senior market and user-research planner. Build a comprehensive cross-source research plan "
+            "for validating whether a user requirement is real. Do not limit the plan to Reddit. Include sources "
+            "such as web search, forums, YouTube, app stores, product reviews, competitor pages, and Reddit when useful. "
+            "Respond in Chinese (简体中文) for text fields. Return only JSON."
+        )
+        user = json.dumps(
+            {
+                "requirement": {
+                    "requirement_id": requirement.requirement_id,
+                    "title": requirement.canonical_requirement,
+                    "description": requirement.description,
+                    "audience_segments": requirement.audience_segments,
+                    "current_scores": requirement.current_scores,
+                },
+                "existing_evidence": [
+                    {
+                        "title": item.title,
+                        "body": item.body[:700],
+                        "source": item.source,
+                        "subreddit": item.subreddit,
+                        "signals": item.matched_patterns,
+                    }
+                    for item in evidence[:8]
+                ],
+                "expected_json": {
+                    "requirement_rewrite": "用一句中文重写真正要验证的用户需求",
+                    "target_users": ["目标用户群体"],
+                    "hypotheses": ["需要验证或证伪的假设"],
+                    "search_tracks": [
+                        {
+                            "track": "pain_validation | market_solution_scan | commercial_signal | product_review_scan | forum_scan",
+                            "source": "reddit | google_web | youtube | forums | app_store | product_reviews | competitor_pages",
+                            "queries": ["具体搜索 query"],
+                            "question": "这个搜索要回答什么",
+                            "success_criteria": "什么证据算支持需求",
+                        }
+                    ],
+                },
+            },
+            ensure_ascii=False,
+        )
+        try:
+            parsed = llm.json_chat(model_name, system, user)
+        except Exception as exc:  # noqa: BLE001 - fallback plan keeps the research agent usable.
+            return {**normalize_deep_research_plan({}, fallback), "planning_error": str(exc)}
+        return normalize_deep_research_plan(parsed, fallback)
 
     def _analyze_research_item(
         self,
@@ -1153,7 +1425,8 @@ class DeepResearchAgent(BaseAgent):
         if llm.available():
             system = (
                 "You are a deep research evidence analyst. Decide whether this search result is useful evidence "
-                "for validating the requirement. Return only JSON and do not include hidden reasoning."
+                "for validating the requirement. Respond in Chinese (简体中文) for all text fields. "
+                "Return only JSON and do not include hidden reasoning."
             )
             user = json.dumps(
                 {
@@ -1167,6 +1440,7 @@ class DeepResearchAgent(BaseAgent):
                         "query": item.get("search_query", ""),
                         "subreddit": item.get("search_subreddit", ""),
                         "strategy": item.get("search_strategy", ""),
+                        "source": item.get("search_source", item.get("source", "")),
                     },
                     "post": {
                         "title": title,
@@ -1178,8 +1452,8 @@ class DeepResearchAgent(BaseAgent):
                     },
                     "expected_json": {
                         "is_relevant_evidence": "boolean",
-                        "evidence_type": "repeat_pain | workaround | alternative | buying_intent | geography | noise",
-                        "analysis_summary": "short observable analysis",
+                        "evidence_type": "pain | workaround | existing_solution | complaint | buying_intent | competitor | market_noise | geography | noise",
+                        "analysis_summary": "用中文简短分析",
                         "signals": ["short labels"],
                         "country_area_hints": ["regions or countries if stated"],
                         "existing_solutions": ["tools, brands, methods if mentioned"],
@@ -1189,7 +1463,8 @@ class DeepResearchAgent(BaseAgent):
             )
             try:
                 parsed = llm.json_chat(model_name, system, user)
-                analysis = normalize_deep_research_item_analysis(parsed)
+                if any(key in parsed for key in {"is_relevant_evidence", "evidence_type", "analysis_summary", "signals"}):
+                    analysis = normalize_deep_research_item_analysis(parsed)
             except Exception as exc:  # noqa: BLE001 - deterministic fallback is acceptable and logged in payload.
                 analysis = {"llm_error": str(exc)}
 
@@ -1199,7 +1474,7 @@ class DeepResearchAgent(BaseAgent):
         return {
             "is_relevant_evidence": relevant,
             "evidence_type": matched[0] if matched else "noise",
-            "analysis_summary": "Matched requirement validation signals." if relevant else relevance["reason"],
+            "analysis_summary": "匹配到需求验证信号。" if relevant else relevance["reason"],
             "signals": matched,
             "country_area_hints": infer_geo(text, str(item.get("subreddit", ""))),
             "existing_solutions": infer_existing_solution_terms(text),
@@ -1283,30 +1558,30 @@ class ReportAgent(BaseAgent):
         runs = self.storage.list_research_runs()
         queue = self.storage.list_queue()
         lines = [
-            "# Daily Requirement Discovery Report",
+            "# 每日需求发现报告",
             "",
-            f"Generated: {utc_now()}",
+            f"生成时间: {utc_now()}",
             "",
-            "## Snapshot",
-            f"- New or tracked requirements: {len(requirements)}",
-            f"- Queued for research: {len(queue)}",
-            f"- Research runs completed: {len(runs)}",
+            "## 概览",
+            f"- 新增或跟踪中的需求: {len(requirements)}",
+            f"- 排队等待研究: {len(queue)}",
+            f"- 已完成的研究运行: {len(runs)}",
             "",
-            "## Strongest Candidates",
+            "## 最强候选需求",
         ]
         for requirement in sorted(requirements, key=lambda item: item.current_scores.get("overall_score", 0), reverse=True)[:10]:
             lines.append(
                 f"- {requirement.canonical_requirement} | {requirement.status.value} | "
-                f"{requirement.current_scores.get('overall_score', 0)} | evidence {requirement.evidence_count}"
+                f"{requirement.current_scores.get('overall_score', 0)} | 证据数 {requirement.evidence_count}"
             )
-        lines.extend(["", "## Reopened Requirements"])
+        lines.extend(["", "## 已重新打开的需求"])
         reopened = [item for item in requirements if item.status == RequirementStatus.REOPENED or item.reopen_events]
         lines.extend(
-            f"- {item.canonical_requirement}: {item.reopen_events[-1]['reason'] if item.reopen_events else 'reopened'}"
+            f"- {item.canonical_requirement}: {item.reopen_events[-1]['reason'] if item.reopen_events else '已重新打开'}"
             for item in reopened
         )
-        lines.extend(["", "## Agent Errors Or Data Gaps"])
-        lines.append("- Live Reddit API ingestion is not configured in this MVP; use JSON input for controlled subreddit scans.")
+        lines.extend(["", "## 智能体错误或数据缺口"])
+        lines.append("- 当前 MVP 未配置 Reddit API 实时采集；请使用 JSON 输入进行受控的子版块扫描。")
         report = "\n".join(lines) + "\n"
         self.log("daily_report", "completed", [], [])
         return report
@@ -1321,16 +1596,16 @@ class ReportAgent(BaseAgent):
         lines = [
             f"# {requirement.canonical_requirement}",
             "",
-            f"Status: {requirement.status.value}",
-            f"Overall score: {requirement.current_scores.get('overall_score', 0)}",
+            f"状态: {requirement.status.value}",
+            f"综合评分: {requirement.current_scores.get('overall_score', 0)}",
             "",
-            "## Why This Might Be Real",
-            latest.findings["why_real"] if latest else "No deep research run yet.",
+            "## 为什么可能是真实需求",
+            latest.findings["why_real"] if latest else "尚未进行深度研究。",
             "",
-            "## Why This Might Be Noise",
-            latest.findings["why_noise"] if latest else "No deep research run yet.",
+            "## 为什么可能是噪音",
+            latest.findings["why_noise"] if latest else "尚未进行深度研究。",
             "",
-            "## Source Evidence",
+            "## 来源证据",
         ]
         lines.extend(f"- {item.subreddit}: {item.title} ({item.source_url})" for item in evidence)
         return "\n".join(lines) + "\n"
@@ -1394,15 +1669,15 @@ def validate_requirement(
     regions = requirement.geo_distribution or [{"region": "unknown", "confidence": 0.0, "evidence_count": len(evidence)}]
     realness_factors = []
     if requirement.evidence_count >= 2:
-        realness_factors.append("repeated evidence")
+        realness_factors.append("重复出现的证据")
     if requirement.subreddit_count >= 2:
-        realness_factors.append("appears across multiple communities")
+        realness_factors.append("出现在多个社区中")
     if scores["pain_intensity_score"] >= 30:
-        realness_factors.append("observable pain language")
+        realness_factors.append("可观察到的痛点表达")
     if find_payment_signals(evidence):
-        realness_factors.append("payment or switching signal")
+        realness_factors.append("存在付费或转换信号")
     if scores["solution_gap_score"] >= 20:
-        realness_factors.append("current workaround or alternative mentioned")
+        realness_factors.append("提到了当前的临时解决方案或替代方案")
     is_real = scores["overall_score"] >= 45 or len(realness_factors) >= 3
     scale = signal_size(scores["overall_score"])
     if requirement.evidence_count >= 8 or requirement.subreddit_count >= 4:
@@ -1411,11 +1686,11 @@ def validate_requirement(
         scale = "medium"
     return {
         "is_real_requirement": is_real,
-        "realness_reason": "; ".join(realness_factors) if realness_factors else "Evidence is still thin and needs more samples.",
+        "realness_reason": "; ".join(realness_factors) if realness_factors else "证据仍然不足，需要更多样本。",
         "requirement_scale": scale,
         "scale_reason": (
-            f"{requirement.evidence_count} evidence item(s), {requirement.subreddit_count} subreddit(s), "
-            f"engagement score {scores['engagement_score']}."
+            f"{requirement.evidence_count} 条证据, {requirement.subreddit_count} 个子版块, "
+            f"参与度评分 {scores['engagement_score']}。"
         ),
         "country_area_distribution": regions,
         "current_alternatives": alternatives.get("existing_solutions", []),
@@ -1439,14 +1714,14 @@ def detect_change(requirement: RequirementRecord) -> dict[str, Any]:
     new_evidence_count = max(requirement.evidence_count - int(previous.get("evidence_count", 0)), 0)
     reasons: list[str] = []
     if score_delta >= 12:
-        reasons.append("signal strength increased materially")
+        reasons.append("信号强度显著增加")
     if requirement.subreddit_count >= 3 and float(previous.get("subreddit_spread_score", 0)) < current.get("subreddit_spread_score", 0):
-        reasons.append("evidence spread across more subreddits")
+        reasons.append("证据扩展到更多子版块")
     if current.get("monetization_score", 0) > previous.get("monetization_score", 0):
-        reasons.append("new willingness-to-pay language appeared")
+        reasons.append("出现了新的付费意愿表达")
     return {
         "should_reopen": bool(reasons),
-        "reason": "; ".join(reasons) if reasons else "no meaningful change detected",
+        "reason": "; ".join(reasons) if reasons else "未检测到显著变化",
         "score_delta": score_delta,
         "new_evidence_count": new_evidence_count,
     }
@@ -1459,16 +1734,16 @@ def infer_existing_solutions(evidence: list[RawEvidence]) -> dict[str, Any]:
         if term in body:
             solutions.append(term)
     return {
-        "existing_solutions": sorted(set(solutions)) or ["manual workarounds", "generic search", "forum advice"],
-        "common_complaints": ["too manual", "hard to compare options", "existing tools do not fit the workflow"],
+        "existing_solutions": sorted(set(solutions)) or ["手动临时方案", "通用搜索", "论坛建议"],
+        "common_complaints": ["过于手动", "难以比较选项", "现有工具不适合工作流程"],
     }
 
 
 def infer_opportunities(requirement: RequirementRecord, evidence: list[RawEvidence]) -> dict[str, list[str]]:
     topic = requirement.canonical_requirement.removeprefix("Users need a better way to handle ")
     return {
-        "product": [f"Focused workflow tool for {topic}", f"Evidence-backed tracker for {topic}"],
-        "content": [f"Best ways to solve {topic}", f"Comparison guide for {topic} tools"],
+        "product": [f"针对 {topic} 的专注工作流工具", f"基于证据的 {topic} 跟踪器"],
+        "content": [f"解决 {topic} 的最佳方法", f"{topic} 工具比较指南"],
     }
 
 
@@ -1508,23 +1783,32 @@ def search_feedback_terms(searches: list[dict[str, Any]]) -> list[str]:
     return [term for term, _count in terms.most_common(8)]
 
 
+def canonical_research_strategy(strategy: str) -> str:
+    aliases = {
+        "pain_validation": "repeat_pain_validation",
+        "market_solution_scan": "existing_solution_scan",
+        "commercial_signal": "market_signal_scan",
+    }
+    return aliases.get(strategy, strategy)
+
+
 def summarize_why_real(evidence: list[RawEvidence]) -> str:
     if not evidence:
-        return "No supporting evidence was found."
+        return "未找到支持性证据。"
     subreddits = sorted({item.subreddit for item in evidence})
     patterns = sorted({pattern for item in evidence for pattern in item.matched_patterns})
-    return f"Found {len(evidence)} supporting Reddit evidence item(s) across {len(subreddits)} subreddit(s): {', '.join(subreddits)}. Signals include {', '.join(patterns)}."
+    return f"在 {len(subreddits)} 个子版块中找到 {len(evidence)} 条支持性 Reddit 证据: {', '.join(subreddits)}。信号包括 {', '.join(patterns)}。"
 
 
 def summarize_why_noise(requirement: RequirementRecord, evidence: list[RawEvidence]) -> str:
     risks = []
     if requirement.evidence_count < 3:
-        risks.append("low evidence count")
+        risks.append("证据数量较少")
     if requirement.subreddit_count < 2:
-        risks.append("limited subreddit spread")
+        risks.append("子版块覆盖范围有限")
     if not find_payment_signals(evidence):
-        risks.append("no clear willingness-to-pay language")
-    return ", ".join(risks) if risks else "The main risk is Reddit sampling bias rather than a specific contradiction."
+        risks.append("没有明确的付费意愿表达")
+    return ", ".join(risks) if risks else "主要风险是 Reddit 采样偏差，而非特定的矛盾证据。"
 
 
 def one_sentence_rejection_summary(
@@ -1534,16 +1818,16 @@ def one_sentence_rejection_summary(
 ) -> str:
     reasons = []
     if requirement.evidence_count < 3:
-        reasons.append(f"only {requirement.evidence_count} evidence item(s)")
+        reasons.append(f"仅有 {requirement.evidence_count} 条证据")
     if requirement.subreddit_count < 2:
-        reasons.append(f"only {requirement.subreddit_count} subreddit(s)")
+        reasons.append(f"仅有 {requirement.subreddit_count} 个子版块")
     if not find_payment_signals(evidence):
-        reasons.append("no clear willingness-to-pay signal")
-    if validation and validation.get("realness_reason") == "Evidence is still thin and needs more samples.":
-        reasons.append("thin realness evidence")
+        reasons.append("没有明确的付费意愿信号")
+    if validation and validation.get("realness_reason") == "证据仍然不足，需要更多样本。":
+        reasons.append("真实性证据不足")
     if not reasons:
-        reasons.append("insufficient validation strength")
-    return "Rejected because " + ", ".join(dict.fromkeys(reasons)) + "."
+        reasons.append("验证强度不足")
+    return "拒绝原因：" + "、".join(dict.fromkeys(reasons)) + "。"
 
 
 def classify_pain(score: float) -> str:
@@ -1569,17 +1853,17 @@ def make_recommendation(
     rejection_summary: str | None = None,
 ) -> str:
     if status == RequirementStatus.REJECTED or (validation and not validation.get("is_real_requirement", True)):
-        return rejection_summary or "Rejected because there is insufficient evidence that this is a real requirement."
+        return rejection_summary or "拒绝原因：没有足够的证据证明这是一个真实需求。"
     if status == RequirementStatus.VALIDATED or scores["overall_score"] >= 72:
-        return "validated enough for human review and external validation"
+        return "已验证充分，可进行人工审核和外部验证"
     if status == RequirementStatus.WATCHING or scores["overall_score"] >= 45:
-        return "keep tracking and run lightweight validation"
-    return "watch for more evidence before acting"
+        return "继续跟踪并运行轻量级验证"
+    return "在采取行动前继续观察更多证据"
 
 
 def next_validation_step(scores: dict[str, Any]) -> str:
     if scores["monetization_score"] < 30:
-        return "Search for stronger payment or switching signals before product investment."
+        return "在产品投入之前，搜索更强的付费或转换信号。"
     if scores["subreddit_spread_score"] < 40:
-        return "Check adjacent subreddits to confirm the requirement is not isolated."
-    return "Create a short opportunity brief and test demand with content or interviews."
+        return "检查相邻子版块以确认该需求不是孤立的。"
+    return "创建简短的机会简报，通过内容或访谈测试需求。"

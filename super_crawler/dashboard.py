@@ -1685,7 +1685,10 @@ def agent_links_for_requirement(storage: Storage, requirement: object, roles: li
     links = []
     for role in roles:
         href = f"/agent-log?role={html.escape(role)}&ref={html.escape(requirement.requirement_id)}"
-        links.append(f"<a class='agent-chip' href='{href}'>{html.escape(role.replace('_', ' ').title())}</a>")
+        label = role.replace("_", " ").title()
+        if role == "deep_research":
+            label = f"{label} ({len(requirement.research_history)})"
+        links.append(f"<a class='agent-chip' href='{href}'>{html.escape(label)}</a>")
     return "".join(links)
 
 

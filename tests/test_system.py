@@ -30,6 +30,58 @@ class FakePlannerLLM:
         return self.response
 
 
+class FakeDeepResearchLLM:
+    def __init__(self):
+        self.prompts: list[str] = []
+
+    def available(self) -> bool:
+        return True
+
+    def json_chat(self, model: str, system: str, user: str) -> dict[str, object]:
+        self.prompts.append(user)
+        if "final_decision" in user:
+            return {
+                "final_decision": "watching",
+                "confidence": 0.78,
+                "why_real": "多来源证据显示用户持续抱怨订阅费，并寻找本地存储替代方案。",
+                "why_noise": "当前证据仍主要来自小样本搜索，需要更多平台验证。",
+                "strongest_evidence": ["用户明确表示愿意为更好的本地存储方案付费"],
+                "weakest_assumptions": ["尚未验证更大规模用户群体"],
+                "existing_solutions": ["本地 NAS", "带 SD 卡摄像头"],
+                "market_gap": "现有方案配置复杂且比较困难。",
+                "recommended_next_step": "继续搜索产品评论和竞品价格页。",
+            }
+        if "search_tracks" in user:
+            return {
+                "requirement_rewrite": "用户需要减少智能摄像头订阅成本并保留本地录像能力",
+                "target_users": ["智能家居用户"],
+                "hypotheses": ["用户在多个平台抱怨订阅费", "已有方案不能覆盖本地存储需求"],
+                "search_tracks": [
+                    {
+                        "track": "product_review_scan",
+                        "source": "product_reviews",
+                        "queries": ["smart camera subscription fees local storage reviews complaints"],
+                        "question": "产品评论中是否有订阅费痛点",
+                    },
+                    {
+                        "track": "market_solution_scan",
+                        "source": "google_web",
+                        "queries": ["smart camera local storage alternative subscription"],
+                        "question": "网页和竞品是否说明已有方案缺口",
+                    },
+                ],
+            }
+        return {
+            "is_relevant_evidence": True,
+            "evidence_type": "buying_intent",
+            "analysis_summary": "该结果支持订阅费和本地存储痛点。",
+            "signals": ["complaint", "buying_intent", "alternative"],
+            "country_area_hints": [],
+            "existing_solutions": ["local storage camera"],
+            "confidence": 0.86,
+        }
+
+
 def planner_response(assignments: list[dict[str, object]], domain: str = "Creator camera support accessories") -> dict[str, object]:
     return {
         "search_goal": f"Find Reddit pain points for {domain}.",
@@ -63,7 +115,7 @@ class SystemTests(unittest.TestCase):
             self.assertTrue(queued)
             self.assertIsNotNone(run)
             self.assertTrue(run.recommendation)
-            self.assertIn("Daily Requirement Discovery Report", report)
+            self.assertIn("每日需求发现报告", report)
             self.assertEqual(storage.dashboard_counts()["evidence"], 4)
             self.assertTrue(
                 any(
@@ -821,6 +873,92 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Evidence Item Analysis", deep_log_html)
             self.assertIn("Evidence Collected", deep_log_html)
 
+    def test_deep_research_uses_llm_cross_source_plan_and_synthesis(self) -> None:
+        class FakeCollector:
+            def __init__(self, command: str = "opencli reddit search", timeout_seconds: int = 120):
+                self.command = command
+                self.timeout_seconds = timeout_seconds
+                self.queries: list[str] = []
+
+            def search(self, query: str, limit: int = 5, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, object]:
+                self.queries.append(query)
+                return {
+                    "command": ["opencli", "search", query],
+                    "stderr": "",
+                    "items": [
+                        {
+                            "source": "web_search",
+                            "source_url": f"https://example.com/{len(self.queries)}",
+                            "subreddit": subreddit or "web",
+                            "post_id": None,
+                            "comment_id": None,
+                            "title": "Smart camera users complain about subscription fees and local storage",
+                            "body": "Reviews mention subscription fatigue, local storage workarounds, and willingness to pay once for a better alternative.",
+                            "author_metadata_allowed": False,
+                            "score": 20,
+                            "comment_count": 8,
+                            "created_at": utc_now(),
+                            "language": "en",
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C",
+                task_type=TaskGroupType.DOMAIN,
+                domain="smart home devices",
+                input_dir=str(Path(directory) / "3c"),
+            )
+            storage.update_task_group_config(task_group.task_group_id, {"collector_enabled": "1"})
+            now = utc_now()
+            storage.upsert_requirement(
+                RequirementRecord(
+                    requirement_id="req-camera",
+                    canonical_requirement="Users need smart cameras without subscriptions",
+                    description="Users complain about subscription fees and want local storage.",
+                    status=RequirementStatus.QUEUED_FOR_RESEARCH,
+                    first_seen=now,
+                    last_seen=now,
+                    times_detected=1,
+                    evidence_count=0,
+                    subreddit_count=0,
+                    geo_distribution=[],
+                    audience_segments=["smart home users"],
+                    current_scores={},
+                    previous_scores={},
+                    research_history=[],
+                    decision_history=[],
+                    reopen_events=[],
+                    latest_recommendation=None,
+                    evidence_ids=[],
+                    task_group_ids=[task_group.task_group_id],
+                    task_group_run_ids=["run-camera"],
+                )
+            )
+            storage.enqueue_research("req-camera", 50, "test llm deep research", 0, None)
+
+            run = DeepResearchAgent(
+                storage,
+                "research-agent-1",
+                collector_factory=FakeCollector,
+                llm_client=FakeDeepResearchLLM(),
+            ).run_next()
+
+            self.assertIsNotNone(run)
+            self.assertEqual(storage.get_requirement("req-camera").status, RequirementStatus.WATCHING)
+            self.assertEqual(run.findings["llm_synthesis"]["decision_source"], "llm")
+            self.assertIn("现有方案配置复杂", run.findings["market_gap"])
+            logs = storage.list_experiment_logs(task_group_id=task_group.task_group_id, agent_role="deep_research", limit=50)
+            plan_logs = [item for item in logs if item["step_name"] == "deep_research_plan_created"]
+            self.assertTrue(plan_logs)
+            plan = plan_logs[0]["payload_json"]["research_plan"]
+            self.assertEqual(plan["planning_method"], "llm")
+            self.assertIn("product_reviews", {item["source"] for item in plan["search_tracks"]})
+
     def test_rejected_deep_research_has_rejected_recommendation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
@@ -866,10 +1004,10 @@ class SystemTests(unittest.TestCase):
             self.assertIsNotNone(run)
             self.assertIsNotNone(requirement)
             self.assertEqual(requirement.status, RequirementStatus.REJECTED)
-            self.assertIn("rejected", run.recommendation.lower())
-            self.assertNotEqual(run.recommendation, "watch for more evidence before acting")
+            self.assertIn("拒绝原因", run.recommendation)
+            self.assertNotEqual(run.recommendation, "在采取行动前继续观察更多证据")
             self.assertIn("rejection_summary", run.findings)
-            self.assertIn("Rejected because", run.findings["rejection_summary"])
+            self.assertIn("拒绝原因", run.findings["rejection_summary"])
             rejected_html = grouped_requirement_lineage(storage, rejected_requirements(storage), task_group.task_group_id)
             detail_html = detail_page(storage, "req-weak")
             self.assertIn("Reason:", rejected_html)
