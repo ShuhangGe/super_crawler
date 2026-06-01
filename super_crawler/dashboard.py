@@ -545,7 +545,7 @@ def deep_research_agent_cards(storage: Storage, task_group: object, requirements
 
 
 def deep_research_agent_card(row: dict[str, object], index: int, active_slot: bool = False) -> str:
-    running = bool(row.get("locked_by")) or active_slot
+    running = bool(row.get("locked_by"))
     status = "running" if running else "queued"
     agent = str(row.get("locked_by") or row.get("assigned_agent") or f"research-agent-{index}")
     summary = "Researching now" if row.get("locked_by") else "Assigned to a deep research slot"
@@ -1426,6 +1426,8 @@ def agent_log_page(storage: Storage, role: str, agent_id: str, ref: str = "") ->
     if role == "deep_research":
         readable_title = "Deep Research Log"
         readable_entries = readable_deep_research_log_sections(experiment_logs)
+        if ref and not experiment_logs:
+            readable_entries += deep_research_queue_status_block(storage, ref)
     else:
         readable_entries = readable_search_log_sections(experiment_logs)
     ref_text = f" Related to {ref}." if ref else ""
@@ -1591,6 +1593,24 @@ def readable_deep_research_log_sections(experiment_logs: list[dict[str, object]]
             "</section>"
         )
     return f"<div class='readable-log'>{content}</div>"
+
+
+def deep_research_queue_status_block(storage: Storage, requirement_id: str) -> str:
+    queue_row = next((row for row in storage.list_queue() if row["requirement_id"] == requirement_id), None)
+    if not queue_row:
+        return ""
+    locked_by = str(queue_row.get("locked_by") or "")
+    agent = locked_by or str(queue_row.get("assigned_agent") or "")
+    state = "Researching now" if locked_by else "Waiting for an available deep research agent slot."
+    return f"""
+    <section class="readable-block">
+      <h3>Queued for Deep Research</h3>
+      <div><strong>Status:</strong> {html.escape(state)}</div>
+      <div><strong>Agent:</strong> {html.escape(agent or 'none')}</div>
+      <div><strong>priority:</strong> {html.escape(str(queue_row.get('priority', '')))}</div>
+      <div><strong>Reason:</strong> {html.escape(str(queue_row.get('reason', '')))}</div>
+    </section>
+    """
 
 
 def readable_deep_research_plan_block(item: dict[str, object]) -> str:

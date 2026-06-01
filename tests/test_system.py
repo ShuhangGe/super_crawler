@@ -698,12 +698,14 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Possible Requirements Waiting For Deep Research", html)
             self.assertIn("client photo galleries", html)
             self.assertIn("Deep Research Agent 1", html)
-            self.assertIn(">running<", html)
+            self.assertIn(">queued<", html)
             self.assertIn("Assigned to a deep research slot", html)
 
             queued_log_html = agent_log_page(storage, "deep_research", "", changed[0].requirement_id)
             self.assertIn("Deep Research Log", queued_log_html)
             self.assertIn("Waiting For Deep Research", queued_log_html)
+            self.assertIn("Queued for Deep Research", queued_log_html)
+            self.assertIn("Waiting for an available deep research agent slot.", queued_log_html)
 
             run = DeepResearchAgent(storage, "research-agent-1").run_next()
             self.assertIsNotNone(run)
