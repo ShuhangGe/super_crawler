@@ -1496,7 +1496,7 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(search_disabled.search_slots, 0)
         self.assertEqual(search_disabled.deep_research_slots, 2)
 
-    def test_runner_consumes_existing_deep_research_queue_before_search(self) -> None:
+    def test_runner_separates_discovery_from_deep_research_queue(self) -> None:
         class RecordingRunner(AlwaysOnRunner):
             def __init__(self, storage: Storage, input_dir: Path):
                 super().__init__(storage, input_dir)
@@ -1559,8 +1559,13 @@ class SystemTests(unittest.TestCase):
 
             result = runner.run_task_groups([task_group], plan)
 
-            self.assertEqual(runner.queue_count_when_search_started, 0)
-            self.assertEqual(result["research_run"], "fake-run-1")
+            self.assertEqual(runner.queue_count_when_search_started, 1)
+            self.assertIsNone(result["research_run"])
+            self.assertEqual(len(storage.list_queue()), 1)
+
+            research_result = runner.run_deep_research_once()
+
+            self.assertEqual(research_result["research_run"], "fake-run-1")
             self.assertEqual(storage.list_queue(), [])
 
     def test_collected_items_keep_search_agent_identity(self) -> None:
