@@ -458,8 +458,11 @@ def parse_int(value: object, default: int) -> int:
 class RequirementMemoryAgent(BaseAgent):
     role = "requirement_memory"
 
-    def reconcile_candidates(self) -> list[RequirementRecord]:
+    def reconcile_candidates(self, candidate_ids: list[str] | None = None) -> list[RequirementRecord]:
         candidates = self.storage.list_candidates([RequirementStatus.NEW_CANDIDATE.value])
+        if candidate_ids is not None:
+            requested = set(candidate_ids)
+            candidates = [candidate for candidate in candidates if candidate.candidate_id in requested]
         requirements = self.storage.list_requirements()
         changed: list[RequirementRecord] = []
         for candidate in candidates:
@@ -472,6 +475,7 @@ class RequirementMemoryAgent(BaseAgent):
             else:
                 record = self._create_requirement(candidate)
                 requirements.append(record)
+                candidate.status = RequirementStatus.DUPLICATE_CANDIDATE
                 event_type = "memory_created_requirement"
                 event_message = f"Requirement memory created requirement {record.requirement_id}"
 

@@ -1062,6 +1062,37 @@ class SystemTests(unittest.TestCase):
             self.assertIsNotNone(snapshot)
             self.assertTrue(snapshot["requirement_snapshot"])
 
+    def test_task_group_run_only_reconciles_current_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            stale_inbox = Path(directory) / "stale"
+            current_inbox = Path(directory) / "current"
+            stale_inbox.mkdir()
+            current_inbox.mkdir()
+            (stale_inbox / "items.json").write_text(json.dumps(SAMPLE_REDDIT_ITEMS[:2]))
+            (current_inbox / "items.json").write_text(json.dumps(SAMPLE_REDDIT_ITEMS[2:3]))
+            storage = Storage(db_path)
+            storage.migrate()
+            stale_group = storage.create_task_group("Stale", TaskGroupType.DOMAIN, "pets", str(stale_inbox))
+            current_group = storage.create_task_group("Current", TaskGroupType.DOMAIN, "lunchbox", str(current_inbox))
+            stale_candidates = DiscoveryAgent(storage, "discovery-stale").ingest_reddit_items(
+                SAMPLE_REDDIT_ITEMS[:2],
+                stale_group.task_group_id,
+                "stale-run",
+            )
+            self.assertEqual(len(stale_candidates), 2)
+            storage.close()
+
+            runner = AlwaysOnRunner(Storage(db_path), input_dir=Path(directory) / "unused", interval_seconds=1)
+            result = runner.run_task_group(current_group.task_group_id)
+            storage = Storage(db_path)
+
+            self.assertEqual(result["requirements_changed"], result["candidates"])
+            self.assertEqual(
+                len(storage.list_candidates([RequirementStatus.NEW_CANDIDATE.value])),
+                2,
+            )
+
     def test_task_group_runs_and_tags_requirement_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"

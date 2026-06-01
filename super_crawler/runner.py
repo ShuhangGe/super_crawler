@@ -83,7 +83,9 @@ class AlwaysOnRunner:
 
         items = load_json_items(self.input_dir)
         candidates = DiscoveryAgent(self.storage, "discovery-daemon").ingest_reddit_items(items) if items else []
-        changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates()
+        changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates(
+            [candidate.candidate_id for candidate in candidates]
+        )
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
         return {
             "items_loaded": len(items),
@@ -278,7 +280,9 @@ class AlwaysOnRunner:
             f"Requirement memory started for {task_group.name}",
             {"candidate_ids": [candidate.candidate_id for candidate in candidates]},
         )
-        changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates()
+        changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates(
+            [candidate.candidate_id for candidate in candidates]
+        )
         queued = len([item for item in changed if item.task_group_ids and task_group.task_group_id in item.task_group_ids])
         rejected = len([item for item in changed if item.status.value in {"rejected", "archived"}])
         group_changed = [item for item in changed if task_group.task_group_id in item.task_group_ids]
