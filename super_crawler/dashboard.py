@@ -322,6 +322,17 @@ def layout(content: str) -> str:
     h3 {{ margin: 0 0 10px; font-size: 15px; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
     .card {{ background: white; border: 1px solid #dce2e8; border-radius: 8px; padding: 14px; }}
+    .top-workspace {{ display: grid; grid-template-columns: minmax(360px, .9fr) minmax(520px, 1.35fr); gap: 12px; align-items: stretch; margin-bottom: 18px; }}
+    .toolbar-card {{ background: #ffffff; border: 1px solid #d9e1e7; border-radius: 8px; padding: 12px; box-shadow: 0 10px 24px rgba(18, 52, 59, .05); }}
+    .toolbar-head {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }}
+    .toolbar-title {{ font-weight: 760; color: #17262d; }}
+    .toolbar-summary {{ color: #65727c; font-size: 12px; white-space: nowrap; }}
+    .resource-card form {{ display: grid; grid-template-columns: repeat(3, minmax(76px, 1fr)) auto; gap: 8px; align-items: end; }}
+    .compact-field {{ display: grid; gap: 4px; color: #52616b; font-size: 12px; }}
+    .compact-field input, .compact-field select {{ width: 100%; box-sizing: border-box; min-height: 32px; padding: 5px 8px; }}
+    .resource-card .button, .create-card .button {{ min-height: 32px; padding: 7px 11px; }}
+    .create-card .stacked-form {{ grid-template-columns: minmax(132px, 170px) minmax(140px, 180px) minmax(220px, 1fr) auto; gap: 8px; align-items: end; }}
+    .create-card textarea {{ min-height: 32px; max-height: 72px; padding: 6px 8px; }}
     .board {{ display: grid; grid-template-columns: minmax(240px, 1fr) minmax(420px, 1.7fr) minmax(300px, 1.2fr); gap: 14px; align-items: start; }}
     .workbench {{ display: grid; grid-template-columns: minmax(260px, 1fr) minmax(420px, 1.5fr) minmax(260px, 1fr); gap: 14px; align-items: start; }}
     .task-group-box {{ border: 2px solid #c8d8df; border-radius: 10px; background: #ffffff; margin-top: 18px; overflow: hidden; }}
@@ -399,10 +410,11 @@ def layout(content: str) -> str:
     a {{ color: #0d5c75; }}
     pre {{ white-space: pre-wrap; background: white; border: 1px solid #dce2e8; padding: 14px; border-radius: 8px; }}
     @media (max-width: 760px) {{
+      .top-workspace {{ grid-template-columns: 1fr; }}
       .task-group-header {{ align-items: flex-start; flex-direction: column; }}
       .group-actions {{ justify-content: flex-start; min-width: 0; }}
       .settings-popout {{ position: static; width: auto; margin-top: 8px; }}
-      .stacked-form {{ grid-template-columns: 1fr; }}
+      .stacked-form, .create-card .stacked-form, .resource-card form {{ grid-template-columns: 1fr; }}
       .group-records {{ grid-template-columns: repeat(2, minmax(86px, 1fr)); }}
       .group-record.text-record {{ grid-column: 1 / -1; }}
     }}
@@ -449,8 +461,10 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     task_groups = visible_task_groups(storage)
     return (
         "<h1>Running Status</h1>"
+        + "<section class='top-workspace'>"
         + resource_allocation_panel(storage)
         + task_create_panel()
+        + "</section>"
         + task_group_boards(storage, task_groups, requirements)
     )
 
@@ -477,17 +491,17 @@ def resource_allocation_panel(storage: Storage) -> str:
     resources = storage.get_resource_config()
     running_search = len(storage.list_task_groups([TaskGroupStatus.RUNNING.value]))
     queue = storage.list_queue()
-    locked_research = len([item for item in queue if item.get("locked_by")])
+    researching = len([item for item in storage.list_requirements() if item.status == RequirementStatus.RESEARCHING])
     return f"""
-    <section class="controlbar">
-      <div>
-        <strong>Global Resource Allocation</strong>
-        <div class="muted">Search slots: {running_search}/{resources["max_search_agents"]} | Deep research slots: {locked_research}/{resources["max_deep_research_agents"]} | Report slots: 0/{resources["max_report_agents"]} | Queue: {len(queue)}</div>
+    <section class="toolbar-card resource-card">
+      <div class="toolbar-head">
+        <div class="toolbar-title">Global Resource Allocation</div>
+        <div class="toolbar-summary">Search {running_search}/{resources["max_search_agents"]} · Deep {researching}/{resources["max_deep_research_agents"]} · Queue {len(queue)}</div>
       </div>
-      <form action="/resources" class="actions">
-        <label>Search <input type="number" min="0" name="max_search_agents" value="{resources["max_search_agents"]}"></label>
-        <label>Deep <input type="number" min="0" name="max_deep_research_agents" value="{resources["max_deep_research_agents"]}"></label>
-        <label>Report <input type="number" min="0" name="max_report_agents" value="{resources["max_report_agents"]}"></label>
+      <form action="/resources">
+        <label class="compact-field">Search<input type="number" min="0" name="max_search_agents" value="{resources["max_search_agents"]}"></label>
+        <label class="compact-field">Deep<input type="number" min="0" name="max_deep_research_agents" value="{resources["max_deep_research_agents"]}"></label>
+        <label class="compact-field">Report<input type="number" min="0" name="max_report_agents" value="{resources["max_report_agents"]}"></label>
         <button class="button secondary">Save Limits</button>
       </form>
     </section>
@@ -1146,17 +1160,20 @@ def todo_action_for_requirement(storage: Storage, requirement: object) -> str:
 
 def task_create_panel() -> str:
     return """
-    <section class="card">
-      <h2>Create Task Group</h2>
+    <section class="toolbar-card create-card">
+      <div class="toolbar-head">
+        <div class="toolbar-title">Create Task Group</div>
+        <div class="toolbar-summary">General Search / Domain Specific</div>
+      </div>
       <form action="/task" class="stacked-form">
         <input type="hidden" name="action" value="create">
-        <select id="task-type" name="type" aria-label="Task group type">
+        <label class="compact-field">Task Group<select id="task-type" name="type" aria-label="Task group type">
           <option value="general_search">General Search</option>
           <option value="domain_search">Domain Specific</option>
-        </select>
-        <input name="name" placeholder="Group name">
+        </select></label>
+        <label class="compact-field">Group name<input name="name" placeholder="Group name"></label>
         <span id="domain-description" class="domain-description" hidden>
-          <textarea id="task-description" name="description" placeholder="Domain search plan" disabled></textarea>
+          <label class="compact-field">Domain search plan<textarea id="task-description" name="description" placeholder="Domain search plan" disabled></textarea></label>
         </span>
         <button class="button">Create</button>
       </form>
