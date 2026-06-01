@@ -124,6 +124,25 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(config["model_deep_research"], "deepseek-v4-flash")
             self.assertEqual(config["model_report"], "deepseek-v4-pro")
 
+    def test_domain_task_group_enables_opencli_collection_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            input_dir = Path(directory) / "task_inbox" / "3c"
+
+            task_group = storage.create_task_group(
+                name="3C",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(input_dir),
+                description="Find customer needs for support brackets and fill lights.",
+                enable_collector=True,
+            )
+
+            config = storage.get_task_group_config(task_group.task_group_id)
+            self.assertEqual(config["collector_enabled"], "1")
+            self.assertTrue(input_dir.is_dir())
+
     def test_home_page_uses_group_controls_without_global_runtime_controls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"

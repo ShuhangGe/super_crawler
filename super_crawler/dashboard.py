@@ -238,7 +238,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             subreddits = split_csv(query.get("subreddits", [""])[0])
             keywords = split_csv(query.get("keywords", [""])[0])
             negative_keywords = split_csv(query.get("negative_keywords", [""])[0])
-            storage.create_task_group(name, task_type, domain, input_dir, description, subreddits, keywords, negative_keywords)
+            storage.create_task_group(
+                name,
+                task_type,
+                domain,
+                input_dir,
+                description,
+                subreddits,
+                keywords,
+                negative_keywords,
+                enable_collector=task_type == TaskGroupType.DOMAIN,
+            )
         elif action == "start":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.RUNNING)
             self.app_controller.start()

@@ -133,6 +133,7 @@ def main() -> None:
                     subreddits=split_csv(args.subreddits),
                     keywords=split_csv(args.keywords),
                     negative_keywords=split_csv(args.negative_keywords),
+                    enable_collector=task_type == TaskGroupType.DOMAIN,
                 )
                 print(f"Created {task_group.task_group_id} at {task_group.input_dir}")
             elif args.task_command == "list":

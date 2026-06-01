@@ -963,6 +963,7 @@ class Storage:
         subreddits: list[str] | None = None,
         keywords: list[str] | None = None,
         negative_keywords: list[str] | None = None,
+        enable_collector: bool = False,
     ) -> TaskGroup:
         now = utc_now()
         slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")[:36] or "task"
@@ -982,6 +983,9 @@ class Storage:
             updated_at=now,
         )
         self.upsert_task_group(task_group)
+        Path(input_dir).mkdir(parents=True, exist_ok=True)
+        if enable_collector:
+            self.update_task_group_config(task_group.task_group_id, {"collector_enabled": "1"})
         return task_group
 
     def update_task_group_status(self, task_group_id: str, status: TaskGroupStatus) -> None:
