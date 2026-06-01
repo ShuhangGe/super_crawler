@@ -1586,6 +1586,48 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(research_result["research_run"], "fake-run-1")
             self.assertEqual(storage.list_queue(), [])
 
+    def test_deep_research_worker_ignores_stopped_task_group_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            stopped = storage.create_task_group("Stopped", TaskGroupType.DOMAIN, "old", str(Path(directory) / "old"))
+            running = storage.create_task_group("Running", TaskGroupType.DOMAIN, "new", str(Path(directory) / "new"))
+            storage.update_task_group_status(running.task_group_id, TaskGroupStatus.RUNNING)
+            for requirement_id, task_group_id, priority in [
+                ("req-stopped", stopped.task_group_id, 100),
+                ("req-running", running.task_group_id, 10),
+            ]:
+                storage.upsert_requirement(
+                    RequirementRecord(
+                        requirement_id=requirement_id,
+                        canonical_requirement=f"{requirement_id} requirement",
+                        description="Need validation.",
+                        status=RequirementStatus.QUEUED_FOR_RESEARCH,
+                        first_seen=utc_now(),
+                        last_seen=utc_now(),
+                        times_detected=1,
+                        evidence_count=1,
+                        subreddit_count=1,
+                        geo_distribution=[],
+                        audience_segments=[],
+                        current_scores={},
+                        previous_scores={},
+                        research_history=[],
+                        decision_history=[],
+                        reopen_events=[],
+                        latest_recommendation=None,
+                        task_group_ids=[task_group_id],
+                    )
+                )
+                storage.enqueue_research(requirement_id, priority, "test", 1, None)
+
+            locked = storage.lock_next_research("research-agent-1", [running.task_group_id])
+
+            self.assertEqual(locked, "req-running")
+            rows = {row["requirement_id"]: row for row in storage.list_queue()}
+            self.assertIsNone(rows["req-stopped"]["locked_by"])
+            self.assertEqual(rows["req-running"]["locked_by"], "research-agent-1")
+
     def test_collected_items_keep_search_agent_identity(self) -> None:
         class FakeCollector(OpenCliRedditCollector):
             def search(self, query: str, limit: int = 25, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, object]:

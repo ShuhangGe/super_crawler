@@ -647,8 +647,8 @@ class DeepResearchAgent(BaseAgent):
         self.collector_factory = collector_factory or OpenCliRedditCollector
         self.llm_client = llm_client
 
-    def run_next(self) -> ResearchRun | None:
-        requirement_id = self.storage.lock_next_research(self.agent_id)
+    def run_next(self, eligible_task_group_ids: list[str] | None = None) -> ResearchRun | None:
+        requirement_id = self.storage.lock_next_research(self.agent_id, eligible_task_group_ids)
         if requirement_id is None:
             self.log("run_next", "skipped", [], [])
             return None

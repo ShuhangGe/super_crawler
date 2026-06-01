@@ -655,26 +655,47 @@ class Storage:
         )
         self.conn.commit()
 
-    def lock_next_research(self, agent_id: str) -> str | None:
+    def lock_next_research(self, agent_id: str, eligible_task_group_ids: list[str] | None = None) -> str | None:
         if self.conn.in_transaction:
-            return self._lock_next_research_in_current_transaction(agent_id)
+            return self._lock_next_research_in_current_transaction(agent_id, eligible_task_group_ids)
         try:
             self.conn.execute("BEGIN IMMEDIATE")
-            requirement_id = self._lock_next_research_in_current_transaction(agent_id)
+            requirement_id = self._lock_next_research_in_current_transaction(agent_id, eligible_task_group_ids)
             self.conn.commit()
             return requirement_id
         except Exception:
             self.conn.rollback()
             raise
 
-    def _lock_next_research_in_current_transaction(self, agent_id: str) -> str | None:
+    def _lock_next_research_in_current_transaction(
+        self,
+        agent_id: str,
+        eligible_task_group_ids: list[str] | None = None,
+    ) -> str | None:
+        params: list[Any] = []
+        group_filter = ""
+        if eligible_task_group_ids is not None:
+            if not eligible_task_group_ids:
+                return None
+            placeholders = ", ".join("?" for _ in eligible_task_group_ids)
+            group_filter = (
+                "AND EXISTS ("
+                "SELECT 1 FROM json_each(requirements.task_group_ids) "
+                f"WHERE json_each.value IN ({placeholders})"
+                ")"
+            )
+            params.extend(eligible_task_group_ids)
         row = self.conn.execute(
-            """
-            SELECT requirement_id FROM research_queue
-            WHERE locked_by IS NULL
-            ORDER BY priority DESC, created_at ASC
+            f"""
+            SELECT research_queue.requirement_id
+            FROM research_queue
+            JOIN requirements ON requirements.requirement_id = research_queue.requirement_id
+            WHERE research_queue.locked_by IS NULL
+            {group_filter}
+            ORDER BY research_queue.priority DESC, research_queue.created_at ASC
             LIMIT 1
-            """
+            """,
+            params,
         ).fetchone()
         if row is None:
             return None

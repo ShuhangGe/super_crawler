@@ -112,7 +112,12 @@ class AlwaysOnRunner:
     def run_deep_research_agent_once(self, agent_id: str) -> dict[str, int | str | None]:
         resources = self.storage.get_resource_config()
         adaptive_plan = plan_adaptive_resources(resources, len(self.storage.list_queue()), measure_device_health())
-        run = DeepResearchAgent(self.storage, agent_id).run_next() if adaptive_plan.deep_research_slots > 0 else None
+        running_group_ids = [group.task_group_id for group in self.storage.list_task_groups([TaskGroupStatus.RUNNING.value])]
+        run = (
+            DeepResearchAgent(self.storage, agent_id).run_next(running_group_ids)
+            if adaptive_plan.deep_research_slots > 0
+            else None
+        )
         return {
             "items_loaded": 0,
             "candidates": 0,
