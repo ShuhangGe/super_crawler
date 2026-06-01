@@ -1531,7 +1531,7 @@ def requirement_lineage_row(storage: Storage, requirement: object, lang: str = "
     search_agents = agent_links_for_requirement(storage, requirement, ["discovery"])
     pool_agents = agent_links_for_requirement(storage, requirement, ["requirement_memory", "pool_manager", "change_detection"])
     deep_agents = agent_links_for_requirement(storage, requirement, ["deep_research", "report"])
-    saved_line = latest_pipeline_for_requirement(storage, requirement.requirement_id, lang)
+    saved_line = f"<span class='muted'>{t('details', lang)}</span>"
     todo = todo_action_for_requirement(storage, requirement, lang)
     status_class = " rejected" if requirement.status == RequirementStatus.REJECTED else ""
     return f"""
