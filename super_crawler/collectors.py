@@ -133,34 +133,83 @@ class OpenCliRedditCollector:
             command.extend(["--sort", sort])
         if time:
             command.extend(["--time", time])
-        executable = command[0]
-        if shutil.which(executable) is None:
-            raise RuntimeError(
-                f"OpenCLI executable '{executable}' was not found on PATH. "
-                "Install it with: npm install -g @jackwener/opencli. "
-                "Then restart the dashboard so it inherits the updated PATH. "
-                "If you use a non-global install, set this group's OpenCLI command to the full executable path."
-            )
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"opencli command timed out after {self.timeout_seconds} seconds for query: {query}. "
-                f"Command: {' '.join(command)}"
-            ) from exc
-        if completed.returncode != 0:
-            raise RuntimeError((completed.stderr or completed.stdout or "opencli command failed").strip())
+        completed = run_opencli_command(command, self.timeout_seconds)
         raw_items = parse_opencli_output(completed.stdout)
         return {
             "command": command,
             "stderr": completed.stderr.strip(),
             "items": [normalize_reddit_item(item, query) for item in raw_items],
+        }
+
+
+class OpenCliSourceRouter:
+    """Route a planned research source to the best available OpenCLI adapter."""
+
+    def __init__(self, command: str = "opencli reddit search", timeout_seconds: int = 120):
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        self.reddit = OpenCliRedditCollector(command=command, timeout_seconds=timeout_seconds)
+
+    def search(
+        self,
+        query: str,
+        limit: int = 25,
+        subreddit: str = "",
+        sort: str = "",
+        time: str = "",
+        source: str = "reddit",
+    ) -> dict[str, Any]:
+        source_key = normalize_source_key(source)
+        if source_key == "reddit":
+            result = self.reddit.search(query=query, limit=limit, subreddit=subreddit, sort=sort, time=time)
+            result["source_adapter"] = "reddit"
+            return result
+        if source_key == "youtube":
+            return self._search_opencli(
+                ["opencli", "youtube", "search", query, "--limit", str(limit), "-f", "json"],
+                query,
+                normalize_youtube_item,
+                "youtube",
+            )
+        if source_key == "google_web":
+            return self._search_opencli(
+                ["opencli", "google", "search", query, "--limit", str(limit), "-f", "json"],
+                query,
+                normalize_web_search_item,
+                "google_web",
+            )
+        if source_key in {"amazon", "product_reviews"}:
+            return self._search_opencli(
+                ["opencli", "amazon", "search", query, "--limit", str(limit), "-f", "json"],
+                query,
+                normalize_amazon_item,
+                "amazon",
+            )
+        if source_key == "producthunt":
+            return self._search_opencli(
+                ["opencli", "producthunt", "posts", "--limit", str(limit), "-f", "json"],
+                query,
+                normalize_producthunt_item,
+                "producthunt",
+            )
+        result = self.reddit.search(query=query, limit=limit, subreddit=subreddit, sort=sort, time=time)
+        result["source_adapter"] = "reddit_fallback"
+        return result
+
+    def _search_opencli(
+        self,
+        command: list[str],
+        query: str,
+        normalizer: Any,
+        source_adapter: str,
+    ) -> dict[str, Any]:
+        completed = run_opencli_command(command, self.timeout_seconds)
+        raw_items = parse_opencli_output(completed.stdout)
+        return {
+            "command": command,
+            "stderr": completed.stderr.strip(),
+            "source_adapter": source_adapter,
+            "items": [normalizer(item, query) for item in raw_items],
         }
 
 
@@ -216,6 +265,50 @@ def parse_opencli_output(output: str) -> list[dict[str, Any]]:
     return []
 
 
+def run_opencli_command(command: list[str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+    executable = command[0]
+    if shutil.which(executable) is None:
+        raise RuntimeError(
+            f"OpenCLI executable '{executable}' was not found on PATH. "
+            "Install it with: npm install -g @jackwener/opencli. "
+            "Then restart the dashboard so it inherits the updated PATH."
+        )
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"opencli command timed out after {timeout_seconds} seconds. "
+            f"Command: {' '.join(command)}"
+        ) from exc
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or completed.stdout or "opencli command failed").strip())
+    return completed
+
+
+def normalize_source_key(source: str) -> str:
+    value = source.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "web": "google_web",
+        "google": "google_web",
+        "forums": "google_web",
+        "forum_scan": "google_web",
+        "competitor_pages": "google_web",
+        "youtube_forums": "youtube",
+        "video": "youtube",
+        "app_store": "google_web",
+        "reviews": "product_reviews",
+        "product_review": "product_reviews",
+        "amazon_reviews": "product_reviews",
+    }
+    return aliases.get(value, value or "reddit")
+
+
 def normalize_reddit_item(item: dict[str, Any], query: str) -> dict[str, Any]:
     title = str(first_present(item, ["title", "name", "headline"]) or "")
     body = str(first_present(item, ["body", "selftext", "text", "content", "description"]) or "")
@@ -238,6 +331,101 @@ def normalize_reddit_item(item: dict[str, Any], query: str) -> dict[str, Any]:
         "score": int_or_zero(first_present(item, ["score", "ups", "upvotes"])),
         "comment_count": int_or_zero(first_present(item, ["comment_count", "num_comments", "comments"])),
         "created_at": created_at,
+        "language": str(first_present(item, ["language", "lang"]) or "en"),
+        "collection_query": query,
+        "raw_payload": item,
+    }
+
+
+def normalize_web_search_item(item: dict[str, Any], query: str) -> dict[str, Any]:
+    title = str(first_present(item, ["title", "name", "headline"]) or "")
+    snippet = str(first_present(item, ["snippet", "body", "description", "text"]) or "")
+    url = str(first_present(item, ["url", "source_url", "link"]) or "")
+    return {
+        "source": "google_web_opencli",
+        "source_url": url,
+        "subreddit": "web",
+        "post_id": None,
+        "comment_id": None,
+        "title": title,
+        "body": snippet,
+        "author_metadata_allowed": False,
+        "score": 0,
+        "comment_count": 0,
+        "created_at": str(first_present(item, ["date", "published", "created_at"]) or utc_now()),
+        "language": str(first_present(item, ["language", "lang"]) or "en"),
+        "collection_query": query,
+        "raw_payload": item,
+    }
+
+
+def normalize_youtube_item(item: dict[str, Any], query: str) -> dict[str, Any]:
+    title = str(first_present(item, ["title", "name"]) or "")
+    channel = str(first_present(item, ["channel", "author"]) or "")
+    views = str(first_present(item, ["views", "view_count"]) or "")
+    published = str(first_present(item, ["published", "date", "created_at"]) or "")
+    body = " | ".join(part for part in [channel, views, published] if part)
+    return {
+        "source": "youtube_opencli",
+        "source_url": str(first_present(item, ["url", "source_url", "link"]) or ""),
+        "subreddit": "youtube",
+        "post_id": first_present(item, ["video_id", "id"]),
+        "comment_id": None,
+        "title": title,
+        "body": body,
+        "author_metadata_allowed": False,
+        "score": int_or_zero(first_present(item, ["likes", "score"])),
+        "comment_count": int_or_zero(first_present(item, ["comments", "comment_count"])),
+        "created_at": published or utc_now(),
+        "language": str(first_present(item, ["language", "lang"]) or "en"),
+        "collection_query": query,
+        "raw_payload": item,
+    }
+
+
+def normalize_amazon_item(item: dict[str, Any], query: str) -> dict[str, Any]:
+    title = str(first_present(item, ["title", "name"]) or "")
+    price = str(first_present(item, ["price_text", "price"]) or "")
+    rating = str(first_present(item, ["rating_value", "rating"]) or "")
+    reviews = str(first_present(item, ["review_count", "reviews"]) or "")
+    body = " | ".join(part for part in [price, f"rating {rating}" if rating else "", f"reviews {reviews}" if reviews else ""] if part)
+    asin = str(first_present(item, ["asin", "id"]) or "")
+    url = str(first_present(item, ["url", "source_url", "link"]) or "")
+    if not url and asin:
+        url = f"https://www.amazon.com/dp/{asin}"
+    return {
+        "source": "amazon_opencli",
+        "source_url": url,
+        "subreddit": "amazon",
+        "post_id": asin or None,
+        "comment_id": None,
+        "title": title,
+        "body": body,
+        "author_metadata_allowed": False,
+        "score": int_or_zero(reviews),
+        "comment_count": int_or_zero(reviews),
+        "created_at": utc_now(),
+        "language": str(first_present(item, ["language", "lang"]) or "en"),
+        "collection_query": query,
+        "raw_payload": item,
+    }
+
+
+def normalize_producthunt_item(item: dict[str, Any], query: str) -> dict[str, Any]:
+    name = str(first_present(item, ["name", "title"]) or "")
+    tagline = str(first_present(item, ["tagline", "description", "body"]) or "")
+    return {
+        "source": "producthunt_opencli",
+        "source_url": str(first_present(item, ["url", "source_url", "link"]) or ""),
+        "subreddit": "producthunt",
+        "post_id": first_present(item, ["id", "rank"]),
+        "comment_id": None,
+        "title": name,
+        "body": tagline,
+        "author_metadata_allowed": False,
+        "score": int_or_zero(first_present(item, ["votes", "reviews", "rank"])),
+        "comment_count": int_or_zero(first_present(item, ["comments", "reviews"])),
+        "created_at": str(first_present(item, ["date", "created_at"]) or utc_now()),
         "language": str(first_present(item, ["language", "lang"]) or "en"),
         "collection_query": query,
         "raw_payload": item,

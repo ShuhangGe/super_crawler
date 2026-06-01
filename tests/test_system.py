@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from super_crawler.agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, ReportAgent, RequirementMemoryAgent, normalize_llm_requirement_analysis, search_relevance_check
-from super_crawler.collectors import OpenCliRedditCollector, build_requirement_search_queries, normalize_reddit_item, parse_opencli_output
+from super_crawler.collectors import OpenCliRedditCollector, OpenCliSourceRouter, build_requirement_search_queries, normalize_reddit_item, parse_opencli_output
 from super_crawler.dashboard import agent_log_page, detail_page, experiment_log_page, filter_requirements_by_group, grouped_requirement_lineage, home_page, possible_requirements, rejected_requirements, requirement_list_page, visible_task_groups, search_agent_count_for_group, todo_page
 from super_crawler.models import RequirementRecord, RequirementStatus, ResearchRun, TaskGroupStatus, TaskGroupType, utc_now
 from super_crawler.runner import AlwaysOnRunner, DeviceHealth, allocate_search_slots, plan_adaptive_resources
@@ -1614,6 +1614,41 @@ class SystemTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "npm install -g @jackwener/opencli"):
             collector.search("sports scheduling", limit=1)
+
+    def test_opencli_source_router_dispatches_and_normalizes_sources(self) -> None:
+        calls = []
+
+        def fake_run(command, timeout_seconds):
+            calls.append(command)
+
+            class Completed:
+                stderr = ""
+
+                def __init__(self, stdout):
+                    self.stdout = stdout
+
+            if command[:3] == ["opencli", "youtube", "search"]:
+                return Completed(json.dumps([{"title": "No subscription camera review", "channel": "Camera Lab", "views": "100 views", "url": "https://youtube.com/watch?v=1"}]))
+            if command[:3] == ["opencli", "google", "search"]:
+                return Completed(json.dumps([{"title": "No subscription camera guide", "snippet": "Local storage options", "url": "https://example.com/guide"}]))
+            if command[:3] == ["opencli", "amazon", "search"]:
+                return Completed(json.dumps([{"asin": "B000TEST", "title": "Local storage camera", "price_text": "$39", "rating_value": "4.2", "review_count": "120"}]))
+            return Completed(json.dumps([{"title": "Reddit camera question", "subreddit": "homesecurity", "url": "https://reddit.com/r/homesecurity/test"}]))
+
+        with patch("super_crawler.collectors.run_opencli_command", fake_run):
+            router = OpenCliSourceRouter()
+            youtube = router.search("camera review", source="youtube", limit=1)
+            google = router.search("camera guide", source="google_web", limit=1)
+            amazon = router.search("camera product", source="product_reviews", limit=1)
+            reddit = router.search("camera reddit", source="reddit", limit=1)
+
+        self.assertEqual(youtube["items"][0]["source"], "youtube_opencli")
+        self.assertEqual(google["items"][0]["source"], "google_web_opencli")
+        self.assertEqual(amazon["items"][0]["source"], "amazon_opencli")
+        self.assertEqual(reddit["items"][0]["source"], "reddit_opencli")
+        self.assertIn(["opencli", "youtube", "search", "camera review", "--limit", "1", "-f", "json"], calls)
+        self.assertIn(["opencli", "google", "search", "camera guide", "--limit", "1", "-f", "json"], calls)
+        self.assertIn(["opencli", "amazon", "search", "camera product", "--limit", "1", "-f", "json"], calls)
 
     def test_search_slots_and_query_variants_support_multiple_agents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

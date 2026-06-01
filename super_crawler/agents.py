@@ -6,7 +6,7 @@ from collections import Counter
 from statistics import mean
 from typing import Any
 
-from .collectors import OpenCliRedditCollector
+from .collectors import OpenCliSourceRouter
 from .llm import DeepSeekClient
 from .models import (
     AgentActivityLog,
@@ -727,7 +727,7 @@ class DeepResearchAgent(BaseAgent):
 
     def __init__(self, storage: Storage, agent_id: str, collector_factory: Any | None = None, llm_client: DeepSeekClient | None = None):
         super().__init__(storage, agent_id)
-        self.collector_factory = collector_factory or OpenCliRedditCollector
+        self.collector_factory = collector_factory or OpenCliSourceRouter
         self.llm_client = llm_client
 
     def run_next(self, eligible_task_group_ids: list[str] | None = None) -> ResearchRun | None:
@@ -1204,13 +1204,23 @@ class DeepResearchAgent(BaseAgent):
                 {"agent_id": self.agent_id, **task},
             )
             try:
-                result = collector.search(
-                    str(task["query"]),
-                    limit=5,
-                    subreddit=str(task.get("subreddit", "")),
-                    sort=str(task.get("sort", "relevance")),
-                    time=str(task.get("time", "year")),
-                )
+                try:
+                    result = collector.search(
+                        str(task["query"]),
+                        limit=5,
+                        subreddit=str(task.get("subreddit", "")),
+                        sort=str(task.get("sort", "relevance")),
+                        time=str(task.get("time", "year")),
+                        source=str(task.get("source", "reddit")),
+                    )
+                except TypeError:
+                    result = collector.search(
+                        str(task["query"]),
+                        limit=5,
+                        subreddit=str(task.get("subreddit", "")),
+                        sort=str(task.get("sort", "relevance")),
+                        time=str(task.get("time", "year")),
+                    )
             except Exception as exc:  # noqa: BLE001 - failed searches should be logged and the requirement should still be scored.
                 searches.append({"query": task["query"], "subreddit": task.get("subreddit", ""), "error": str(exc)})
                 self._log_deep_research_step(
