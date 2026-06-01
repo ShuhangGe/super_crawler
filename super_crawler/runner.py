@@ -109,6 +109,20 @@ class AlwaysOnRunner:
             "adaptive_resources": json.dumps(adaptive_plan.as_dict(), sort_keys=True),
         }
 
+    def run_deep_research_agent_once(self, agent_id: str) -> dict[str, int | str | None]:
+        resources = self.storage.get_resource_config()
+        adaptive_plan = plan_adaptive_resources(resources, len(self.storage.list_queue()), measure_device_health())
+        run = DeepResearchAgent(self.storage, agent_id).run_next() if adaptive_plan.deep_research_slots > 0 else None
+        return {
+            "items_loaded": 0,
+            "candidates": 0,
+            "requirements_changed": 0,
+            "reopened": 0,
+            "research_run": run.research_run_id if run else None,
+            "research_runs": run.research_run_id if run else "",
+            "adaptive_resources": json.dumps(adaptive_plan.as_dict(), sort_keys=True),
+        }
+
     def run_task_group(self, task_group_id: str) -> dict[str, int | str | None]:
         task_group = self.storage.get_task_group(task_group_id)
         if task_group is None:
@@ -547,9 +561,9 @@ def plan_adaptive_resources(
     configured_search = max(int(resources.get("max_search_agents", 3)), 0)
     configured_deep = max(int(resources.get("max_deep_research_agents", 1)), 0)
     if backlog_count > MAX_RESEARCH_BACKLOG:
-        search_slots = min(configured_search, 1)
+        search_slots = 0
         collector_limit = HIGH_BACKLOG_COLLECTOR_LIMIT
-        reason = "research backlog is above the maximum target, so search intake is throttled"
+        reason = "research backlog is above the maximum target, so search intake is paused"
     elif backlog_count > TARGET_RESEARCH_BACKLOG:
         search_slots = min(configured_search, 2)
         collector_limit = MEDIUM_BACKLOG_COLLECTOR_LIMIT
@@ -559,7 +573,7 @@ def plan_adaptive_resources(
         collector_limit = None
         reason = "research backlog is within target, so configured search intake is allowed"
 
-    if configured_search > 0:
+    if configured_search > 0 and backlog_count <= MAX_RESEARCH_BACKLOG:
         search_slots = max(search_slots, 1)
 
     if device_health.status == "very_busy":

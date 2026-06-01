@@ -1466,7 +1466,7 @@ class SystemTests(unittest.TestCase):
             device_health=DeviceHealth(cpu_load_ratio=0.2, memory_available_bytes=8_000_000_000, status="healthy"),
         )
 
-        self.assertEqual(high_backlog.search_slots, 1)
+        self.assertEqual(high_backlog.search_slots, 0)
         self.assertEqual(high_backlog.collector_limit, 8)
         self.assertEqual(high_backlog.deep_research_slots, 2)
         self.assertEqual(medium_backlog.search_slots, 2)
@@ -1495,6 +1495,24 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(very_busy.deep_research_slots, 0)
         self.assertEqual(search_disabled.search_slots, 0)
         self.assertEqual(search_disabled.deep_research_slots, 2)
+
+    def test_runtime_starts_one_deep_worker_per_configured_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            storage.update_resource_config({"max_deep_research_agents": 3})
+            storage.close()
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=60)
+
+            self.assertTrue(controller.start())
+            status = controller.status()
+            controller.stop()
+
+            self.assertTrue(status["workers"]["discovery"])
+            self.assertTrue(status["workers"]["deep_research_1"])
+            self.assertTrue(status["workers"]["deep_research_2"])
+            self.assertTrue(status["workers"]["deep_research_3"])
 
     def test_runner_separates_discovery_from_deep_research_queue(self) -> None:
         class RecordingRunner(AlwaysOnRunner):

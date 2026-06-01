@@ -656,6 +656,18 @@ class Storage:
         self.conn.commit()
 
     def lock_next_research(self, agent_id: str) -> str | None:
+        if self.conn.in_transaction:
+            return self._lock_next_research_in_current_transaction(agent_id)
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            requirement_id = self._lock_next_research_in_current_transaction(agent_id)
+            self.conn.commit()
+            return requirement_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _lock_next_research_in_current_transaction(self, agent_id: str) -> str | None:
         row = self.conn.execute(
             """
             SELECT requirement_id FROM research_queue
@@ -672,7 +684,6 @@ class Storage:
             "UPDATE research_queue SET locked_by=?, assigned_agent=?, updated_at=? WHERE requirement_id=?",
             (agent_id, agent_id, now, requirement_id),
         )
-        self.conn.commit()
         return requirement_id
 
     def dequeue_research(self, requirement_id: str) -> None:

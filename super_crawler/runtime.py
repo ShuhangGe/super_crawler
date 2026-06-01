@@ -31,13 +31,31 @@ class RuntimeController:
             if any(thread.is_alive() for thread in self._threads.values()):
                 return False
             self._stop_event.clear()
+            deep_worker_count = self._deep_research_worker_count()
             self._threads = {
                 "discovery": threading.Thread(target=self._run_discovery_loop, name="discovery-runtime", daemon=True),
-                "deep_research": threading.Thread(target=self._run_deep_research_loop, name="deep-research-runtime", daemon=True),
             }
+            self._threads.update(
+                {
+                    f"deep_research_{index}": threading.Thread(
+                        target=self._run_deep_research_loop,
+                        args=(index,),
+                        name=f"deep-research-runtime-{index}",
+                        daemon=True,
+                    )
+                    for index in range(1, deep_worker_count + 1)
+                }
+            )
             for thread in self._threads.values():
                 thread.start()
-            self._record("started", {"input_dir": str(self.input_dir), "interval_seconds": self.interval_seconds})
+            self._record(
+                "started",
+                {
+                    "input_dir": str(self.input_dir),
+                    "interval_seconds": self.interval_seconds,
+                    "deep_research_workers": deep_worker_count,
+                },
+            )
             return True
 
     def stop(self) -> bool:
@@ -45,7 +63,12 @@ class RuntimeController:
             if not any(thread.is_alive() for thread in self._threads.values()):
                 return False
             self._stop_event.set()
+            threads = list(self._threads.values())
             self._record("stop_requested", {})
+        for thread in threads:
+            thread.join(timeout=0.5)
+        with self._lock:
+            self._record("stop_completed", {"workers": {name: thread.is_alive() for name, thread in self._threads.items()}})
             return True
 
     def status(self) -> dict[str, Any]:
@@ -96,17 +119,22 @@ class RuntimeController:
     def _run_discovery_loop(self) -> None:
         self._run_worker_loop("discovery", self.interval_seconds, "run_discovery_once")
 
-    def _run_deep_research_loop(self) -> None:
-        self._run_worker_loop("deep_research", 1, "run_deep_research_once")
+    def _run_deep_research_loop(self, worker_index: int) -> None:
+        self._run_worker_loop(
+            f"deep_research_{worker_index}",
+            1,
+            "run_deep_research_agent_once",
+            f"research-agent-{worker_index}",
+        )
 
-    def _run_worker_loop(self, worker_name: str, interval_seconds: int, runner_method: str) -> None:
+    def _run_worker_loop(self, worker_name: str, interval_seconds: int, runner_method: str, *runner_args: str) -> None:
         while not self._stop_event.is_set():
             started_at = utc_now()
             try:
                 with Storage(self.db_path) as storage:
                     storage.migrate()
                     runner = AlwaysOnRunner(storage, self.input_dir, self.interval_seconds)
-                    result = getattr(runner, runner_method)()
+                    result = getattr(runner, runner_method)(*runner_args)
                     completed_at = utc_now()
                     pipeline_run_id = f"pipe_{worker_name}_{self._safe_time_id(completed_at)}_{self._cycle_count + 1}"
                     storage.save_pipeline_run(
@@ -148,6 +176,14 @@ class RuntimeController:
             self._stop_event.wait(interval_seconds)
         with self._lock:
             self._record(f"{worker_name}_stopped", {})
+
+    def _deep_research_worker_count(self) -> int:
+        try:
+            with Storage(self.db_path) as storage:
+                storage.migrate()
+                return max(int(storage.get_resource_config().get("max_deep_research_agents", 1)), 0)
+        except Exception:
+            return 1
 
     def _record(self, event: str, detail: dict[str, Any]) -> None:
         self._events.appendleft({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event, "detail": detail})
