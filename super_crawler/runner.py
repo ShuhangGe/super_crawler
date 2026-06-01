@@ -339,7 +339,27 @@ class AlwaysOnRunner:
             for assignment in plan.get("assignments", [])
         ]
         search_insights = self.storage.list_search_insights(task_group.task_group_id, limit=20)
-        plan = SearchPlannerAgent().plan(task_group, search_agent_count, cycle_index, recent_queries, search_insights)
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "search_planner",
+            "search_plan_started",
+            f"AI 搜索规划器正在理解任务“{task_group.name}”，并结合深度研究反馈生成第 {cycle_index} 轮搜索计划。",
+            {
+                "cycle_index": cycle_index,
+                "input_description": task_group.description or task_group.domain or task_group.name,
+                "recent_query_count": len(recent_queries),
+                "deep_research_feedback_count": len(search_insights),
+                "model": config.get("model_search", "deepseek-v4-flash"),
+            },
+        )
+        plan = SearchPlannerAgent(model_name=config.get("model_search", "deepseek-v4-flash")).plan(
+            task_group,
+            search_agent_count,
+            cycle_index,
+            recent_queries,
+            search_insights,
+        )
         plan_id = self.storage.save_search_plan(
             task_group.task_group_id,
             task_group_run_id,

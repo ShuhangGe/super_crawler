@@ -56,7 +56,7 @@ class SearchPlannerAgent:
                 insights,
                 error=str(exc),
             )
-        return normalize_llm_plan(parsed, self.agent_id, task_group, cycle_index, description, requested_count, recent, insights)
+        return normalize_llm_plan(parsed, self.agent_id, self.model_name, task_group, cycle_index, description, requested_count, recent, insights)
 
 
 def planner_system_prompt() -> str:
@@ -66,6 +66,9 @@ def planner_system_prompt() -> str:
         "read prior search plans, and use deep research feedback to decide what to search next. "
         "Do not use hard-coded domain assumptions. Infer the domain from the user input and evidence feedback. "
         "Prefer English Reddit search queries even when the user input is Chinese. "
+        "All user-facing explanation fields must be written in Simplified Chinese, including search_goal, why, "
+        "domain_understanding, must_match, reject_if, and deep_research_lessons. Keep the search query itself in "
+        "English when searching English-language Reddit is appropriate. "
         "Use productive deep research dimensions to deepen promising directions and use noisy dimensions to avoid bad directions. "
         "Return only JSON."
     )
@@ -98,6 +101,7 @@ def planner_user_prompt(
             },
             "instructions": {
                 "goal": "Create a search plan that finds Reddit posts expressing real user needs related to the user's stated product/domain.",
+                "language": "除 query 和 subreddit 之外，所有输出文本字段必须使用简体中文。",
                 "deep_research_usage": [
                     "Continue or broaden dimensions that produced relevant evidence.",
                     "Avoid exact noisy queries and explain how the new plan avoids them.",
@@ -110,14 +114,14 @@ def planner_user_prompt(
                     "Use subreddit only when it improves precision; otherwise leave it empty.",
                 ],
                 "expected_json": {
-                    "search_goal": "human-readable goal",
+                    "search_goal": "中文说明本轮搜索目标",
                     "search_brief": {
-                        "domain_understanding": "what the user is actually trying to discover",
-                        "target_users": ["who is likely to have this need"],
-                        "product_or_problem_scope": ["scope items"],
-                        "must_match": ["semantic criteria for relevant results"],
-                        "reject_if": ["semantic criteria for noisy results"],
-                        "deep_research_lessons": ["how feedback changed this plan"],
+                        "domain_understanding": "中文说明用户真正想发现什么需求",
+                        "target_users": ["中文描述潜在用户"],
+                        "product_or_problem_scope": ["中文描述产品或问题范围"],
+                        "must_match": ["中文描述相关结果必须满足的语义条件"],
+                        "reject_if": ["中文描述应拒绝的噪音条件"],
+                        "deep_research_lessons": ["中文说明 deep research 反馈如何影响本轮计划"],
                         "planning_method": "llm",
                     },
                     "assignments": [
@@ -141,6 +145,7 @@ def planner_user_prompt(
 def normalize_llm_plan(
     parsed: dict[str, Any],
     agent_id: str,
+    model_name: str,
     task_group: TaskGroup,
     cycle_index: int,
     description: str,
@@ -159,7 +164,7 @@ def normalize_llm_plan(
         "reject_if": string_list(brief.get("reject_if")),
         "deep_research_lessons": string_list(brief.get("deep_research_lessons")),
         "planning_method": "llm",
-        "model": DEFAULT_SEARCH_MODEL,
+        "model": model_name,
     }
     assignments = normalize_assignments(parsed.get("assignments"), requested_count)
     return {
@@ -167,7 +172,7 @@ def normalize_llm_plan(
         "cycle_index": cycle_index,
         "task_group_id": task_group.task_group_id,
         "input_description": description,
-        "search_goal": str(parsed.get("search_goal") or f"Find relevant Reddit requirement signals for {task_group.name}."),
+        "search_goal": str(parsed.get("search_goal") or f"为 {task_group.name} 寻找相关的 Reddit 用户需求信号。"),
         "search_brief": {
             **brief,
             "recent_queries_considered": recent_queries,
@@ -204,7 +209,7 @@ def normalize_assignments(value: object, requested_count: int) -> list[dict[str,
                 "subreddit": clean_subreddit(item.get("subreddit")),
                 "sort": clean_choice(item.get("sort"), {"relevance", "top", "new", "comments"}, "relevance"),
                 "time": clean_choice(item.get("time"), {"day", "week", "month", "year", "all"}, "year"),
-                "why": str(item.get("why") or "Planned by LLM from user requirement and deep research feedback.").strip(),
+                "why": str(item.get("why") or "由 AI 根据用户需求和深度研究反馈规划。").strip(),
             }
         )
         if len(assignments) >= requested_count:
@@ -245,7 +250,7 @@ def unavailable_plan(
     search_insights: list[dict[str, Any]],
     error: str | None = None,
 ) -> dict[str, Any]:
-    reason = error or "LLM planner is unavailable because no API key is configured."
+    reason = error or "AI 搜索规划器不可用：未配置 API key。"
     assignments = [
         {
             "agent_id": f"search-agent-{index}",
@@ -263,7 +268,7 @@ def unavailable_plan(
         "cycle_index": cycle_index,
         "task_group_id": task_group.task_group_id,
         "input_description": description,
-        "search_goal": "Search planning requires an available LLM planner.",
+        "search_goal": "搜索规划需要可用的 AI 搜索规划器。",
         "search_brief": {
             "domain_understanding": task_group.domain or task_group.name,
             "target_users": [],

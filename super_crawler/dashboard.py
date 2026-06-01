@@ -8,7 +8,6 @@ from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
 from .models import RequirementStatus, TaskGroupStatus, TaskGroupType
-from .search_planner import SearchPlannerAgent
 from .runtime import RuntimeController
 from .storage import Storage
 
@@ -441,6 +440,7 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     return (
         "<h1>Running Status</h1>"
         + resource_allocation_panel(storage)
+        + ai_activity_panel(controller.status(), task_groups, storage)
         + task_create_panel()
         + task_group_boards(storage, task_groups, requirements)
     )
@@ -493,8 +493,7 @@ def discovery_agent_card(storage: Storage, task_group: object) -> str:
     if latest_plan:
         assignments = latest_plan["assignments"]
     else:
-        plan = SearchPlannerAgent().plan(task_group, search_agent_count_for_group(storage, task_group), 1, [])
-        assignments = plan["assignments"]
+        assignments = planner_waiting_assignments(search_agent_count_for_group(storage, task_group))
     return "".join(
         f"""
         <a class="item" href="/agent-log?role=discovery&agent_id={html.escape(str(assignment['agent_id']))}&ref={html.escape(task_group.task_group_id)}">
@@ -740,7 +739,7 @@ def search_planner_card(storage: Storage, task_group: object) -> str:
           <ul class="url-list">{rows}</ul>
         </a>
         """
-    preview = SearchPlannerAgent().plan(task_group, search_agent_count_for_group(storage, task_group), 1, [])
+    preview = planner_waiting_preview(search_agent_count_for_group(storage, task_group))
     rows = "".join(
         f"<li><strong>{html.escape(str(item.get('strategy', 'search')))}:</strong> {html.escape(str(item.get('query', '')))}</li>"
         for item in preview["assignments"]
@@ -752,6 +751,53 @@ def search_planner_card(storage: Storage, task_group: object) -> str:
       <div class="summary">{html.escape(str(preview['search_goal']))}</div>
       <ul class="url-list">{rows}</ul>
     </div>
+    """
+
+
+def planner_waiting_preview(search_agent_count: int) -> dict[str, object]:
+    return {
+        "search_goal": "等待后台 AI 搜索规划器理解用户需求并生成搜索计划。",
+        "assignments": planner_waiting_assignments(search_agent_count),
+    }
+
+
+def planner_waiting_assignments(search_agent_count: int) -> list[dict[str, str]]:
+    return [
+        {
+            "agent_id": f"search-agent-{index}",
+            "strategy": "waiting_for_ai_planner",
+            "query": "等待 AI 生成搜索查询",
+        }
+        for index in range(1, max(search_agent_count, 1) + 1)
+    ]
+
+
+def ai_activity_panel(runtime: dict[str, object], task_groups: list[object], storage: Storage) -> str:
+    running = bool(runtime.get("running"))
+    event_rows = "".join(
+        f"<li>{html.escape(str(item.get('at', '')))} - {html.escape(str(item.get('event', '')))} "
+        f"{html.escape(json.dumps(item.get('detail', {}), ensure_ascii=False, default=str))}</li>"
+        for item in list(runtime.get("events", []))[:3]
+        if isinstance(item, dict)
+    )
+    latest_logs = []
+    for task_group in task_groups[:4]:
+        logs = storage.list_experiment_logs(task_group_id=task_group.task_group_id, limit=1)
+        if logs:
+            latest_logs.append(f"{task_group.name}: {logs[0]['message']}")
+    log_rows = "".join(f"<li>{html.escape(item)}</li>" for item in latest_logs)
+    status = (
+        "AI 正在后台运行。刷新页面可查看最新阶段。"
+        if running
+        else "AI 后台当前未运行。点击任务组 Start 后会开始后台规划、采集和分析。"
+    )
+    return f"""
+    <section class="notice">
+      <strong>AI 运行状态</strong>
+      <div class="summary">{html.escape(status)}</div>
+      <ul class="url-list">{event_rows or "<li>暂无运行事件。</li>"}</ul>
+      <ul class="url-list">{log_rows or "<li>暂无任务日志。</li>"}</ul>
+    </section>
     """
 
 
