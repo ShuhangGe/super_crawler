@@ -1466,7 +1466,7 @@ class SystemTests(unittest.TestCase):
             self.assertIn("is there an app for photography", queries)
             self.assertIn("best way to manage photography", queries)
 
-    def test_adaptive_resources_throttle_search_when_backlog_is_high(self) -> None:
+    def test_adaptive_resources_limit_collection_without_hiding_search_agents(self) -> None:
         resources = {"max_search_agents": 3, "max_deep_research_agents": 2}
 
         high_backlog = plan_adaptive_resources(
@@ -1485,10 +1485,10 @@ class SystemTests(unittest.TestCase):
             device_health=DeviceHealth(cpu_load_ratio=0.2, memory_available_bytes=8_000_000_000, status="healthy"),
         )
 
-        self.assertEqual(high_backlog.search_slots, 0)
+        self.assertEqual(high_backlog.search_slots, 3)
         self.assertEqual(high_backlog.collector_limit, 8)
         self.assertEqual(high_backlog.deep_research_slots, 2)
-        self.assertEqual(medium_backlog.search_slots, 2)
+        self.assertEqual(medium_backlog.search_slots, 3)
         self.assertEqual(medium_backlog.collector_limit, 12)
         self.assertEqual(low_backlog.search_slots, 3)
         self.assertIsNone(low_backlog.collector_limit)

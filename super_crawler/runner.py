@@ -565,21 +565,16 @@ def plan_adaptive_resources(
 ) -> AdaptiveResourcePlan:
     configured_search = max(int(resources.get("max_search_agents", 3)), 0)
     configured_deep = max(int(resources.get("max_deep_research_agents", 1)), 0)
+    search_slots = configured_search
     if backlog_count > MAX_RESEARCH_BACKLOG:
-        search_slots = 0
         collector_limit = HIGH_BACKLOG_COLLECTOR_LIMIT
-        reason = "research backlog is above the maximum target, so search intake is paused"
+        reason = "research backlog is above the maximum target, so search intake per agent is limited"
     elif backlog_count > TARGET_RESEARCH_BACKLOG:
-        search_slots = min(configured_search, 2)
         collector_limit = MEDIUM_BACKLOG_COLLECTOR_LIMIT
-        reason = "research backlog is above target, so search intake is reduced"
+        reason = "research backlog is above target, so search intake per agent is reduced"
     else:
-        search_slots = configured_search
         collector_limit = None
         reason = "research backlog is within target, so configured search intake is allowed"
-
-    if configured_search > 0 and backlog_count <= MAX_RESEARCH_BACKLOG:
-        search_slots = max(search_slots, 1)
 
     if device_health.status == "very_busy":
         deep_slots = 0
