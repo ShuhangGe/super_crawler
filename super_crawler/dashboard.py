@@ -531,8 +531,7 @@ def allocate_search_slots_for_dashboard(group_count: int, max_search_agents: int
 
 
 def deep_research_agent_cards(storage: Storage, task_group: object, requirements: list[object]) -> str:
-    requirement_ids = {item.requirement_id for item in requirements}
-    queue_rows = [row for row in storage.list_queue() if row["requirement_id"] in requirement_ids]
+    queue_rows = task_group_queue_rows(storage, task_group, requirements)
     if not queue_rows:
         return "<p class='muted'>No active deep research agent for this group.</p>"
     max_agents = max(int(storage.get_resource_config().get("max_deep_research_agents", 1)), 0)
@@ -540,7 +539,7 @@ def deep_research_agent_cards(storage: Storage, task_group: object, requirements
         return "<p class='muted'>Deep research is disabled by the global resource limit.</p>"
     return "".join(
         deep_research_agent_card(row, index, active_slot=True)
-        for index, row in enumerate(queue_rows[:max_agents], start=1)
+        for index, row in enumerate(sorted(queue_rows, key=lambda row: (0 if row.get("locked_by") else 1, -int(row.get("priority", 0))))[:max_agents], start=1)
     )
 
 
@@ -833,10 +832,10 @@ def deep_research_agents_panel(storage: Storage) -> str:
 
 
 def task_group_deep_research_panel(storage: Storage, task_group: object, requirements: list[object]) -> str:
-    requirement_ids = {item.requirement_id for item in requirements}
-    queue = [row for row in storage.list_queue() if row["requirement_id"] in requirement_ids]
+    queue = task_group_queue_rows(storage, task_group, requirements)
     max_agents = max(int(storage.get_resource_config().get("max_deep_research_agents", 1)), 0)
-    backlog_count = max(len(queue) - max_agents, 0)
+    active_count = len([row for row in queue if row.get("locked_by")])
+    backlog_count = len([row for row in queue if not row.get("locked_by")])
     if task_group.status != TaskGroupStatus.RUNNING:
         paused = f"<div class='summary'>{len(queue)} queued requirement(s) paused until this group starts.</div>" if queue else ""
         return (
@@ -845,19 +844,33 @@ def task_group_deep_research_panel(storage: Storage, task_group: object, require
             + paused
             + "</section>"
         )
+    next_queue = [row for row in queue if not row.get("locked_by")]
     queue_text = "".join(
         f"<div class='summary'>Next requirement: {html.escape(row['requirement_id'])} priority {row['priority']}</div>"
-        for row in queue[:max_agents]
+        for row in next_queue[:max_agents]
     ) or "<p class='muted'>No deep research queue item for this task group.</p>"
     backlog = f"<div class='summary'>{backlog_count} requirement(s) waiting behind active slots.</div>" if backlog_count else ""
+    active = f"<div class='summary'>{active_count}/{max_agents} active slots for this group.</div>"
     return (
         "<section class='panel'><h2>Running Deep Research Agents</h2>"
         "<p class='muted'>Deep research agents are created dynamically from queued requirements, up to the global Deep limit.</p>"
+        + active
         + deep_research_agent_cards(storage, task_group, requirements)
         + queue_text
         + backlog
         + "</section>"
     )
+
+
+def task_group_queue_rows(storage: Storage, task_group: object, requirements: list[object]) -> list[dict[str, object]]:
+    requirement_ids = {item.requirement_id for item in requirements}
+    rows = []
+    for row in storage.list_queue():
+        if row.get("task_group_id") == task_group.task_group_id:
+            rows.append(row)
+        elif not row.get("task_group_id") and row["requirement_id"] in requirement_ids:
+            rows.append(row)
+    return rows
 
 
 def group_settings_inline(storage: Storage, task_group: object) -> str:
