@@ -124,7 +124,8 @@ class Storage:
             );
 
             CREATE TABLE IF NOT EXISTS research_queue (
-                requirement_id TEXT PRIMARY KEY,
+                requirement_id TEXT NOT NULL,
+                task_group_id TEXT NOT NULL DEFAULT '',
                 priority INTEGER NOT NULL,
                 reason TEXT NOT NULL,
                 new_evidence_count INTEGER NOT NULL,
@@ -135,6 +136,7 @@ class Storage:
                 expected_completion_minutes INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                PRIMARY KEY(requirement_id, task_group_id),
                 FOREIGN KEY(requirement_id) REFERENCES requirements(requirement_id)
             );
 
@@ -300,6 +302,7 @@ class Storage:
         self._ensure_column("requirements", "task_group_ids", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column("requirements", "task_group_run_ids", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column("task_groups", "description", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_group_scoped_research_queue()
         self._ensure_default_resource_config()
         self._ensure_default_app_config()
         self.conn.commit()
@@ -620,19 +623,21 @@ class Storage:
         reason: str,
         new_evidence_count: int,
         previous_research_status: str | None,
+        task_group_id: str | None = None,
         estimated_cost: float = 0.25,
         expected_completion_minutes: int = 20,
     ) -> None:
         now = utc_now()
+        task_group_id = task_group_id if task_group_id is not None else self._latest_requirement_task_group_id(requirement_id)
         self.conn.execute(
             """
             INSERT INTO research_queue (
-                requirement_id, priority, reason, new_evidence_count,
+                requirement_id, task_group_id, priority, reason, new_evidence_count,
                 previous_research_status, assigned_agent, locked_by,
                 estimated_cost, expected_completion_minutes, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
-            ON CONFLICT(requirement_id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+            ON CONFLICT(requirement_id, task_group_id) DO UPDATE SET
                 priority=excluded.priority,
                 reason=excluded.reason,
                 new_evidence_count=excluded.new_evidence_count,
@@ -643,6 +648,7 @@ class Storage:
             """,
             (
                 requirement_id,
+                task_group_id,
                 priority,
                 reason,
                 new_evidence_count,
@@ -678,18 +684,12 @@ class Storage:
             if not eligible_task_group_ids:
                 return None
             placeholders = ", ".join("?" for _ in eligible_task_group_ids)
-            group_filter = (
-                "AND EXISTS ("
-                "SELECT 1 FROM json_each(requirements.task_group_ids) "
-                f"WHERE json_each.value IN ({placeholders})"
-                ")"
-            )
+            group_filter = f"AND research_queue.task_group_id IN ({placeholders})"
             params.extend(eligible_task_group_ids)
         row = self.conn.execute(
             f"""
             SELECT research_queue.requirement_id
             FROM research_queue
-            JOIN requirements ON requirements.requirement_id = research_queue.requirement_id
             WHERE research_queue.locked_by IS NULL
             {group_filter}
             ORDER BY research_queue.priority DESC, research_queue.created_at ASC
@@ -707,15 +707,34 @@ class Storage:
         )
         return requirement_id
 
-    def dequeue_research(self, requirement_id: str) -> None:
-        self.conn.execute("DELETE FROM research_queue WHERE requirement_id=?", (requirement_id,))
+    def dequeue_research(self, requirement_id: str, task_group_id: str | None = None) -> None:
+        if task_group_id is None:
+            self.conn.execute("DELETE FROM research_queue WHERE requirement_id=?", (requirement_id,))
+        else:
+            self.conn.execute(
+                "DELETE FROM research_queue WHERE requirement_id=? AND task_group_id=?",
+                (requirement_id, task_group_id),
+            )
         self.conn.commit()
 
-    def unlock_research(self, requirement_id: str) -> None:
+    def dequeue_locked_research(self, requirement_id: str, agent_id: str) -> None:
         self.conn.execute(
-            "UPDATE research_queue SET locked_by=NULL, updated_at=? WHERE requirement_id=?",
-            (utc_now(), requirement_id),
+            "DELETE FROM research_queue WHERE requirement_id=? AND locked_by=?",
+            (requirement_id, agent_id),
         )
+        self.conn.commit()
+
+    def unlock_research(self, requirement_id: str, agent_id: str | None = None) -> None:
+        if agent_id is None:
+            self.conn.execute(
+                "UPDATE research_queue SET locked_by=NULL, updated_at=? WHERE requirement_id=?",
+                (utc_now(), requirement_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE research_queue SET locked_by=NULL, updated_at=? WHERE requirement_id=? AND locked_by=?",
+                (utc_now(), requirement_id, agent_id),
+            )
         self.conn.commit()
 
     def update_queue_priority(self, requirement_id: str, priority: int) -> None:
@@ -1187,6 +1206,76 @@ class Storage:
         columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _ensure_group_scoped_research_queue(self) -> None:
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(research_queue)").fetchall()}
+        primary_keys = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(research_queue)").fetchall()
+            if row["pk"]
+        }
+        if "task_group_id" in columns and primary_keys == {"requirement_id", "task_group_id"}:
+            return
+        rows = self.conn.execute("SELECT * FROM research_queue").fetchall()
+        self.conn.execute("ALTER TABLE research_queue RENAME TO research_queue_legacy")
+        self.conn.execute(
+            """
+            CREATE TABLE research_queue (
+                requirement_id TEXT NOT NULL,
+                task_group_id TEXT NOT NULL DEFAULT '',
+                priority INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                new_evidence_count INTEGER NOT NULL,
+                previous_research_status TEXT,
+                assigned_agent TEXT,
+                locked_by TEXT,
+                estimated_cost REAL NOT NULL,
+                expected_completion_minutes INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(requirement_id, task_group_id),
+                FOREIGN KEY(requirement_id) REFERENCES requirements(requirement_id)
+            )
+            """
+        )
+        for row in rows:
+            item = dict(row)
+            task_group_id = str(item.get("task_group_id") or self._latest_requirement_task_group_id(str(item["requirement_id"])))
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO research_queue (
+                    requirement_id, task_group_id, priority, reason, new_evidence_count,
+                    previous_research_status, assigned_agent, locked_by,
+                    estimated_cost, expected_completion_minutes, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item["requirement_id"],
+                    task_group_id,
+                    item["priority"],
+                    item["reason"],
+                    item["new_evidence_count"],
+                    item["previous_research_status"],
+                    item["assigned_agent"],
+                    item["locked_by"],
+                    item["estimated_cost"],
+                    item["expected_completion_minutes"],
+                    item["created_at"],
+                    item["updated_at"],
+                ),
+            )
+        self.conn.execute("DROP TABLE research_queue_legacy")
+
+    def _latest_requirement_task_group_id(self, requirement_id: str) -> str:
+        row = self.conn.execute("SELECT task_group_ids FROM requirements WHERE requirement_id=?", (requirement_id,)).fetchone()
+        if row is None:
+            return ""
+        try:
+            task_group_ids = json.loads(row["task_group_ids"])
+        except json.JSONDecodeError:
+            return ""
+        return str(task_group_ids[-1]) if task_group_ids else ""
 
     def _ensure_default_resource_config(self) -> None:
         now = utc_now()

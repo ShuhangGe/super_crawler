@@ -506,6 +506,7 @@ class RequirementMemoryAgent(BaseAgent):
                     reason=self._queue_reason(record),
                     new_evidence_count=len(candidate.evidence_ids),
                     previous_research_status=record.latest_recommendation,
+                    task_group_id=candidate.task_group_id,
                 )
                 self.storage.log_requirement_event(
                     record.requirement_id,
@@ -630,6 +631,7 @@ class ChangeDetectionAgent(BaseAgent):
                     reason=change["reason"],
                     new_evidence_count=int(change.get("new_evidence_count", 0)),
                     previous_research_status=requirement.latest_recommendation,
+                    task_group_id=requirement.task_group_ids[-1] if requirement.task_group_ids else None,
                 )
                 reopened.append(requirement)
         self.log("evaluate_reopenings", "completed", [], [item.requirement_id for item in reopened])
@@ -783,7 +785,7 @@ class DeepResearchAgent(BaseAgent):
         requirement.previous_scores = scores
         requirement.decision_history.append({"at": utc_now(), "decision": requirement.status.value, "research_run": run_id})
         self.storage.upsert_requirement(requirement)
-        self.storage.dequeue_research(requirement.requirement_id)
+        self.storage.dequeue_locked_research(requirement.requirement_id, self.agent_id)
         self.storage.log_requirement_event(
             requirement.requirement_id,
             task_group_id,
@@ -921,7 +923,7 @@ class DeepResearchAgent(BaseAgent):
         requirement.assigned_to = None
         requirement.decision_history.append({"at": utc_now(), "decision": "deep_research_failed", "error": error})
         self.storage.upsert_requirement(requirement)
-        self.storage.unlock_research(requirement.requirement_id)
+        self.storage.unlock_research(requirement.requirement_id, self.agent_id)
         task_group_id = requirement.task_group_ids[-1] if requirement.task_group_ids else None
         task_group_run_id = requirement.task_group_run_ids[-1] if requirement.task_group_run_ids else None
         self.storage.log_requirement_event(
