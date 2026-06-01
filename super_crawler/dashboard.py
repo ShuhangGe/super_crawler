@@ -450,7 +450,6 @@ def home_page(storage: Storage, controller: RuntimeController) -> str:
     return (
         "<h1>Running Status</h1>"
         + resource_allocation_panel(storage)
-        + ai_activity_panel(controller.status(), task_groups, storage)
         + task_create_panel()
         + task_group_boards(storage, task_groups, requirements)
     )
