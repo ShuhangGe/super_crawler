@@ -827,6 +827,25 @@ class Storage:
         rows = self.conn.execute("SELECT * FROM requirements ORDER BY last_seen DESC").fetchall()
         return [self._from_row(RequirementRecord, row) for row in rows]
 
+    def list_requirements_with_research_runs(self, statuses: list[str]) -> list[RequirementRecord]:
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM requirements
+            WHERE status IN ({placeholders})
+              AND EXISTS (
+                SELECT 1 FROM research_runs
+                WHERE research_runs.requirement_id = requirements.requirement_id
+              )
+            ORDER BY last_seen DESC
+            """,
+            statuses,
+        ).fetchall()
+        return [self._from_row(RequirementRecord, row) for row in rows]
+
     def get_requirement(self, requirement_id: str) -> RequirementRecord | None:
         row = self.conn.execute("SELECT * FROM requirements WHERE requirement_id=?", (requirement_id,)).fetchone()
         return None if row is None else self._from_row(RequirementRecord, row)
