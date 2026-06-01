@@ -10,7 +10,7 @@ from super_crawler.agents import ChangeDetectionAgent, DeepResearchAgent, Discov
 from super_crawler.collectors import OpenCliRedditCollector, build_requirement_search_queries, normalize_reddit_item, parse_opencli_output
 from super_crawler.dashboard import agent_log_page, detail_page, experiment_log_page, filter_requirements_by_group, grouped_requirement_lineage, home_page, possible_requirements, rejected_requirements, requirement_list_page, visible_task_groups, search_agent_count_for_group, todo_page
 from super_crawler.models import RequirementRecord, RequirementStatus, ResearchRun, TaskGroupStatus, TaskGroupType, utc_now
-from super_crawler.runner import DeviceHealth, allocate_search_slots, plan_adaptive_resources
+from super_crawler.runner import AlwaysOnRunner, DeviceHealth, allocate_search_slots, plan_adaptive_resources
 from super_crawler.runtime import RuntimeController
 from super_crawler.seed import SAMPLE_REDDIT_ITEMS
 from super_crawler.search_planner import SearchPlannerAgent
@@ -1495,6 +1495,73 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(very_busy.deep_research_slots, 0)
         self.assertEqual(search_disabled.search_slots, 0)
         self.assertEqual(search_disabled.deep_research_slots, 2)
+
+    def test_runner_consumes_existing_deep_research_queue_before_search(self) -> None:
+        class RecordingRunner(AlwaysOnRunner):
+            def __init__(self, storage: Storage, input_dir: Path):
+                super().__init__(storage, input_dir)
+                self.queue_count_when_search_started: int | None = None
+
+            def _run_deep_research_slots(self, limit: int) -> list[str]:
+                run_ids = []
+                for index, row in enumerate(self.storage.list_queue()[:limit], start=1):
+                    self.storage.dequeue_research(str(row["requirement_id"]))
+                    run_ids.append(f"fake-run-{index}")
+                return run_ids
+
+            def _run_search_task_group(self, task_group, search_agent_count: int, collector_limit_override: int | None = None) -> dict[str, int | str | None]:
+                self.queue_count_when_search_started = len(self.storage.list_queue())
+                return {
+                    "items_loaded": 0,
+                    "candidates": 0,
+                    "requirements_changed": 0,
+                    "task_group_run_id": "search-run-1",
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C",
+                task_type=TaskGroupType.DOMAIN,
+                domain="consumer electronics",
+                input_dir=str(Path(directory) / "3c"),
+            )
+            storage.upsert_requirement(
+                RequirementRecord(
+                    requirement_id="req-queued",
+                    canonical_requirement="Users need better consumer electronics setup help",
+                    description="Need help setting up devices.",
+                    status=RequirementStatus.QUEUED_FOR_RESEARCH,
+                    first_seen=utc_now(),
+                    last_seen=utc_now(),
+                    times_detected=1,
+                    evidence_count=1,
+                    subreddit_count=1,
+                    geo_distribution=[],
+                    audience_segments=[],
+                    current_scores={},
+                    previous_scores={},
+                    research_history=[],
+                    decision_history=[],
+                    reopen_events=[],
+                    latest_recommendation=None,
+                    task_group_ids=[task_group.task_group_id],
+                )
+            )
+            storage.enqueue_research("req-queued", 50, "existing backlog", 1, None)
+            plan = plan_adaptive_resources(
+                storage.get_resource_config(),
+                backlog_count=1,
+                device_health=DeviceHealth(cpu_load_ratio=0.2, memory_available_bytes=8_000_000_000, status="healthy"),
+            )
+            runner = RecordingRunner(storage, Path(directory) / "inbox")
+
+            result = runner.run_task_groups([task_group], plan)
+
+            self.assertEqual(runner.queue_count_when_search_started, 0)
+            self.assertEqual(result["research_run"], "fake-run-1")
+            self.assertEqual(storage.list_queue(), [])
 
     def test_collected_items_keep_search_agent_identity(self) -> None:
         class FakeCollector(OpenCliRedditCollector):

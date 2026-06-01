@@ -66,16 +66,18 @@ class AlwaysOnRunner:
         device_health = measure_device_health()
         backlog_count = len(self.storage.list_queue())
         adaptive_plan = plan_adaptive_resources(resources, backlog_count, device_health)
+        pre_research_runs = self._run_deep_research_slots(adaptive_plan.deep_research_slots)
         groups = self.storage.list_task_groups([TaskGroupStatus.RUNNING.value])
         if groups:
-            return self.run_task_groups(groups[: adaptive_plan.search_slots], adaptive_plan)
+            result = self.run_task_groups(groups[: adaptive_plan.search_slots], adaptive_plan, pre_research_runs)
+            return result
 
         items = load_json_items(self.input_dir)
         candidates = DiscoveryAgent(self.storage, "discovery-daemon").ingest_reddit_items(items) if items else []
         changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates()
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
         adaptive_plan = plan_adaptive_resources(resources, len(self.storage.list_queue()), device_health)
-        research_runs = self._run_deep_research_slots(adaptive_plan.deep_research_slots)
+        research_runs = [*pre_research_runs, *self._run_deep_research_slots(adaptive_plan.deep_research_slots)]
         return {
             "items_loaded": len(items),
             "candidates": len(candidates),
@@ -96,10 +98,14 @@ class AlwaysOnRunner:
         self,
         task_groups: list[TaskGroup],
         adaptive_plan: AdaptiveResourcePlan | None = None,
+        pre_research_runs: list[str] | None = None,
     ) -> dict[str, int | str | None]:
         resources = self.storage.get_resource_config()
         if adaptive_plan is None:
             adaptive_plan = plan_adaptive_resources(resources, len(self.storage.list_queue()), measure_device_health())
+        research_runs = list(pre_research_runs or [])
+        if pre_research_runs is None:
+            research_runs.extend(self._run_deep_research_slots(adaptive_plan.deep_research_slots))
         search_slots = max(int(adaptive_plan.search_slots), 0)
         active_task_groups = task_groups if search_slots > 0 else []
         slot_allocations = allocate_search_slots(len(active_task_groups), search_slots)
@@ -120,7 +126,7 @@ class AlwaysOnRunner:
 
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
         deep_plan = plan_adaptive_resources(resources, len(self.storage.list_queue()), measure_device_health())
-        research_runs = self._run_deep_research_slots(deep_plan.deep_research_slots)
+        research_runs.extend(self._run_deep_research_slots(deep_plan.deep_research_slots))
         return {
             "items_loaded": total_items,
             "candidates": total_candidates,
