@@ -83,6 +83,41 @@ class FakeDeepResearchLLM:
         }
 
 
+class FakeDiscoveryProductLLM:
+    def available(self) -> bool:
+        return True
+
+    def json_chat(self, model: str, system: str, user: str) -> dict[str, object]:
+        payload = json.loads(user)
+        title = str(payload["post"]["title"])
+        if "camera recommendation" in title.lower() or "相机推荐" in title:
+            return {
+                "is_possible_requirement": True,
+                "signals": ["advice_request"],
+                "requirement_title": "用户需要适合商业视频拍摄的入门级相机推荐",
+                "requirement_description": "用户在寻求购买建议，不是新的可制造产品机会。",
+                "is_physical_product_opportunity": False,
+                "production_line_fit": "none",
+                "product_opportunity_score": 20,
+                "sample_rejection_reason": "这是相机购买建议，不是可复用生产线的实体产品机会。",
+            }
+        return {
+            "is_possible_requirement": True,
+            "signals": ["product_pain", "complaint"],
+            "requirement_title": "用户需要稳定不晃动的头顶拍摄支架",
+            "requirement_description": "用户在拥挤桌面上拍摄绘画视频，需要更稳定的支架产品。",
+            "audience": ["视频创作者"],
+            "pain_level": "high",
+            "confidence": 0.88,
+            "is_physical_product_opportunity": True,
+            "manufacturable_form": "桌面夹具式头顶拍摄支架",
+            "production_line_fit": "high",
+            "buyer_context": "绘画和教程视频创作者在桌面拍摄时购买",
+            "purchase_signal": "现有支架晃动且占桌面空间",
+            "product_opportunity_score": 86,
+        }
+
+
 def planner_response(assignments: list[dict[str, object]], domain: str = "Creator camera support accessories") -> dict[str, object]:
     return {
         "search_goal": f"Find Reddit pain points for {domain}.",
@@ -2478,6 +2513,42 @@ class SystemTests(unittest.TestCase):
         self.assertFalse(unrelated["is_relevant"])
         self.assertTrue(related["is_relevant"])
 
+    def test_discovery_llm_keeps_only_physical_product_opportunities(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group("3C", TaskGroupType.DOMAIN, "support accessories", str(Path(directory) / "3c"))
+            items = [
+                {
+                    "source_url": "https://reddit.com/camera-advice",
+                    "subreddit": "videography",
+                    "title": "Need entry level camera recommendation for commercial video",
+                    "body": "Which camera should I buy as a beginner?",
+                    "search_query": "camera recommendation for commercial video",
+                    "search_agent_id": "search-agent-1",
+                },
+                {
+                    "source_url": "https://reddit.com/overhead-stand",
+                    "subreddit": "NewTubers",
+                    "title": "Stable overhead camera stand for filming drawing videos on a crowded desk",
+                    "body": "My current tripod shakes and takes too much desk space.",
+                    "search_query": "overhead camera stand shaky crowded desk",
+                    "search_agent_id": "search-agent-2",
+                },
+            ]
+
+            with patch("super_crawler.agents.DeepSeekClient", lambda: FakeDiscoveryProductLLM()):
+                candidates = DiscoveryAgent(storage, "discovery-test").ingest_reddit_items(
+                    items,
+                    task_group.task_group_id,
+                    "run-1",
+                    use_llm=True,
+                )
+
+            self.assertEqual(len(candidates), 1)
+            self.assertIn("头顶拍摄支架", candidates[0].requirement_title)
+            self.assertEqual(len(storage.list_evidence()), 1)
+
     def test_llm_requirement_analysis_normalization(self) -> None:
         analysis = normalize_llm_requirement_analysis(
             {
@@ -2507,6 +2578,65 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(rejected["is_possible_requirement"], False)
         self.assertEqual(rejected["signals"], [])
         self.assertIn("deep research", rejected["sample_rejection_reason"])
+
+    def test_validated_deep_research_requires_product_opportunity_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            agent = DeepResearchAgent(storage, "research-test")
+            now = utc_now()
+            requirement = RequirementRecord(
+                requirement_id="req-camera-advice",
+                canonical_requirement="用户需要适合商业视频拍摄的入门级相机推荐",
+                description="用户想知道买哪台相机。",
+                status=RequirementStatus.RESEARCHING,
+                first_seen=now,
+                last_seen=now,
+                times_detected=1,
+                evidence_count=3,
+                subreddit_count=2,
+                geo_distribution=[],
+                audience_segments=["视频创作者"],
+                current_scores={},
+                previous_scores={},
+                research_history=[],
+                decision_history=[],
+                reopen_events=[],
+                latest_recommendation=None,
+            )
+
+            status = agent._status_from_synthesis(
+                {
+                    "final_decision": "validated",
+                    "is_product_opportunity": False,
+                    "product_rejection_reason": "这是购买建议，不是可制造产品机会。",
+                },
+                requirement,
+                [
+                    RawEvidence(
+                        evidence_id="ev-1",
+                        source="reddit",
+                        source_url="https://reddit.com/1",
+                        subreddit="videography",
+                        post_id=None,
+                        comment_id=None,
+                        title="Need camera recommendation",
+                        body="Which beginner camera should I buy?",
+                        author_metadata_allowed=False,
+                        score=10,
+                        comment_count=5,
+                        created_at=now,
+                        fetched_at=now,
+                        language="en",
+                        geo_hints=[],
+                        matched_patterns=["advice_request"],
+                        raw_payload={},
+                    )
+                ],
+                {"overall_score": 90},
+            )
+
+            self.assertEqual(status, RequirementStatus.REJECTED)
 
 
 if __name__ == "__main__":

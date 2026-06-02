@@ -122,6 +122,8 @@ class DiscoveryAgent(BaseAgent):
             matched = analysis["signals"] if analysis else matched_signal_patterns(text)
             source_url = str(item.get("source_url") or "")
             is_possible = bool(matched and not (analysis and not analysis["is_possible_requirement"]))
+            if analysis and is_possible and not analysis.get("is_product_opportunity", True):
+                is_possible = False
             sample_analysis = (analysis or {}).get("sample_analysis") or ("Matched possible requirement signals." if matched else "No possible requirement signal found.")
             sample_rejection_reason = (analysis or {}).get("sample_rejection_reason", "")
             analysis_payload = {
@@ -146,6 +148,12 @@ class DiscoveryAgent(BaseAgent):
                 "rejection_reason": sample_rejection_reason,
                 "requirement_title": (analysis or {}).get("requirement_title", ""),
                 "confidence": (analysis or {}).get("confidence"),
+                "is_product_opportunity": (analysis or {}).get("is_product_opportunity"),
+                "manufacturable_form": (analysis or {}).get("manufacturable_form", ""),
+                "production_line_fit": (analysis or {}).get("production_line_fit", ""),
+                "buyer_context": (analysis or {}).get("buyer_context", ""),
+                "purchase_signal": (analysis or {}).get("purchase_signal", ""),
+                "product_opportunity_score": (analysis or {}).get("product_opportunity_score"),
             }
             if task_group_id or task_group_run_id:
                 self.storage.log_experiment(
@@ -156,7 +164,7 @@ class DiscoveryAgent(BaseAgent):
                     f"Sample analyzed: {item.get('title', '')}",
                     analysis_payload,
                 )
-            if not matched or (analysis and not analysis["is_possible_requirement"]):
+            if not matched or (analysis and (not analysis["is_possible_requirement"] or not analysis.get("is_product_opportunity", True))):
                 continue
 
             evidence_id = self._id("ev", item.get("source_url", "") + text)
@@ -213,7 +221,10 @@ class DiscoveryAgent(BaseAgent):
         system = (
             "You are a discovery search agent. Your job is lightweight sample screening, not final validation. "
             "Decide whether this Reddit post is worth saving as a possible requirement candidate for a deep "
-            "research agent. Respond in Chinese (简体中文) for all text fields. Return only JSON."
+            "research agent. Only save manufacturable physical product opportunities that could become sellable "
+            "accessories or hardware products. Reject pure advice, camera-buying recommendations, software/content "
+            "workflow, tutorials, and creator operation guidance. Respond in Chinese (简体中文) for all text fields. "
+            "Return only JSON."
         )
         user = json.dumps(
             {
@@ -227,6 +238,12 @@ class DiscoveryAgent(BaseAgent):
                     "sample_rejection_reason": "如果 is_possible_requirement 为 false，用中文简短说明原因",
                     "pain_level": "low, medium, or high",
                     "confidence": "number from 0 to 1",
+                    "is_physical_product_opportunity": "true only if the need can become a physical product/SKU/accessory",
+                    "manufacturable_form": "具体产品形态，例如手机支架、灯架、夹具、转轴、桌面固定结构；不是实体产品则为空",
+                    "production_line_fit": "high, medium, low, or none; judge fit with phone stands, light stands, clamps, arms, poles, magnetic mounts, hinges, desktop fixtures",
+                    "buyer_context": "谁会购买、在什么场景购买",
+                    "purchase_signal": "帖子里体现出的购买、替换、现有产品不满或愿意付费信号",
+                    "product_opportunity_score": "0 to 100",
                 },
                 "post": {
                     "title": title,
@@ -240,6 +257,7 @@ class DiscoveryAgent(BaseAgent):
                     "url": item.get("source_url", ""),
                 },
                 "important_filter": "Reject if the post is not clearly related to the search_query/search_subreddit context, even if it contains a generic user pain.",
+                "business_goal": "我们主要卖可制造的实体产品，优先寻找能复用手机支架、直播灯支架、桌面夹具、伸缩杆、磁吸/转轴/云台等生产线的客户需求。",
             }
         )
         try:
@@ -502,6 +520,95 @@ def compact_analysis_payload(analysis: dict[str, Any]) -> dict[str, Any]:
     return {key: analysis[key] for key in keys if key in analysis}
 
 
+def assess_product_opportunity(text: str, parsed: dict[str, Any] | None = None) -> dict[str, Any]:
+    parsed = parsed or {}
+    explicit = parsed.get("is_physical_product_opportunity", parsed.get("is_product_opportunity"))
+    fit = str(parsed.get("production_line_fit") or "").lower().strip()
+    score_raw = parsed.get("product_opportunity_score")
+    try:
+        score = int(float(score_raw))
+    except (TypeError, ValueError):
+        score = -1
+    if explicit is not None:
+        is_product = bool(explicit)
+        if fit in {"none", "no", "not_fit"}:
+            is_product = False
+        if score >= 0 and score < 45:
+            is_product = False
+        return {
+            "is_product_opportunity": is_product,
+            "manufacturable_form": str(parsed.get("manufacturable_form") or ""),
+            "production_line_fit": fit or ("medium" if is_product else "none"),
+            "buyer_context": str(parsed.get("buyer_context") or ""),
+            "purchase_signal": str(parsed.get("purchase_signal") or ""),
+            "product_opportunity_score": max(score, 0) if score >= 0 else (70 if is_product else 20),
+            "product_rejection_reason": str(parsed.get("product_rejection_reason") or parsed.get("rejection_reason") or ""),
+        }
+
+    lowered = text.lower()
+    product_terms = {
+        "stand",
+        "mount",
+        "holder",
+        "bracket",
+        "tripod",
+        "camera",
+        "security camera",
+        "smart camera",
+        "light stand",
+        "ring light",
+        "clamp",
+        "arm",
+        "pole",
+        "hinge",
+        "magnetic",
+        "magsafe",
+        "desktop fixture",
+        "phone grip",
+        "stabilizer",
+        "rig",
+        "支架",
+        "灯架",
+        "夹具",
+        "夹子",
+        "伸缩杆",
+        "磁吸",
+        "转轴",
+        "云台",
+        "固定",
+    }
+    non_product_terms = {
+        "which camera",
+        "camera recommendation",
+        "beginner camera",
+        "入门相机",
+        "相机推荐",
+        "教程",
+        "guide",
+        "how to start",
+        "software",
+        "app",
+        "streaming tips",
+        "content creation advice",
+        "script writers",
+        "game streaming",
+        "设备配置",
+        "入门指导",
+    }
+    has_product = any(term in lowered for term in product_terms)
+    has_non_product = any(term in lowered for term in non_product_terms)
+    is_product = has_product and not has_non_product
+    return {
+        "is_product_opportunity": is_product,
+        "manufacturable_form": "实体支架/夹具/灯架类配件" if is_product else "",
+        "production_line_fit": "medium" if is_product else "none",
+        "buyer_context": "",
+        "purchase_signal": "",
+        "product_opportunity_score": 65 if is_product else 20,
+        "product_rejection_reason": "" if is_product else "不是明确的可制造实体产品机会，或更像推荐、教程、软件/内容需求。",
+    }
+
+
 def normalize_llm_requirement_analysis(parsed: dict[str, Any], title: str, body: str) -> dict[str, Any] | None:
     is_possible = bool(parsed.get("is_possible_requirement", parsed.get("is_requirement")))
     if not is_possible:
@@ -511,6 +618,7 @@ def normalize_llm_requirement_analysis(parsed: dict[str, Any], title: str, body:
             or "The post does not express a clear user problem or request worth deep research."
         )
         sample_analysis = str(parsed.get("sample_analysis") or parsed.get("analysis_summary") or "")
+        product = assess_product_opportunity(f"{title}\n{body}", parsed)
         return {
             "is_possible_requirement": False,
             "is_requirement": False,
@@ -519,6 +627,7 @@ def normalize_llm_requirement_analysis(parsed: dict[str, Any], title: str, body:
             "analysis_summary": sample_analysis,
             "sample_rejection_reason": sample_rejection_reason,
             "rejection_reason": sample_rejection_reason,
+            **product,
         }
     signals = parsed.get("signals")
     if not isinstance(signals, list) or not signals:
@@ -531,6 +640,7 @@ def normalize_llm_requirement_analysis(parsed: dict[str, Any], title: str, body:
         confidence = max(0.05, min(float(confidence), 0.98))
     except (TypeError, ValueError):
         confidence = 0.55
+    product = assess_product_opportunity(f"{title}\n{body}", parsed)
     return {
         "is_possible_requirement": True,
         "is_requirement": True,
@@ -545,6 +655,7 @@ def normalize_llm_requirement_analysis(parsed: dict[str, Any], title: str, body:
         "analysis_summary": str(parsed.get("sample_analysis") or parsed.get("analysis_summary") or ""),
         "sample_rejection_reason": str(parsed.get("sample_rejection_reason") or parsed.get("rejection_reason") or ""),
         "rejection_reason": str(parsed.get("sample_rejection_reason") or parsed.get("rejection_reason") or ""),
+        **product,
     }
 
 
@@ -637,6 +748,13 @@ def normalize_deep_research_synthesis(parsed: dict[str, Any]) -> dict[str, Any]:
             return []
         return [str(item) for item in value]
 
+    product = assess_product_opportunity(
+        " ".join(
+            str(parsed.get(key) or "")
+            for key in ["why_real", "market_gap", "recommended_next_step", "manufacturable_form", "buyer_context", "purchase_signal"]
+        ),
+        parsed,
+    )
     return {
         "final_decision": status,
         "confidence": round(confidence, 2),
@@ -647,6 +765,7 @@ def normalize_deep_research_synthesis(parsed: dict[str, Any]) -> dict[str, Any]:
         "existing_solutions": list_of_strings("existing_solutions"),
         "market_gap": str(parsed.get("market_gap") or ""),
         "recommended_next_step": str(parsed.get("recommended_next_step") or ""),
+        **product,
     }
 
 
@@ -950,6 +1069,8 @@ class DeepResearchAgent(BaseAgent):
         opportunities = infer_opportunities(requirement, evidence)
         validation = validate_requirement(requirement, evidence, scores, alternatives)
         synthesis = self._synthesize_research_decision(requirement, evidence, scores, validation, alternatives, active_research)
+        product_assessment = self._product_opportunity_assessment(requirement, evidence, synthesis)
+        synthesis = {**synthesis, **product_assessment}
         final_status = self._status_from_synthesis(synthesis, requirement, evidence, scores)
         validation["is_real_requirement"] = final_status != RequirementStatus.REJECTED
         if synthesis.get("why_real"):
@@ -978,6 +1099,7 @@ class DeepResearchAgent(BaseAgent):
                 "pain_intensity": classify_pain(scores["pain_intensity_score"]),
                 "willingness_to_pay_signals": find_payment_signals(evidence),
                 "product_opportunities": opportunities["product"],
+                "product_opportunity_assessment": product_assessment,
                 "content_opportunities": opportunities["content"],
                 "suggested_next_validation_step": synthesis.get("recommended_next_step") or next_validation_step(scores),
                 "llm_synthesis": synthesis,
@@ -1065,6 +1187,7 @@ class DeepResearchAgent(BaseAgent):
                     "scores": scores,
                     "active_research": active_research,
                     "llm_synthesis": synthesis,
+                    "product_opportunity_assessment": product_assessment,
                     "search_insight_id": insight_id,
                     "search_insight": search_insight,
                 },
@@ -1199,8 +1322,12 @@ class DeepResearchAgent(BaseAgent):
         ]
         system = (
             "You are a senior product research analyst. Synthesize cross-source evidence and decide whether a "
-            "requirement is validated, should be watched, needs more research, or should be rejected. Use the evidence, "
-            "not only numeric scores. Respond in Chinese (简体中文) for all text fields. Return only JSON."
+            "requirement is a validated sellable physical product opportunity, should be watched, needs more research, "
+            "or should be rejected. The business sells manufacturable hardware/accessories and wants opportunities "
+            "that can reuse phone stand, light stand, clamp, arm, pole, magnetic mount, hinge, desktop fixture, or "
+            "camera-support production capabilities. Reject pure advice, camera-buying recommendations, software/content "
+            "workflow, tutorials, and creator operation guidance even if the user pain is real. Use the evidence, not "
+            "only numeric scores. Respond in Chinese (简体中文) for all text fields. Return only JSON."
         )
         user = json.dumps(
             {
@@ -1229,6 +1356,13 @@ class DeepResearchAgent(BaseAgent):
                     "weakest_assumptions": ["最弱假设"],
                     "existing_solutions": ["已有解决方案或竞品"],
                     "market_gap": "现有方案缺口",
+                    "is_physical_product_opportunity": "是否是可制造实体产品机会",
+                    "manufacturable_form": "可落地产品形态；不是实体产品则为空",
+                    "production_line_fit": "high | medium | low | none",
+                    "buyer_context": "目标购买者与使用场景",
+                    "purchase_signal": "购买、替换、现有产品不满或愿意付费信号",
+                    "product_opportunity_score": "0 to 100",
+                    "product_rejection_reason": "如果不是产品机会，说明为什么",
                     "recommended_next_step": "下一步建议",
                 },
             },
@@ -1241,6 +1375,24 @@ class DeepResearchAgent(BaseAgent):
         synthesis = normalize_deep_research_synthesis(parsed)
         synthesis["decision_source"] = "llm"
         return {**fallback, **synthesis}
+
+    def _product_opportunity_assessment(
+        self,
+        requirement: RequirementRecord,
+        evidence: list[RawEvidence],
+        synthesis: dict[str, Any],
+    ) -> dict[str, Any]:
+        text = "\n".join(
+            [
+                requirement.canonical_requirement,
+                requirement.description,
+                str(synthesis.get("why_real") or ""),
+                str(synthesis.get("market_gap") or ""),
+                *[item.title for item in evidence[:8]],
+                *[item.body[:400] for item in evidence[:8]],
+            ]
+        )
+        return assess_product_opportunity(text, synthesis)
 
     def _status_from_synthesis(
         self,
@@ -1256,6 +1408,8 @@ class DeepResearchAgent(BaseAgent):
             "needs_more_research": RequirementStatus.WATCHING,
             "rejected": RequirementStatus.REJECTED,
         }.get(decision, self._status_from_scores(scores))
+        if status == RequirementStatus.VALIDATED and not synthesis.get("is_product_opportunity", False):
+            return RequirementStatus.REJECTED
         if not evidence:
             return RequirementStatus.REJECTED
         if (
