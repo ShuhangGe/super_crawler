@@ -91,6 +91,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "has_file": {"en": "has", "zh": "有"},
     "json_files": {"en": "JSON file(s). Enable OpenCLI in this group Settings, or put Reddit-like JSON files in the group input folder.", "zh": "个 JSON 文件。请在组设置中启用 OpenCLI，或将 Reddit 格式的 JSON 文件放入组输入文件夹。"},
     "no_input_loaded": {"en": "No input loaded.", "zh": "没有加载输入。"},
+    "no_search_files": {"en": "No search result files have been collected yet.", "zh": "还没有采集到搜索结果文件。"},
+    "wait_for_search_agent": {"en": "Keep the search agent running, or check the search agent log if this lasts too long.", "zh": "请保持搜索智能体运行；如果持续太久，请检查搜索智能体日志。"},
     "has_file_but_loaded": {"en": "has", "zh": "有"},
     "items_loaded_zero": {"en": "JSON file(s), but the latest run loaded 0 item(s).", "zh": "个 JSON 文件，但最近一次运行加载了 0 条数据。"},
     # -- search panel --
@@ -1100,6 +1102,12 @@ def task_group_diagnostic(storage: Storage, task_group: object, lang: str = "en"
             return (
                 f"<section class='notice warning'><strong>{t('no_input_collected', lang)}</strong> "
                 f"{t('opencli_disabled', lang)} {html.escape(task_group.input_dir)} {t('has_file', lang)} {file_count} {t('json_files', lang)}</section>"
+            )
+        if file_count == 0:
+            return (
+                f"<section class='notice warning'><strong>{t('no_search_files', lang)}</strong> "
+                f"{html.escape(task_group.input_dir)} {t('has_file', lang)} 0 {t('json_files', lang)} "
+                f"{t('wait_for_search_agent', lang)}</section>"
             )
         return (
             f"<section class='notice warning'><strong>{t('no_input_loaded', lang)}</strong> "

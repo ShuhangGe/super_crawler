@@ -294,6 +294,27 @@ class SystemTests(unittest.TestCase):
             self.assertNotIn("Full Experiment Payload", agent_html)
             self.assertNotIn("<th>ID</th><th>Time</th><th>Role</th><th>Agent</th>", agent_html)
 
+    def test_dashboard_distinguishes_empty_search_files_from_failed_input_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C product search",
+                task_type=TaskGroupType.DOMAIN,
+                domain="3C products",
+                input_dir=str(Path(directory) / "3c"),
+                enable_collector=True,
+            )
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+            storage.log_experiment(task_group.task_group_id, "run-1", "scheduler", "files_read", "Read 0 JSON file(s)", {"files": []})
+            storage.log_experiment(task_group.task_group_id, "run-1", "scheduler", "input_loaded", "Loaded 0 item(s)", {"items_loaded": 0, "items_skipped": 0})
+
+            html = home_page(storage, RuntimeController(Path(directory) / "test.sqlite3", input_dir=Path(directory) / "unused", interval_seconds=1))
+
+            self.assertIn("No search result files have been collected yet.", html)
+            self.assertNotIn("No input loaded.", html)
+            self.assertNotIn("but the latest run loaded 0 item(s)", html)
+
     def test_search_planner_expands_user_description_for_breadth_search(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
