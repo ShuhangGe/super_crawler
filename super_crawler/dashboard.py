@@ -127,13 +127,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "no_active_deep_research_agent": {"en": "No active deep research agent.", "zh": "没有活跃的深度研究智能体。"},
     "deep_research_consume": {"en": "Deep research agents consume requirements from the queue and produce conclusions.", "zh": "深度研究智能体从队列中消费需求并生成结论。"},
     # -- pipeline --
-    "saved_pipeline_snapshots": {"en": "Saved Pipeline Snapshots", "zh": "已保存的管道快照"},
-    "pipeline_snapshot_description": {"en": "Each finished cycle is saved for future evaluation.", "zh": "每个完成的循环都会保存以供将来评估。"},
+    "saved_pipeline_snapshots": {"en": "Pipeline Run Records", "zh": "管道运行记录"},
+    "pipeline_snapshot_description": {"en": "Only cycles with actual work are saved as lightweight records.", "zh": "只有发生实际工作的循环会保存为轻量运行记录。"},
     "pipeline": {"en": "Pipeline", "zh": "管道"},
     "status": {"en": "Status", "zh": "状态"},
     "summary": {"en": "Summary", "zh": "摘要"},
     "completed": {"en": "Completed", "zh": "完成时间"},
-    "no_pipeline_snapshot": {"en": "No completed pipeline snapshot yet. Click Run Once to create one.", "zh": "尚无已完成的管道快照。点击 Run Once 创建一个。"},
+    "no_pipeline_snapshot": {"en": "No completed pipeline run record yet.", "zh": "尚无已完成的管道运行记录。"},
     # -- requirement list pages --
     "each_row_preserves": {"en": "Each row preserves the whole line from requirement search to conclusion so it can be evaluated later.", "zh": "每行保留了从需求搜索到结论的完整链路，以便后续评估。"},
     "ungrouped_legacy": {"en": "Ungrouped / Legacy", "zh": "未分组 / 历史数据"},
@@ -161,7 +161,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "research_runs": {"en": "research run(s)", "zh": "次研究运行"},
     "reason": {"en": "Reason", "zh": "原因"},
     "no_saved_snapshot": {"en": "No saved snapshot yet", "zh": "尚无保存的快照"},
-    "pipeline_snapshot_link": {"en": "Pipeline Snapshot", "zh": "管道快照"},
+    "pipeline_snapshot_link": {"en": "Pipeline Run", "zh": "管道运行"},
     "move_to_todo": {"en": "Move to todo list", "zh": "移至待办"},
     "todo_status": {"en": "Todo", "zh": "待办"},
     # -- todo page --
@@ -295,7 +295,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "requirement_samples_desc": {"en": "One short sentence for every requirement generated or updated by requirement memory.", "zh": "需求记忆生成或更新的每个需求的短句。"},
     "no_requirement_samples": {"en": "No requirement samples yet.", "zh": "尚无需求样本。"},
     # -- pipeline page --
-    "pipeline_snapshot": {"en": "Pipeline Snapshot", "zh": "管道快照"},
+    "pipeline_snapshot": {"en": "Pipeline Run", "zh": "管道运行"},
     "cycle_result": {"en": "Cycle Result", "zh": "循环结果"},
     "requirement_snapshot": {"en": "Requirement Snapshot", "zh": "需求快照"},
     "agent_log_snapshot": {"en": "Agent Log Snapshot", "zh": "智能体日志快照"},
@@ -1723,12 +1723,6 @@ def requirement_experiment_logs(storage: Storage, requirement: object, role: str
 
 
 def latest_pipeline_for_requirement(storage: Storage, requirement_id: str, lang: str = "en") -> str:
-    for pipeline in storage.list_pipeline_runs(30):
-        snapshot = storage.get_pipeline_run(str(pipeline["pipeline_run_id"]))
-        if not snapshot:
-            continue
-        if any(item.get("requirement_id") == requirement_id for item in snapshot["requirement_snapshot"]):
-            return f"<a class='agent-chip' href='/pipeline?id={html.escape(str(pipeline['pipeline_run_id']))}'>{t('pipeline_snapshot_link', lang)}</a>"
     return f"<span class='muted'>{t('no_saved_snapshot', lang)}</span>"
 
 
@@ -2425,30 +2419,6 @@ def pipeline_page(storage: Storage, pipeline_run_id: str, lang: str = "en") -> s
     pipeline = storage.get_pipeline_run(pipeline_run_id)
     if pipeline is None:
         return f"<h1>{t('pipeline_not_found', lang)}</h1>"
-    requirements = pipeline["requirement_snapshot"]
-    logs = pipeline["agent_log_snapshot"]
-    req_rows = "".join(
-        f"""
-        <tr>
-          <td>{html.escape(str(item['requirement_id']))}</td>
-          <td>{html.escape(str(item['canonical_requirement']))}</td>
-          <td>{html.escape(str(item['status']))}</td>
-          <td>{html.escape(str(item['evidence_count']))}</td>
-        </tr>
-        """
-        for item in requirements
-    )
-    log_rows = "".join(
-        f"""
-        <tr>
-          <td>{html.escape(str(item['completed_at'] or item['started_at']))}</td>
-          <td>{html.escape(str(item['agent_role']))}</td>
-          <td>{html.escape(str(item['task_id']))}</td>
-          <td>{html.escape(str(item['status']))}</td>
-        </tr>
-        """
-        for item in logs[:30]
-    )
     return f"""
     <h1>{t('pipeline_snapshot', lang)}</h1>
     <p><span class="status">{html.escape(str(pipeline['status']))}</span> {html.escape(str(pipeline['pipeline_run_id']))}</p>
@@ -2456,12 +2426,6 @@ def pipeline_page(storage: Storage, pipeline_run_id: str, lang: str = "en") -> s
     <div class="linkbar"><a href="/">{t('nav_running_status', lang)}</a><a href="/possible">{t('nav_possible', lang)}</a><a href="/rejected">{t('nav_rejected', lang)}</a></div>
     <h2>{t('cycle_result', lang)}</h2>
     <pre>{html.escape(json.dumps(pipeline['result'], indent=2, default=str))}</pre>
-    <h2>{t('requirement_snapshot', lang)}</h2>
-    <table><thead><tr><th>{t('id', lang)}</th><th>{t('requirement_label', lang)}</th><th>{t('status', lang)}</th><th>{t('evidence', lang)}</th></tr></thead><tbody>{req_rows}</tbody></table>
-    <h2>{t('agent_log_snapshot', lang)}</h2>
-    <table><thead><tr><th>{t('time', lang)}</th><th>{t('agent', lang)}</th><th>{t('task', lang)}</th><th>{t('status', lang)}</th></tr></thead><tbody>{log_rows}</tbody></table>
-    <h2>{t('full_snapshot', lang)}</h2>
-    <pre>{html.escape(json.dumps(pipeline, indent=2, default=str))}</pre>
     """
 
 

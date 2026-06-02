@@ -1170,9 +1170,6 @@ class Storage:
         result: dict[str, Any],
         summary: str,
     ) -> None:
-        requirements = [asdict(item) for item in self.list_requirements()]
-        queue = self.list_queue()
-        logs = self.list_activity_logs(50)
         self.conn.execute(
             """
             INSERT INTO pipeline_runs (
@@ -1195,9 +1192,9 @@ class Storage:
                 completed_at,
                 status,
                 json.dumps(result, sort_keys=True),
-                json.dumps(requirements, default=str, sort_keys=True),
-                json.dumps(queue, default=str, sort_keys=True),
-                json.dumps(logs, default=str, sort_keys=True),
+                "[]",
+                "[]",
+                "[]",
                 summary,
             ),
         )

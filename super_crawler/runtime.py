@@ -136,15 +136,18 @@ class RuntimeController:
                     runner = AlwaysOnRunner(storage, self.input_dir, self.interval_seconds)
                     result = getattr(runner, runner_method)(*runner_args)
                     completed_at = utc_now()
-                    pipeline_run_id = f"pipe_{worker_name}_{self._safe_time_id(completed_at)}_{self._cycle_count + 1}"
-                    storage.save_pipeline_run(
-                        pipeline_run_id=pipeline_run_id,
-                        started_at=started_at,
-                        completed_at=completed_at,
-                        status="completed",
-                        result={**result, "worker": worker_name},
-                        summary=self._summary(result),
-                    )
+                    if self._should_persist_worker_result(result):
+                        pipeline_run_id = f"pipe_{worker_name}_{self._safe_time_id(completed_at)}_{self._cycle_count + 1}"
+                        storage.save_pipeline_run(
+                            pipeline_run_id=pipeline_run_id,
+                            started_at=started_at,
+                            completed_at=completed_at,
+                            status="completed",
+                            result={**result, "worker": worker_name},
+                            summary=self._summary(result),
+                        )
+                    else:
+                        pipeline_run_id = None
                     result = {**result, "pipeline_run_id": pipeline_run_id, "worker": worker_name}
                 with self._lock:
                     self._cycle_count += 1
@@ -194,6 +197,20 @@ class RuntimeController:
             f"changed {result.get('requirements_changed', 0)} requirement(s), reopened {result.get('reopened', 0)}, "
             f"research run {result.get('research_run') or 'none'}."
         )
+
+    def _should_persist_worker_result(self, result: dict[str, Any]) -> bool:
+        if result.get("error"):
+            return True
+        if result.get("research_run") or result.get("research_runs"):
+            return True
+        numeric_keys = [
+            "items_loaded",
+            "candidates",
+            "requirements_changed",
+            "reopened",
+            "task_group_runs",
+        ]
+        return any(int(result.get(key) or 0) > 0 for key in numeric_keys)
 
     def _safe_time_id(self, value: str) -> str:
         return (

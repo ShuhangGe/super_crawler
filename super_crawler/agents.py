@@ -177,7 +177,7 @@ class DiscoveryAgent(BaseAgent):
                 language=item.get("language", "en"),
                 geo_hints=infer_geo(text, item.get("subreddit", "")),
                 matched_patterns=matched,
-                raw_payload=item,
+                raw_payload=compact_evidence_payload(item),
                 task_group_id=task_group_id or item.get("task_group_id"),
                 task_group_run_id=task_group_run_id or item.get("task_group_run_id"),
             )
@@ -351,6 +351,44 @@ def search_relevance_check(item: dict[str, Any]) -> dict[str, Any]:
     if query_terms and any(term in haystack for term in query_terms[:8]):
         return {"is_relevant": True, "reason": "Post matches the search query terms."}
     return {"is_relevant": True, "reason": "No strict relevance gate applies to this search context."}
+
+
+def compact_evidence_payload(item: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "source",
+        "source_url",
+        "post_id",
+        "comment_id",
+        "subreddit",
+        "author_metadata_allowed",
+        "score",
+        "comment_count",
+        "created_at",
+        "language",
+        "search_agent_id",
+        "search_agent_index",
+        "search_query",
+        "search_subreddit",
+        "search_strategy",
+        "search_source",
+        "deep_research_question",
+        "task_group_id",
+        "task_group_run_id",
+    ]
+    return {key: item[key] for key in keys if key in item and item[key] not in (None, "")}
+
+
+def compact_analysis_payload(analysis: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "is_relevant_evidence",
+        "evidence_summary",
+        "user_need",
+        "pain_level",
+        "confidence",
+        "signals",
+        "rejection_reason",
+    ]
+    return {key: analysis[key] for key in keys if key in analysis}
 
 
 def normalize_llm_requirement_analysis(parsed: dict[str, Any], title: str, body: str) -> dict[str, Any] | None:
@@ -1514,7 +1552,7 @@ class DeepResearchAgent(BaseAgent):
             language=str(item.get("language") or "en"),
             geo_hints=geo_hints,
             matched_patterns=signals,
-            raw_payload={**item, "deep_research_analysis": analysis},
+            raw_payload={**compact_evidence_payload(item), "deep_research_analysis": compact_analysis_payload(analysis)},
             task_group_id=item.get("task_group_id"),
             task_group_run_id=item.get("task_group_run_id"),
         )

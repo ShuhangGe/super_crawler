@@ -234,7 +234,11 @@ class AlwaysOnRunner:
             "scheduler",
             "input_loaded",
             f"Loaded {len(scan['items'])} item(s) from {task_group.input_dir}",
-            {"items_loaded": len(scan["items"]), "items_skipped": scan["items_skipped"], "collection_result": collection_result},
+            {
+                "items_loaded": len(scan["items"]),
+                "items_skipped": scan["items_skipped"],
+                "collection_result": summarize_collection_result(collection_result),
+            },
         )
         if scan["items_skipped"]:
             self.storage.log_experiment(
@@ -490,7 +494,7 @@ class AlwaysOnRunner:
                 "discovery",
                 "search_agent_completed",
                 f"{search_agent['agent_id']} collected {search_agent['items_collected']} item(s) for query: {search_agent['query']}",
-                search_agent,
+                summarize_search_agent_result(search_agent),
             )
         self.storage.log_experiment(
             task_group.task_group_id,
@@ -498,7 +502,7 @@ class AlwaysOnRunner:
             "collector",
             "reddit_opencli_collected",
             f"Collected {result['items_collected']} Reddit item(s) with OpenCLI",
-            result,
+            summarize_collection_result(result) or {},
         )
         return result
 
@@ -546,6 +550,39 @@ def parse_int(value: object, default: int) -> int:
         return int(str(value))
     except (TypeError, ValueError):
         return default
+
+
+def summarize_collection_result(result: dict[str, object] | None) -> dict[str, object] | None:
+    if result is None:
+        return None
+    summary: dict[str, object] = {
+        "queries": list(result.get("queries", []))[:20] if isinstance(result.get("queries"), list) else result.get("queries"),
+        "items_collected": result.get("items_collected", 0),
+        "limit_per_query": result.get("limit_per_query"),
+    }
+    if result.get("error"):
+        summary["error"] = result.get("error")
+    search_agents = result.get("search_agents")
+    if isinstance(search_agents, list):
+        summary["search_agents"] = [
+            summarize_search_agent_result(item) for item in search_agents if isinstance(item, dict)
+        ]
+    return summary
+
+
+def summarize_search_agent_result(result: dict[str, object]) -> dict[str, object]:
+    return {
+        "agent_id": result.get("agent_id"),
+        "query": result.get("query"),
+        "subreddit": result.get("subreddit", ""),
+        "strategy": result.get("strategy", ""),
+        "items_collected": result.get("items_collected", 0),
+        "output_path": result.get("output_path", ""),
+        "urls": list(result.get("urls", []))[:20] if isinstance(result.get("urls"), list) else [],
+        "titles": list(result.get("titles", []))[:20] if isinstance(result.get("titles"), list) else [],
+        "started_at": result.get("started_at"),
+        "completed_at": result.get("completed_at"),
+    }
 
 
 def allocate_search_slots(group_count: int, max_search_agents: int) -> list[int]:

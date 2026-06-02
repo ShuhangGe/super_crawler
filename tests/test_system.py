@@ -1181,7 +1181,7 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Prepare follow-up validation", todo_html)
             self.assertIn("Todo: open", possible_html)
 
-    def test_runtime_saves_pipeline_snapshot(self) -> None:
+    def test_runtime_saves_lightweight_pipeline_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
             storage = Storage(db_path)
@@ -1196,9 +1196,27 @@ class SystemTests(unittest.TestCase):
             storage = Storage(db_path)
             self.assertIn("pipeline_run_id", result)
             self.assertEqual(len(storage.list_pipeline_runs()), 1)
-            snapshot = storage.get_pipeline_run(result["pipeline_run_id"])
-            self.assertIsNotNone(snapshot)
-            self.assertTrue(snapshot["requirement_snapshot"])
+            record = storage.get_pipeline_run(result["pipeline_run_id"])
+            self.assertIsNotNone(record)
+            self.assertEqual(record["requirement_snapshot"], [])
+            self.assertEqual(record["queue_snapshot"], [])
+            self.assertEqual(record["agent_log_snapshot"], [])
+
+    def test_empty_worker_cycle_does_not_write_pipeline_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=1)
+            result = controller._should_persist_worker_result(
+                {
+                    "items_loaded": 0,
+                    "candidates": 0,
+                    "requirements_changed": 0,
+                    "reopened": 0,
+                    "research_run": None,
+                    "research_runs": "",
+                }
+            )
+            self.assertFalse(result)
 
     def test_task_group_run_only_reconciles_current_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
