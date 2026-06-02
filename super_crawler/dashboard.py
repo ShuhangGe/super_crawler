@@ -666,6 +666,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "max_report_agents": parse_int(query.get("max_report_agents", ["1"])[0], 1),
             }
         )
+        self.app_controller.sync_deep_research_workers()
         self.send_response(303)
         self.send_header("Location", quote("/", safe="/:?#"))
         self.end_headers()
@@ -950,17 +951,14 @@ def allocate_search_slots_for_dashboard(group_count: int, max_search_agents: int
 
 def deep_research_agent_cards(storage: Storage, task_group: object, requirements: list[object], lang: str = "en") -> str:
     active_rows = active_deep_research_rows(storage, requirements)
-    queue_rows = task_group_queue_rows(storage, task_group, requirements)
-    if not active_rows and not queue_rows:
+    if not active_rows:
         return f"<p class='muted'>{t('no_active_deep_research', lang)}</p>"
     max_agents = max(int(storage.get_resource_config().get("max_deep_research_agents", 1)), 0)
     if max_agents == 0:
         return f"<p class='muted'>{t('deep_research_disabled', lang)}</p>"
-    queue_rows = sorted(queue_rows, key=lambda row: -int(row.get("priority", 0)))
-    rows = active_rows + queue_rows
     return "".join(
         deep_research_agent_card(row, index, active_slot=True, lang=lang)
-        for index, row in enumerate(rows[:max_agents], start=1)
+        for index, row in enumerate(active_rows[:max_agents], start=1)
     )
 
 

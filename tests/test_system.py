@@ -774,7 +774,7 @@ class SystemTests(unittest.TestCase):
             self.assertIn("broken query", failed_agent)
             self.assertIn("No SW", failed_agent)
 
-    def test_queued_requirements_show_deep_research_agent_slot(self) -> None:
+    def test_queued_requirements_show_queue_without_fake_agent_slot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
             storage = Storage(db_path)
@@ -809,9 +809,10 @@ class SystemTests(unittest.TestCase):
 
             self.assertIn("Possible Requirements Waiting For Deep Research", html)
             self.assertIn("client photo galleries", html)
-            self.assertIn("Deep Research Agent 1", html)
-            self.assertIn(">queued<", html)
-            self.assertIn("Assigned to a deep research slot", html)
+            self.assertIn("Next requirement", html)
+            self.assertIn(changed[0].requirement_id, html)
+            self.assertIn("No active deep research agent for this group.", html)
+            self.assertNotIn("Assigned to a deep research slot", html)
 
             queued_log_html = agent_log_page(storage, "deep_research", "", changed[0].requirement_id)
             self.assertIn("Deep Research Log", queued_log_html)
@@ -1795,6 +1796,73 @@ class SystemTests(unittest.TestCase):
             self.assertTrue(status["workers"]["deep_research_1"])
             self.assertTrue(status["workers"]["deep_research_2"])
             self.assertTrue(status["workers"]["deep_research_3"])
+
+    def test_runtime_sync_adds_deep_workers_after_resource_increase(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            storage.update_resource_config({"max_deep_research_agents": 1})
+            storage.close()
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=60)
+
+            self.assertTrue(controller.start())
+            with Storage(db_path) as storage:
+                storage.update_resource_config({"max_deep_research_agents": 3})
+            workers = controller.sync_deep_research_workers()
+            status = controller.status()
+            controller.stop()
+
+            self.assertTrue(workers["deep_research_1"])
+            self.assertTrue(workers["deep_research_2"])
+            self.assertTrue(workers["deep_research_3"])
+            self.assertTrue(status["workers"]["deep_research_2"])
+            self.assertTrue(status["workers"]["deep_research_3"])
+
+    def test_runtime_start_requeues_stale_researching_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group("Photo", TaskGroupType.DOMAIN, "photo", str(Path(directory) / "photo"))
+            storage.upsert_requirement(
+                RequirementRecord(
+                    requirement_id="req-stale",
+                    canonical_requirement="Users need better camera lighting",
+                    description="Need validation.",
+                    status=RequirementStatus.RESEARCHING,
+                    first_seen=utc_now(),
+                    last_seen=utc_now(),
+                    times_detected=1,
+                    evidence_count=1,
+                    subreddit_count=1,
+                    geo_distribution=[],
+                    audience_segments=[],
+                    current_scores={},
+                    previous_scores={},
+                    research_history=[],
+                    decision_history=[],
+                    reopen_events=[],
+                    latest_recommendation=None,
+                    assigned_to="research-agent-1",
+                    task_group_ids=[task_group.task_group_id],
+                )
+            )
+            storage.update_resource_config({"max_deep_research_agents": 0})
+            storage.close()
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=60)
+
+            self.assertTrue(controller.start())
+            controller.stop()
+            storage = Storage(db_path)
+            requirement = storage.get_requirement("req-stale")
+            queue = storage.list_queue()
+
+            self.assertIsNotNone(requirement)
+            self.assertEqual(requirement.status, RequirementStatus.QUEUED_FOR_RESEARCH)
+            self.assertIsNone(requirement.assigned_to)
+            self.assertEqual(len(queue), 1)
+            self.assertEqual(queue[0]["requirement_id"], "req-stale")
 
     def test_runner_separates_discovery_from_deep_research_queue(self) -> None:
         class RecordingRunner(AlwaysOnRunner):

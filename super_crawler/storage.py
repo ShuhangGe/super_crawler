@@ -33,6 +33,8 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA busy_timeout = 30000")
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
 
     def __enter__(self) -> Storage:
         return self
@@ -753,6 +755,37 @@ class Storage:
             (priority, utc_now(), requirement_id),
         )
         self.conn.commit()
+
+    def recover_researching_requirements(self, reason: str = "runtime restart recovery") -> int:
+        rows = self.conn.execute(
+            "SELECT * FROM requirements WHERE status=?",
+            (RequirementStatus.RESEARCHING.value,),
+        ).fetchall()
+        recovered = 0
+        for row in rows:
+            requirement = self._from_row(RequirementRecord, row)
+            previous_agent = requirement.assigned_to
+            requirement.status = RequirementStatus.QUEUED_FOR_RESEARCH
+            requirement.assigned_to = None
+            requirement.decision_history.append(
+                {
+                    "at": utc_now(),
+                    "decision": "requeued_from_researching",
+                    "reason": reason,
+                    "previous_agent": previous_agent,
+                }
+            )
+            self.upsert_requirement(requirement)
+            self.enqueue_research(
+                requirement.requirement_id,
+                max(int(requirement.current_scores.get("overall_score", 0) or 0), 1),
+                reason,
+                0,
+                RequirementStatus.RESEARCHING.value,
+                requirement.task_group_ids[-1] if requirement.task_group_ids else None,
+            )
+            recovered += 1
+        return recovered
 
     def update_requirement_status(self, requirement_id: str, status: RequirementStatus, reason: str) -> None:
         requirement = self.get_requirement(requirement_id)

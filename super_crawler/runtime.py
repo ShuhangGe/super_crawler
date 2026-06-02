@@ -31,29 +31,23 @@ class RuntimeController:
             if any(thread.is_alive() for thread in self._threads.values()):
                 return False
             self._stop_event.clear()
-            deep_worker_count = self._deep_research_worker_count()
+            with Storage(self.db_path) as storage:
+                storage.migrate()
+                recovered = storage.recover_researching_requirements()
             self._threads = {
                 "discovery": threading.Thread(target=self._run_discovery_loop, name="discovery-runtime", daemon=True),
             }
-            self._threads.update(
-                {
-                    f"deep_research_{index}": threading.Thread(
-                        target=self._run_deep_research_loop,
-                        args=(index,),
-                        name=f"deep-research-runtime-{index}",
-                        daemon=True,
-                    )
-                    for index in range(1, deep_worker_count + 1)
-                }
-            )
-            for thread in self._threads.values():
-                thread.start()
+            self._ensure_deep_research_workers_locked()
+            for name, thread in self._threads.items():
+                if name == "discovery":
+                    thread.start()
             self._record(
                 "started",
                 {
                     "input_dir": str(self.input_dir),
                     "interval_seconds": self.interval_seconds,
-                    "deep_research_workers": deep_worker_count,
+                    "deep_research_workers": self._deep_research_worker_count(),
+                    "recovered_researching": recovered,
                 },
             )
             return True
@@ -89,6 +83,15 @@ class RuntimeController:
                 "input_dir": str(self.input_dir),
                 "interval_seconds": self.interval_seconds,
             }
+
+    def sync_deep_research_workers(self) -> dict[str, bool]:
+        with self._lock:
+            if self._stop_event.is_set() or not any(thread.is_alive() for thread in self._threads.values()):
+                return {}
+            self._ensure_deep_research_workers_locked()
+            workers = {name: thread.is_alive() for name, thread in self._threads.items() if name.startswith("deep_research_")}
+            self._record("deep_research_workers_synced", {"workers": workers})
+            return workers
 
     def run_once(self) -> dict[str, Any]:
         started_at = utc_now()
@@ -129,10 +132,16 @@ class RuntimeController:
 
     def _run_worker_loop(self, worker_name: str, interval_seconds: int, runner_method: str, *runner_args: str) -> None:
         while not self._stop_event.is_set():
+            if worker_name.startswith("deep_research_"):
+                try:
+                    worker_index = int(worker_name.rsplit("_", 1)[1])
+                except ValueError:
+                    worker_index = 1
+                if worker_index > self._deep_research_worker_count():
+                    break
             started_at = utc_now()
             try:
                 with Storage(self.db_path) as storage:
-                    storage.migrate()
                     runner = AlwaysOnRunner(storage, self.input_dir, self.interval_seconds)
                     result = getattr(runner, runner_method)(*runner_args)
                     completed_at = utc_now()
@@ -187,6 +196,21 @@ class RuntimeController:
                 return max(int(storage.get_resource_config().get("max_deep_research_agents", 1)), 0)
         except Exception:
             return 1
+
+    def _ensure_deep_research_workers_locked(self) -> None:
+        for index in range(1, self._deep_research_worker_count() + 1):
+            name = f"deep_research_{index}"
+            thread = self._threads.get(name)
+            if thread is not None and thread.is_alive():
+                continue
+            thread = threading.Thread(
+                target=self._run_deep_research_loop,
+                args=(index,),
+                name=f"deep-research-runtime-{index}",
+                daemon=True,
+            )
+            self._threads[name] = thread
+            thread.start()
 
     def _record(self, event: str, detail: dict[str, Any]) -> None:
         self._events.appendleft({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event, "detail": detail})
