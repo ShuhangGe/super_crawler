@@ -167,7 +167,7 @@ class OpenCliRedditCollector:
         }
 
     def search(self, query: str, limit: int = 25, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, Any]:
-        command = [*shlex.split(self.command), query, "--limit", str(limit), "-f", "json"]
+        command = with_background_browser_options([*shlex.split(self.command), query, "--limit", str(limit), "-f", "json"])
         if subreddit:
             command.extend(["--subreddit", subreddit])
         if sort:
@@ -207,28 +207,28 @@ class OpenCliSourceRouter:
             return result
         if source_key == "youtube":
             return self._search_opencli(
-                ["opencli", "youtube", "search", query, "--limit", str(limit), "-f", "json"],
+                with_background_browser_options(["opencli", "youtube", "search", query, "--limit", str(limit), "-f", "json"]),
                 query,
                 normalize_youtube_item,
                 "youtube",
             )
         if source_key == "google_web":
             return self._search_opencli(
-                ["opencli", "google", "search", query, "--limit", str(limit), "-f", "json"],
+                with_background_browser_options(["opencli", "google", "search", query, "--limit", str(limit), "-f", "json"]),
                 query,
                 normalize_web_search_item,
                 "google_web",
             )
         if source_key in {"amazon", "product_reviews"}:
             return self._search_opencli(
-                ["opencli", "amazon", "search", query, "--limit", str(limit), "-f", "json"],
+                with_background_browser_options(["opencli", "amazon", "search", query, "--limit", str(limit), "-f", "json"]),
                 query,
                 normalize_amazon_item,
                 "amazon",
             )
         if source_key == "producthunt":
             return self._search_opencli(
-                ["opencli", "producthunt", "posts", "--limit", str(limit), "-f", "json"],
+                with_background_browser_options(["opencli", "producthunt", "posts", "--limit", str(limit), "-f", "json"]),
                 query,
                 normalize_producthunt_item,
                 "producthunt",
@@ -330,6 +330,19 @@ def run_opencli_command(command: list[str], timeout_seconds: int) -> subprocess.
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "opencli command failed").strip())
     return completed
+
+
+def with_background_browser_options(command: list[str]) -> list[str]:
+    if not command or Path(command[0]).name != "opencli":
+        return command
+    result = list(command)
+    if "--window" not in result:
+        result.extend(["--window", "background"])
+    if "--site-session" not in result:
+        result.extend(["--site-session", "ephemeral"])
+    if "--keep-tab" not in result:
+        result.extend(["--keep-tab", "false"])
+    return result
 
 
 def normalize_source_key(source: str) -> str:

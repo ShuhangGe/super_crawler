@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from super_crawler.agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, ReportAgent, RequirementMemoryAgent, normalize_llm_requirement_analysis, search_relevance_check
 from super_crawler.collectors import OpenCliRedditCollector, OpenCliSourceRouter, build_requirement_search_queries, normalize_reddit_item, parse_opencli_output
-from super_crawler.dashboard import agent_log_page, detail_page, experiment_log_page, filter_requirements_by_group, grouped_requirement_lineage, home_page, possible_requirements, rejected_requirements, requirement_list_page, visible_task_groups, search_agent_count_for_group, todo_page
+from super_crawler.dashboard import agent_log_page, detail_page, experiment_log_page, filter_requirements_by_group, grouped_requirement_lineage, home_page, layout, possible_requirements, rejected_requirements, requirement_list_page, visible_task_groups, search_agent_count_for_group, todo_page
 from super_crawler.models import RawEvidence, RequirementRecord, RequirementStatus, ResearchRun, TaskGroupStatus, TaskGroupType, utc_now
 from super_crawler.runner import AlwaysOnRunner, DeviceHealth, allocate_search_slots, plan_adaptive_resources
 from super_crawler.runtime import RuntimeController
@@ -238,6 +238,10 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Sports Search Settings", html)
             self.assertIn("OpenCLI Collection", html)
             self.assertIn("Results per run", html)
+
+            page_html = layout(html)
+            self.assertIn("startDashboardPolling", page_html)
+            self.assertIn("refreshDashboardMain", page_html)
 
             self.assertIn("<summary>Advanced</summary>", html)
             self.assertIn('name="model_search"', html)
@@ -1972,9 +1976,11 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(google["items"][0]["source"], "google_web_opencli")
         self.assertEqual(amazon["items"][0]["source"], "amazon_opencli")
         self.assertEqual(reddit["items"][0]["source"], "reddit_opencli")
-        self.assertIn(["opencli", "youtube", "search", "camera review", "--limit", "1", "-f", "json"], calls)
-        self.assertIn(["opencli", "google", "search", "camera guide", "--limit", "1", "-f", "json"], calls)
-        self.assertIn(["opencli", "amazon", "search", "camera product", "--limit", "1", "-f", "json"], calls)
+        browser_options = ["--window", "background", "--site-session", "ephemeral", "--keep-tab", "false"]
+        self.assertIn(["opencli", "youtube", "search", "camera review", "--limit", "1", "-f", "json", *browser_options], calls)
+        self.assertIn(["opencli", "google", "search", "camera guide", "--limit", "1", "-f", "json", *browser_options], calls)
+        self.assertIn(["opencli", "amazon", "search", "camera product", "--limit", "1", "-f", "json", *browser_options], calls)
+        self.assertIn(["opencli", "reddit", "search", "camera reddit", "--limit", "1", "-f", "json", *browser_options], calls)
 
     def test_search_slots_and_query_variants_support_multiple_agents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

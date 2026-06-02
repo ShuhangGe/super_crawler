@@ -840,7 +840,50 @@ def layout(content: str, lang: str = "en") -> str:
       if (type) {{
         type.addEventListener("change", updateTaskCreateFields);
       }}
+      startDashboardPolling();
     }});
+    function dashboardCanRefresh() {{
+      if (window.location.pathname !== "/") {{
+        return false;
+      }}
+      var active = document.activeElement;
+      if (active && ["INPUT", "SELECT", "TEXTAREA"].indexOf(active.tagName) !== -1) {{
+        return false;
+      }}
+      if (document.querySelector("details[open]")) {{
+        return false;
+      }}
+      return true;
+    }}
+    async function refreshDashboardMain() {{
+      if (!dashboardCanRefresh()) {{
+        return;
+      }}
+      try {{
+        var response = await fetch(window.location.pathname + window.location.search, {{
+          headers: {{"X-Dashboard-Poll": "1"}},
+          cache: "no-store"
+        }});
+        if (!response.ok) {{
+          return;
+        }}
+        var text = await response.text();
+        var parsed = new DOMParser().parseFromString(text, "text/html");
+        var nextMain = parsed.querySelector("main");
+        var currentMain = document.querySelector("main");
+        if (nextMain && currentMain) {{
+          currentMain.innerHTML = nextMain.innerHTML;
+          updateTaskCreateFields();
+        }}
+      }} catch (error) {{
+        return;
+      }}
+    }}
+    function startDashboardPolling() {{
+      if (window.location.pathname === "/") {{
+        window.setInterval(refreshDashboardMain, 3000);
+      }}
+    }}
   </script>
 </head>
 <body>
