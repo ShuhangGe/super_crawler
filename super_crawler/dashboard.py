@@ -2002,7 +2002,7 @@ def terminal_log_stream(activity_logs: list[dict[str, object]], experiment_logs:
 
 
 def readable_log_sections(activity_logs: list[dict[str, object]], experiment_logs: list[dict[str, object]], lang: str = "en") -> str:
-    search_blocks = [readable_search_agent_block(item, lang=lang) for item in experiment_logs if item.get("step_name") == "search_agent_completed"]
+    search_blocks = [readable_search_agent_block(item, lang=lang) for item in experiment_logs if item.get("step_name") in {"search_agent_completed", "search_agent_failed"}]
     analysis_blocks = [readable_item_analysis_block(item, lang=lang) for item in experiment_logs if item.get("step_name") in {"item_analyzed", "sample_analyzed"}]
     lifecycle_blocks = [readable_lifecycle_block(item, lang=lang) for item in experiment_logs if item.get("step_name") in {"requirements_generated", "pool_requirement_sample", "requirements_queued", "deep_research_output", "run_completed"}]
     activity_blocks = [readable_activity_block(item, lang=lang) for item in activity_logs]
@@ -2017,7 +2017,7 @@ def readable_search_log_sections(experiment_logs: list[dict[str, object]], lang:
         item for item in experiment_logs if item.get("step_name") == "search_plan_created"
     )
     search_entries = unique_search_log_entries(
-        item for item in experiment_logs if item.get("step_name") == "search_agent_completed"
+        item for item in experiment_logs if item.get("step_name") in {"search_agent_completed", "search_agent_failed"}
     )
     analysis_entries = unique_search_log_entries(
         item for item in experiment_logs if item.get("step_name") in {"item_analyzed", "sample_analyzed"}
@@ -2306,10 +2306,12 @@ def readable_search_agent_block(item: dict[str, object], lang: str = "en") -> st
     return f"""
     <section class="readable-block">
       <h3>{html.escape(str(payload.get('agent_id', item.get('agent_role', t('search_agent', lang)))))}</h3>
+      <div><strong>{t('status', lang)}:</strong> {html.escape(str(payload.get('status', 'completed')))}</div>
       <div><strong>{t('query', lang)}:</strong> {html.escape(str(payload.get('query', '')))}</div>
       <div><strong>{t('subreddit', lang)}:</strong> {html.escape(str(payload.get('subreddit', '') or t('all_reddit', lang)))}</div>
       <div><strong>{t('strategy', lang)}:</strong> {html.escape(str(payload.get('strategy', '')))}</div>
       <div><strong>{t('items_collected', lang)}:</strong> {html.escape(str(payload.get('items_collected', 0)))}</div>
+      {f"<div><strong>Error:</strong> {html.escape(str(payload.get('error', '')))}</div>" if payload.get('error') else ""}
       <div><strong>{t('output_file', lang)}:</strong> {html.escape(str(payload.get('output_path', '')))}</div>
       <ul class="url-list">{url_rows}</ul>
     </section>

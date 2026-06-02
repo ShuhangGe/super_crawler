@@ -473,27 +473,35 @@ class AlwaysOnRunner:
             )
             return {"error": str(exc)}
         for search_agent in result["search_agents"]:
+            status = str(search_agent.get("status") or "completed")
+            error = str(search_agent.get("error") or "") or None
             self.storage.log_activity(
                 AgentActivityLog(
                     agent_id=str(search_agent["agent_id"]),
                     agent_role="discovery",
                     task_id="reddit_opencli_search",
-                    status="completed",
+                    status=status,
                     started_at=search_agent["started_at"],
                     completed_at=search_agent["completed_at"],
                     input_refs=[task_group.task_group_id, task_group_run_id, str(search_agent["query"])],
                     output_refs=[str(search_agent["output_path"]), *[str(url) for url in search_agent.get("urls", [])]],
-                    error=None,
+                    error=error,
                     retry_count=0,
                     cost_estimate=0.0,
                 )
+            )
+            step_name = "search_agent_failed" if status == "failed" else "search_agent_completed"
+            message = (
+                f"{search_agent['agent_id']} failed query: {search_agent['query']}"
+                if status == "failed"
+                else f"{search_agent['agent_id']} collected {search_agent['items_collected']} item(s) for query: {search_agent['query']}"
             )
             self.storage.log_experiment(
                 task_group.task_group_id,
                 task_group_run_id,
                 "discovery",
-                "search_agent_completed",
-                f"{search_agent['agent_id']} collected {search_agent['items_collected']} item(s) for query: {search_agent['query']}",
+                step_name,
+                message,
                 summarize_search_agent_result(search_agent),
             )
         self.storage.log_experiment(
@@ -576,6 +584,8 @@ def summarize_search_agent_result(result: dict[str, object]) -> dict[str, object
         "query": result.get("query"),
         "subreddit": result.get("subreddit", ""),
         "strategy": result.get("strategy", ""),
+        "status": result.get("status", "completed"),
+        "error": result.get("error", ""),
         "items_collected": result.get("items_collected", 0),
         "output_path": result.get("output_path", ""),
         "urls": list(result.get("urls", []))[:20] if isinstance(result.get("urls"), list) else [],

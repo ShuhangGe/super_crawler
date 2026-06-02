@@ -733,6 +733,26 @@ class SystemTests(unittest.TestCase):
             self.assertNotIn("query 2", agent_1)
             self.assertIn("search-agent-2", agent_2)
 
+            storage.log_experiment(
+                task_group.task_group_id,
+                "run-2",
+                "discovery",
+                "search_agent_failed",
+                "search-agent-1 failed query: broken query",
+                {
+                    "agent_id": "search-agent-1",
+                    "query": "broken query",
+                    "status": "failed",
+                    "error": "Pre-navigation to https://reddit.com failed: No SW",
+                    "items_collected": 0,
+                    "urls": [],
+                    "titles": [],
+                },
+            )
+            failed_agent = agent_log_page(storage, "discovery", "search-agent-1", task_group.task_group_id)
+            self.assertIn("broken query", failed_agent)
+            self.assertIn("No SW", failed_agent)
+
     def test_queued_requirements_show_deep_research_agent_slot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
@@ -1914,6 +1934,35 @@ class SystemTests(unittest.TestCase):
             self.assertIn('"search_agent_id": "search-agent-1"', first_output)
             self.assertIn('"search_query": "query one"', first_output)
             self.assertIn('"search_subreddit": "photography"', first_output)
+
+    def test_failed_search_agent_is_returned_for_logging(self) -> None:
+        class FailingCollector(OpenCliRedditCollector):
+            def search(self, query: str, limit: int = 25, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, object]:
+                raise RuntimeError("Pre-navigation to https://reddit.com failed: No SW")
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="Photography",
+                task_type=TaskGroupType.DOMAIN,
+                domain="photography",
+                input_dir=str(Path(directory) / "photo"),
+            )
+            events = []
+
+            result = FailingCollector().collect_queries_to_inbox(
+                task_group,
+                "run-1",
+                [{"agent_id": "search-agent-1", "query": "query one", "subreddit": "photography", "strategy": "advice"}],
+                limit_per_query=1,
+                event_callback=lambda step, message, payload: events.append((step, message, payload)),
+            )
+
+            self.assertEqual(result["items_collected"], 0)
+            self.assertEqual(result["search_agents"][0]["status"], "failed")
+            self.assertIn("No SW", result["search_agents"][0]["error"])
+            self.assertIn("collector_query_failed", [event[0] for event in events])
 
     def test_search_relevance_gate_rejects_unrelated_3c_results(self) -> None:
         unrelated = search_relevance_check(

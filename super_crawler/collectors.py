@@ -57,13 +57,52 @@ class OpenCliRedditCollector:
                     f"{agent_id} started OpenCLI query: {query}",
                     {"agent_id": agent_id, "query": query, "subreddit": assignment.get("subreddit", ""), "limit": limit_per_query, "command": self.command},
                 )
-            result = self.search(
-                query=query,
-                limit=limit_per_query,
-                subreddit=str(assignment.get("subreddit", "")),
-                sort=str(assignment.get("sort", "")),
-                time=str(assignment.get("time", "")),
-            )
+            try:
+                result = self.search(
+                    query=query,
+                    limit=limit_per_query,
+                    subreddit=str(assignment.get("subreddit", "")),
+                    sort=str(assignment.get("sort", "")),
+                    time=str(assignment.get("time", "")),
+                )
+            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                completed_at = utc_now()
+                error = str(exc)
+                if event_callback:
+                    event_callback(
+                        "collector_query_failed",
+                        f"{agent_id} failed OpenCLI query: {query}",
+                        {
+                            "agent_id": agent_id,
+                            "query": query,
+                            "subreddit": assignment.get("subreddit", ""),
+                            "strategy": assignment.get("strategy", ""),
+                            "items_collected": 0,
+                            "error": error,
+                        },
+                    )
+                results.append(
+                    {
+                        "agent_id": agent_id,
+                        "query": query,
+                        "subreddit": assignment.get("subreddit", ""),
+                        "strategy": assignment.get("strategy", ""),
+                        "sort": assignment.get("sort", ""),
+                        "time": assignment.get("time", ""),
+                        "status": "failed",
+                        "items_collected": 0,
+                        "urls": [],
+                        "titles": [],
+                        "subreddits": [],
+                        "output_path": "",
+                        "command": [*shlex.split(self.command), query],
+                        "stderr": "",
+                        "error": error,
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                    }
+                )
+                continue
             completed_at = utc_now()
             query_items = []
             for item in result["items"]:
@@ -106,6 +145,7 @@ class OpenCliRedditCollector:
                     "strategy": assignment.get("strategy", ""),
                     "sort": assignment.get("sort", ""),
                     "time": assignment.get("time", ""),
+                    "status": "completed",
                     "items_collected": len(query_items),
                     "urls": [item.get("source_url", "") for item in query_items],
                     "titles": [item.get("title", "") for item in query_items],
@@ -113,6 +153,7 @@ class OpenCliRedditCollector:
                     "output_path": str(output_path),
                     "command": result["command"],
                     "stderr": result["stderr"],
+                    "error": "",
                     "started_at": started_at,
                     "completed_at": completed_at,
                 }
