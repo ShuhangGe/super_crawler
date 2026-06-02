@@ -196,6 +196,22 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(config["collector_enabled"], "1")
             self.assertTrue(input_dir.is_dir())
 
+    def test_isolated_task_group_creation_uses_unique_id_and_input_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            base_input_dir = Path(directory) / "task_inbox" / "3c"
+
+            first = storage.create_task_group("3C", TaskGroupType.DOMAIN, "3C products", str(base_input_dir), isolate_input_dir=True)
+            second = storage.create_task_group("3C", TaskGroupType.DOMAIN, "3C products", str(base_input_dir), isolate_input_dir=True)
+
+            self.assertNotEqual(first.task_group_id, second.task_group_id)
+            self.assertNotEqual(first.input_dir, second.input_dir)
+            self.assertIn(first.task_group_id, first.input_dir)
+            self.assertIn(second.task_group_id, second.input_dir)
+            self.assertTrue(Path(first.input_dir).is_dir())
+            self.assertTrue(Path(second.input_dir).is_dir())
+
     def test_home_page_uses_group_controls_without_global_runtime_controls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
@@ -1768,7 +1784,7 @@ class SystemTests(unittest.TestCase):
             html = requirement_list_page(
                 storage,
                 "Possible Requirements",
-                filter_requirements_by_group(possible_requirements(storage), pets.task_group_id),
+                possible_requirements(storage, pets.task_group_id),
                 pets.task_group_id,
                 "/possible",
             )

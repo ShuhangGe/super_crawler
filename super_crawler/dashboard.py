@@ -437,12 +437,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 elif parsed.path == "/possible":
                     query = parse_qs(parsed.query)
                     page = max(parse_int(query.get("page", ["1"])[0], 1), 1)
+                    selected_group = query.get("task_group_id", [""])[0]
                     self._html(
                         requirement_list_page(
                             storage,
                             t("nav_possible", lang),
-                            filter_requirements_by_group(possible_requirements(storage), query.get("task_group_id", [""])[0]),
-                            query.get("task_group_id", [""])[0],
+                            possible_requirements(storage, selected_group),
+                            selected_group,
                             "/possible",
                             page,
                             lang,
@@ -451,12 +452,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 elif parsed.path == "/rejected":
                     query = parse_qs(parsed.query)
                     page = max(parse_int(query.get("page", ["1"])[0], 1), 1)
+                    selected_group = query.get("task_group_id", [""])[0]
                     self._html(
                         requirement_list_page(
                             storage,
                             t("nav_rejected", lang),
-                            filter_requirements_by_group(rejected_requirements(storage), query.get("task_group_id", [""])[0]),
-                            query.get("task_group_id", [""])[0],
+                            rejected_requirements(storage, selected_group),
+                            selected_group,
                             "/rejected",
                             page,
                             lang,
@@ -642,6 +644,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 keywords,
                 negative_keywords,
                 enable_collector=task_type == TaskGroupType.DOMAIN,
+                isolate_input_dir=True,
             )
         elif action == "start":
             storage.update_task_group_status(task_group_id, TaskGroupStatus.RUNNING)
@@ -1436,15 +1439,18 @@ def pipeline_history_compact(pipelines: list[dict[str, object]], lang: str = "en
     )
 
 
-def possible_requirements(storage: Storage) -> list[object]:
-    return storage.list_requirements_with_research_runs(
-        [RequirementStatus.VALIDATED.value]
+def possible_requirements(storage: Storage, task_group_id: str = "") -> list[object]:
+    return storage.list_requirements_for_page(
+        [RequirementStatus.VALIDATED.value],
+        task_group_id,
+        require_research_run=True,
     )
 
 
-def rejected_requirements(storage: Storage) -> list[object]:
-    return storage.list_requirements_with_research_runs(
-        [RequirementStatus.REJECTED.value, RequirementStatus.ARCHIVED.value]
+def rejected_requirements(storage: Storage, task_group_id: str = "") -> list[object]:
+    return storage.list_requirements_for_page(
+        [RequirementStatus.REJECTED.value, RequirementStatus.ARCHIVED.value],
+        task_group_id,
     )
 
 
@@ -1532,7 +1538,7 @@ def grouped_requirement_lineage(storage: Storage, requirements: list[object], se
 
 def task_group_filter(storage: Storage, selected_task_group_id: str, page_path: str, lang: str = "en") -> str:
     options = [f"<option value=''>{t('all_groups', lang)}</option>"]
-    for task_group in lineage_task_groups(storage, storage.list_requirements()):
+    for task_group in storage.list_task_groups():
         selected = " selected" if task_group.task_group_id == selected_task_group_id else ""
         label = f"{task_group.name} ({status_text(task_group.status.value, lang)})"
         options.append(f"<option value='{html.escape(task_group.task_group_id)}'{selected}>{html.escape(label)}</option>")

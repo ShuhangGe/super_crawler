@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable, TypeVar
@@ -879,6 +880,36 @@ class Storage:
         ).fetchall()
         return [self._from_row(RequirementRecord, row) for row in rows]
 
+    def list_requirements_for_page(
+        self,
+        statuses: list[str],
+        task_group_id: str = "",
+        require_research_run: bool = False,
+    ) -> list[RequirementRecord]:
+        if not statuses:
+            return []
+        clauses = [f"status IN ({', '.join('?' for _ in statuses)})"]
+        params: list[Any] = list(statuses)
+        if task_group_id == "__ungrouped__":
+            clauses.append("task_group_ids = '[]'")
+        elif task_group_id:
+            clauses.append("EXISTS (SELECT 1 FROM json_each(requirements.task_group_ids) WHERE value = ?)")
+            params.append(task_group_id)
+        if require_research_run:
+            clauses.append(
+                """
+                EXISTS (
+                    SELECT 1 FROM research_runs
+                    WHERE research_runs.requirement_id = requirements.requirement_id
+                )
+                """
+            )
+        rows = self.conn.execute(
+            f"SELECT * FROM requirements WHERE {' AND '.join(clauses)} ORDER BY last_seen DESC",
+            params,
+        ).fetchall()
+        return [self._from_row(RequirementRecord, row) for row in rows]
+
     def get_requirement(self, requirement_id: str) -> RequirementRecord | None:
         row = self.conn.execute("SELECT * FROM requirements WHERE requirement_id=?", (requirement_id,)).fetchone()
         return None if row is None else self._from_row(RequirementRecord, row)
@@ -1026,10 +1057,12 @@ class Storage:
         keywords: list[str] | None = None,
         negative_keywords: list[str] | None = None,
         enable_collector: bool = False,
+        isolate_input_dir: bool = False,
     ) -> TaskGroup:
         now = utc_now()
         slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")[:36] or "task"
-        task_group_id = f"tg_{slug}_{self._count('task_groups') + 1:04d}"
+        task_group_id = f"tg_{slug}_{self._count('task_groups') + 1:04d}_{uuid.uuid4().hex[:8]}"
+        group_input_dir = str(Path(input_dir) / task_group_id) if isolate_input_dir else input_dir
         task_group = TaskGroup(
             task_group_id=task_group_id,
             name=name,
@@ -1037,7 +1070,7 @@ class Storage:
             status=TaskGroupStatus.STOPPED,
             domain=domain,
             description=description,
-            input_dir=input_dir,
+            input_dir=group_input_dir,
             subreddits=subreddits or [],
             keywords=keywords or [],
             negative_keywords=negative_keywords or [],
@@ -1045,7 +1078,7 @@ class Storage:
             updated_at=now,
         )
         self.upsert_task_group(task_group)
-        Path(input_dir).mkdir(parents=True, exist_ok=True)
+        Path(group_input_dir).mkdir(parents=True, exist_ok=True)
         if enable_collector:
             self.update_task_group_config(task_group.task_group_id, {"collector_enabled": "1"})
         return task_group
