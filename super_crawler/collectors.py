@@ -4,6 +4,7 @@ import json
 import shlex
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -46,28 +47,44 @@ class OpenCliRedditCollector:
         all_items: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
         assignments = [normalize_search_assignment(item, index) for index, item in enumerate(queries, start=1)]
+        if not assignments:
+            return {
+                "queries": [],
+                "assignments": [],
+                "items_collected": 0,
+                "limit_per_query": limit_per_query,
+                "search_agents": [],
+            }
+        started_at_by_index: dict[int, str] = {}
         for assignment in assignments:
             index = int(assignment["index"])
             query = str(assignment["query"])
             agent_id = str(assignment["agent_id"])
             started_at = utc_now()
+            started_at_by_index[index] = started_at
             if event_callback:
                 event_callback(
                     "collector_query_started",
                     f"{agent_id} started OpenCLI query: {query}",
                     {"agent_id": agent_id, "query": query, "subreddit": assignment.get("subreddit", ""), "limit": limit_per_query, "command": self.command},
                 )
-            try:
-                result = self.search(
-                    query=query,
-                    limit=limit_per_query,
-                    subreddit=str(assignment.get("subreddit", "")),
-                    sort=str(assignment.get("sort", "")),
-                    time=str(assignment.get("time", "")),
+
+        with ThreadPoolExecutor(max_workers=len(assignments)) as executor:
+            raw_results = list(
+                executor.map(
+                    lambda assignment: self._run_search_assignment(assignment, limit_per_query, started_at_by_index[int(assignment["index"])]),
+                    assignments,
                 )
-            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
-                completed_at = utc_now()
-                error = str(exc)
+            )
+
+        for assignment, raw_result in zip(assignments, raw_results, strict=True):
+            index = int(assignment["index"])
+            query = str(assignment["query"])
+            agent_id = str(assignment["agent_id"])
+            started_at = started_at_by_index[index]
+            completed_at = str(raw_result["completed_at"])
+            error = str(raw_result.get("error") or "")
+            if error:
                 if event_callback:
                     event_callback(
                         "collector_query_failed",
@@ -95,7 +112,7 @@ class OpenCliRedditCollector:
                         "titles": [],
                         "subreddits": [],
                         "output_path": "",
-                        "command": [*shlex.split(self.command), query],
+                        "command": raw_result.get("command", [*shlex.split(self.command), query]),
                         "stderr": "",
                         "error": error,
                         "started_at": started_at,
@@ -103,7 +120,7 @@ class OpenCliRedditCollector:
                     }
                 )
                 continue
-            completed_at = utc_now()
+            result = dict(raw_result["result"])
             query_items = []
             for item in result["items"]:
                 item = {
@@ -165,6 +182,26 @@ class OpenCliRedditCollector:
             "limit_per_query": limit_per_query,
             "search_agents": results,
         }
+
+    def _run_search_assignment(self, assignment: dict[str, Any], limit_per_query: int, started_at: str) -> dict[str, Any]:
+        query = str(assignment["query"])
+        try:
+            result = self.search(
+                query=query,
+                limit=limit_per_query,
+                subreddit=str(assignment.get("subreddit", "")),
+                sort=str(assignment.get("sort", "")),
+                time=str(assignment.get("time", "")),
+            )
+            return {"result": result, "started_at": started_at, "completed_at": utc_now(), "error": ""}
+        except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+            return {
+                "result": None,
+                "started_at": started_at,
+                "completed_at": utc_now(),
+                "error": str(exc),
+                "command": [*shlex.split(self.command), query],
+            }
 
     def search(self, query: str, limit: int = 25, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, Any]:
         command = with_background_browser_options([*shlex.split(self.command), query, "--limit", str(limit), "-f", "json"])

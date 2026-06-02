@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time as time_module
 import unittest
 import json
 from pathlib import Path
@@ -2367,6 +2368,47 @@ class SystemTests(unittest.TestCase):
             self.assertIn('"search_agent_id": "search-agent-1"', first_output)
             self.assertIn('"search_query": "query one"', first_output)
             self.assertIn('"search_subreddit": "photography"', first_output)
+
+    def test_search_assignments_run_concurrently(self) -> None:
+        class SlowCollector(OpenCliRedditCollector):
+            def search(self, query: str, limit: int = 25, subreddit: str = "", sort: str = "", time: str = "") -> dict[str, object]:
+                time_module.sleep(0.1)
+                return {
+                    "command": ["opencli", "reddit", "search", query],
+                    "stderr": "",
+                    "items": [
+                        {
+                            "source": "reddit_opencli",
+                            "source_url": f"https://reddit.com/{query.replace(' ', '-')}",
+                            "subreddit": subreddit or "photo",
+                            "title": f"Need help with {query}",
+                            "body": "",
+                            "collection_query": query,
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group("Photography", TaskGroupType.DOMAIN, "photography", str(Path(directory) / "photo"))
+            started = time_module.monotonic()
+
+            result = SlowCollector().collect_queries_to_inbox(
+                task_group,
+                "run-1",
+                [
+                    {"agent_id": "search-agent-1", "query": "query one"},
+                    {"agent_id": "search-agent-2", "query": "query two"},
+                    {"agent_id": "search-agent-3", "query": "query three"},
+                ],
+                limit_per_query=1,
+            )
+
+            elapsed = time_module.monotonic() - started
+            self.assertLess(elapsed, 0.25)
+            self.assertEqual([row["agent_id"] for row in result["search_agents"]], ["search-agent-1", "search-agent-2", "search-agent-3"])
+            self.assertEqual(result["items_collected"], 3)
 
     def test_failed_search_agent_is_returned_for_logging(self) -> None:
         class FailingCollector(OpenCliRedditCollector):
