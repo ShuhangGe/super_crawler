@@ -238,6 +238,7 @@ class SystemTests(unittest.TestCase):
             self.assertIn("Sports Search Settings", html)
             self.assertIn("OpenCLI Collection", html)
             self.assertIn("Results per run", html)
+
             self.assertIn("<summary>Advanced</summary>", html)
             self.assertIn('name="model_search"', html)
             self.assertIn('name="model_deep_research"', html)
@@ -293,6 +294,48 @@ class SystemTests(unittest.TestCase):
             self.assertNotIn("Full Log Payload", agent_html)
             self.assertNotIn("Full Experiment Payload", agent_html)
             self.assertNotIn("<th>ID</th><th>Time</th><th>Role</th><th>Agent</th>", agent_html)
+
+    def test_home_page_warns_when_runtime_stopped_with_running_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "test.sqlite3"
+            storage = Storage(db_path)
+            storage.migrate()
+            task_group = storage.create_task_group(
+                name="3C",
+                task_type=TaskGroupType.DOMAIN,
+                domain="consumer electronics",
+                input_dir=str(Path(directory) / "3c"),
+            )
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+            storage.upsert_requirement(
+                RequirementRecord(
+                    requirement_id="req-paused",
+                    canonical_requirement="Users need better consumer electronics setup help",
+                    description="Need validation.",
+                    status=RequirementStatus.QUEUED_FOR_RESEARCH,
+                    first_seen=utc_now(),
+                    last_seen=utc_now(),
+                    times_detected=1,
+                    evidence_count=1,
+                    subreddit_count=1,
+                    geo_distribution=[],
+                    audience_segments=[],
+                    current_scores={},
+                    previous_scores={},
+                    research_history=[],
+                    decision_history=[],
+                    reopen_events=[],
+                    latest_recommendation=None,
+                    task_group_ids=[task_group.task_group_id],
+                )
+            )
+            storage.enqueue_research("req-paused", 50, "test paused queue", 1, None)
+            controller = RuntimeController(db_path, input_dir=Path(directory) / "inbox", interval_seconds=1)
+
+            html = home_page(storage, controller)
+
+            self.assertIn("Runtime stopped, queue paused", html)
+            self.assertIn("Queue: 1", html)
 
     def test_dashboard_distinguishes_empty_search_files_from_failed_input_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2087,6 +2130,23 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(len(queue), 1)
             self.assertEqual(queue[0]["requirement_id"], "req-stale")
 
+    def test_runtime_stop_wait_timeout_does_not_report_completed(self) -> None:
+        class AliveThread:
+            def join(self, timeout: float | None = None) -> None:
+                return None
+
+            def is_alive(self) -> bool:
+                return True
+
+        controller = RuntimeController(Path("unused.sqlite3"))
+        controller._threads = {"slow": AliveThread()}  # type: ignore[assignment]
+
+        self.assertTrue(controller.stop())
+        events = controller.status()["events"]
+
+        self.assertEqual(events[-1]["event"], "stop_wait_timeout")
+        self.assertNotIn("stop_completed", [event["event"] for event in events])
+
     def test_runner_separates_discovery_from_deep_research_queue(self) -> None:
         class RecordingRunner(AlwaysOnRunner):
             def __init__(self, storage: Storage, input_dir: Path):
@@ -2158,6 +2218,61 @@ class SystemTests(unittest.TestCase):
 
             self.assertEqual(research_result["research_run"], "fake-run-1")
             self.assertEqual(storage.list_queue(), [])
+
+    def test_discovery_stop_before_memory_does_not_enqueue_requirements(self) -> None:
+        class FakeCandidate:
+            candidate_id = "cand-stop"
+            requirement_title = "Stopped candidate"
+
+        class FakeDiscoveryAgent:
+            def __init__(self, storage: Storage, agent_id: str):
+                self.storage = storage
+                self.agent_id = agent_id
+
+            def ingest_reddit_items(self, *args, **kwargs):
+                stop_requested["value"] = True
+                return [FakeCandidate()]
+
+        class FailingMemoryAgent:
+            def __init__(self, storage: Storage, agent_id: str):
+                pass
+
+            def reconcile_candidates(self, candidate_ids=None):
+                raise AssertionError("Requirement memory should not run after stop is requested.")
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_dir = Path(directory) / "3c"
+            input_dir.mkdir()
+            (input_dir / "items.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "source": "reddit",
+                            "source_url": "https://reddit.com/r/test/comments/1",
+                            "title": "Need better phone accessories",
+                            "body": "Looking for reliable phone accessories.",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group("3C", TaskGroupType.DOMAIN, "consumer electronics", str(input_dir))
+            storage.update_task_group_status(task_group.task_group_id, TaskGroupStatus.RUNNING)
+            stop_requested = {"value": False}
+            runner = AlwaysOnRunner(storage, Path(directory) / "inbox", should_stop=lambda: stop_requested["value"])
+
+            with patch("super_crawler.runner.DiscoveryAgent", FakeDiscoveryAgent), patch(
+                "super_crawler.runner.RequirementMemoryAgent",
+                FailingMemoryAgent,
+            ):
+                result = runner.run_task_groups([task_group])
+
+            self.assertEqual(result["requirements_changed"], 0)
+            self.assertEqual(storage.list_queue(), [])
+            logs = storage.list_experiment_logs(task_group_id=task_group.task_group_id, limit=5)
+            self.assertTrue(any(log["step_name"] == "run_cancelled" for log in logs))
 
     def test_deep_research_worker_ignores_stopped_task_group_queue(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

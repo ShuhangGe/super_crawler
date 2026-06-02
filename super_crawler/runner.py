@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, RequirementMemoryAgent, one_sentence_requirement
 from .collectors import OpenCliRedditCollector
@@ -51,10 +51,17 @@ class AdaptiveResourcePlan:
 class AlwaysOnRunner:
     """Periodic runner for controlled-source MVP operation."""
 
-    def __init__(self, storage: Storage, input_dir: str | Path, interval_seconds: int = 10_800):
+    def __init__(
+        self,
+        storage: Storage,
+        input_dir: str | Path,
+        interval_seconds: int = 10_800,
+        should_stop: Callable[[], bool] | None = None,
+    ):
         self.storage = storage
         self.input_dir = Path(input_dir)
         self.interval_seconds = interval_seconds
+        self.should_stop = should_stop or (lambda: False)
 
     def run_forever(self) -> None:
         while True:
@@ -83,8 +90,12 @@ class AlwaysOnRunner:
 
         items = load_json_items(self.input_dir)
         candidates = DiscoveryAgent(self.storage, "discovery-daemon").ingest_reddit_items(items) if items else []
-        changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates(
-            [candidate.candidate_id for candidate in candidates]
+        changed = (
+            []
+            if self.should_stop()
+            else RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates(
+                [candidate.candidate_id for candidate in candidates]
+            )
         )
         reopened = ChangeDetectionAgent(self.storage, "change-detector").evaluate_reopenings()
         return {
@@ -207,6 +218,8 @@ class AlwaysOnRunner:
             },
         )
         collection_result = self._collect_for_task_group(task_group, task_group_run_id, search_agent_count, collector_limit_override)
+        if self.should_stop():
+            return self._cancel_task_group_run(task_group, task_group_run_id, started_at, "Stop requested after collection.")
         if collection_result is not None and "search_agents" in collection_result:
             output_paths = [agent["output_path"] for agent in collection_result["search_agents"] if agent.get("output_path")]
             scan = load_json_files_with_report(output_paths)
@@ -250,6 +263,9 @@ class AlwaysOnRunner:
                 {"skipped": scan["skipped"]},
             )
 
+        if self.should_stop():
+            return self._cancel_task_group_run(task_group, task_group_run_id, started_at, "Stop requested before LLM discovery.")
+
         items = [tag_task_item(item, task_group, task_group_run_id) for item in scan["items"]]
         config = self.storage.get_task_group_config(task_group.task_group_id)
         self.storage.log_experiment(
@@ -284,6 +300,8 @@ class AlwaysOnRunner:
             f"Requirement memory started for {task_group.name}",
             {"candidate_ids": [candidate.candidate_id for candidate in candidates]},
         )
+        if self.should_stop():
+            return self._cancel_task_group_run(task_group, task_group_run_id, started_at, "Stop requested before requirement memory.")
         changed = RequirementMemoryAgent(self.storage, "requirement-memory").reconcile_candidates(
             [candidate.candidate_id for candidate in candidates]
         )
@@ -353,6 +371,44 @@ class AlwaysOnRunner:
             "items_loaded": len(items),
             "candidates": len(candidates),
             "requirements_changed": len(changed),
+            "task_group_run_id": task_group_run_id,
+        }
+
+    def _cancel_task_group_run(
+        self,
+        task_group: TaskGroup,
+        task_group_run_id: str,
+        started_at: str,
+        summary: str,
+    ) -> dict[str, int | str | None]:
+        completed_at = utc_now()
+        self.storage.upsert_task_group_run(
+            TaskGroupRun(
+                task_group_run_id=task_group_run_id,
+                task_group_id=task_group.task_group_id,
+                started_at=started_at,
+                completed_at=completed_at,
+                status=TaskGroupStatus.STOPPED,
+                items_collected=0,
+                candidates_created=0,
+                requirements_found=0,
+                requirements_queued=0,
+                requirements_rejected=0,
+                summary=summary,
+            )
+        )
+        self.storage.log_experiment(
+            task_group.task_group_id,
+            task_group_run_id,
+            "scheduler",
+            "run_cancelled",
+            summary,
+            {"reason": "stop_requested"},
+        )
+        return {
+            "items_loaded": 0,
+            "candidates": 0,
+            "requirements_changed": 0,
             "task_group_run_id": task_group_run_id,
         }
 

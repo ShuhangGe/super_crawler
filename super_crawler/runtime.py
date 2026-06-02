@@ -62,7 +62,9 @@ class RuntimeController:
         for thread in threads:
             thread.join(timeout=0.5)
         with self._lock:
-            self._record("stop_completed", {"workers": {name: thread.is_alive() for name, thread in self._threads.items()}})
+            workers = {name: thread.is_alive() for name, thread in self._threads.items()}
+            event = "stop_wait_timeout" if any(workers.values()) else "stop_completed"
+            self._record(event, {"workers": workers})
             return True
 
     def status(self) -> dict[str, Any]:
@@ -97,7 +99,7 @@ class RuntimeController:
         started_at = utc_now()
         with Storage(self.db_path) as storage:
             storage.migrate()
-            result = AlwaysOnRunner(storage, self.input_dir, self.interval_seconds).run_once()
+            result = AlwaysOnRunner(storage, self.input_dir, self.interval_seconds, should_stop=self._stop_event.is_set).run_once()
             completed_at = utc_now()
             pipeline_run_id = f"pipe_{self._safe_time_id(completed_at)}_{self._cycle_count + 1}"
             storage.save_pipeline_run(
@@ -142,7 +144,12 @@ class RuntimeController:
             started_at = utc_now()
             try:
                 with Storage(self.db_path) as storage:
-                    runner = AlwaysOnRunner(storage, self.input_dir, self.interval_seconds)
+                    runner = AlwaysOnRunner(
+                        storage,
+                        self.input_dir,
+                        self.interval_seconds,
+                        should_stop=self._stop_event.is_set,
+                    )
                     result = getattr(runner, runner_method)(*runner_args)
                     completed_at = utc_now()
                     if self._should_persist_worker_result(result):

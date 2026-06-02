@@ -52,6 +52,11 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "start": {"en": "Start", "zh": "启动"},
     "stop": {"en": "Stop", "zh": "停止"},
     "run_once": {"en": "Run Once", "zh": "运行一次"},
+    "runtime_queue_paused_title": {"en": "Runtime stopped, queue paused", "zh": "运行时已停止，队列已暂停"},
+    "runtime_queue_paused_desc": {
+        "en": "There are running task groups and queued deep research requirements, but no runtime worker is consuming them. Start a task group to resume processing.",
+        "zh": "当前有运行中的任务组和待研究需求，但没有运行时 worker 正在消费队列。点击任务组启动后会继续处理。",
+    },
     # -- task group header --
     "running": {"en": "Running", "zh": "运行中"},
     "requirement_count": {"en": "requirement(s)", "zh": "个需求"},
@@ -855,14 +860,29 @@ def layout(content: str, lang: str = "en") -> str:
 def home_page(storage: Storage, controller: RuntimeController, lang: str = "en") -> str:
     requirements = storage.list_requirements()
     task_groups = visible_task_groups(storage)
+    runtime = controller.status()
     return (
         f"<h1>{t('home_title', lang)}</h1>"
+        + runtime_queue_paused_notice(storage, task_groups, runtime, lang)
         + "<section class='top-workspace'>"
         + resource_allocation_panel(storage, lang)
         + task_create_panel(lang)
         + "</section>"
         + task_group_boards(storage, task_groups, requirements, lang)
     )
+
+
+def runtime_queue_paused_notice(storage: Storage, task_groups: list[object], runtime: dict[str, object], lang: str = "en") -> str:
+    has_running_group = any(task_group.status == TaskGroupStatus.RUNNING for task_group in task_groups)
+    queue_count = len(storage.list_queue())
+    if not has_running_group or not queue_count or runtime.get("running") or runtime.get("stopping"):
+        return ""
+    return f"""
+    <section class="notice warning">
+      <strong>{t('runtime_queue_paused_title', lang)}</strong>
+      <div class="summary">{t('runtime_queue_paused_desc', lang)} {t('queue', lang)}: {queue_count}</div>
+    </section>
+    """
 
 
 def runtime_controls(runtime: dict[str, object], lang: str = "en") -> str:
