@@ -9,7 +9,7 @@ from unittest.mock import patch
 from super_crawler.agents import ChangeDetectionAgent, DeepResearchAgent, DiscoveryAgent, ReportAgent, RequirementMemoryAgent, normalize_llm_requirement_analysis, search_relevance_check
 from super_crawler.collectors import OpenCliRedditCollector, OpenCliSourceRouter, build_requirement_search_queries, normalize_reddit_item, parse_opencli_output
 from super_crawler.dashboard import agent_log_page, detail_page, experiment_log_page, filter_requirements_by_group, grouped_requirement_lineage, home_page, possible_requirements, rejected_requirements, requirement_list_page, visible_task_groups, search_agent_count_for_group, todo_page
-from super_crawler.models import RequirementRecord, RequirementStatus, ResearchRun, TaskGroupStatus, TaskGroupType, utc_now
+from super_crawler.models import RawEvidence, RequirementRecord, RequirementStatus, ResearchRun, TaskGroupStatus, TaskGroupType, utc_now
 from super_crawler.runner import AlwaysOnRunner, DeviceHealth, allocate_search_slots, plan_adaptive_resources
 from super_crawler.runtime import RuntimeController
 from super_crawler.seed import SAMPLE_REDDIT_ITEMS
@@ -1110,6 +1110,58 @@ class SystemTests(unittest.TestCase):
             self.assertNotIn("football transfer latest news", queries)
             self.assertEqual(plan["noise_filter"]["dropped_tracks"], 2)
 
+    def test_deep_research_rejects_weak_watching_without_payment_signal(self) -> None:
+        requirement = RequirementRecord(
+            requirement_id="req-weak-watch",
+            canonical_requirement="Users need weak single sample",
+            description="Only one weak sample.",
+            status=RequirementStatus.RESEARCHING,
+            first_seen=utc_now(),
+            last_seen=utc_now(),
+            times_detected=1,
+            evidence_count=1,
+            subreddit_count=1,
+            geo_distribution=[],
+            audience_segments=[],
+            current_scores={},
+            previous_scores={},
+            research_history=[],
+            decision_history=[],
+            reopen_events=[],
+            latest_recommendation=None,
+        )
+        evidence = [
+            RawEvidence(
+                evidence_id="ev-weak",
+                source="reddit",
+                source_url="https://example.com/weak",
+                subreddit="general",
+                post_id=None,
+                comment_id=None,
+                title="Weak generic question",
+                body="I wonder what to do.",
+                author_metadata_allowed=False,
+                score=1,
+                comment_count=0,
+                created_at=utc_now(),
+                fetched_at=utc_now(),
+                language="en",
+                geo_hints=[],
+                matched_patterns=[],
+                raw_payload={},
+            )
+        ]
+        scores = {"overall_score": 20}
+        with tempfile.TemporaryDirectory() as directory:
+            status = DeepResearchAgent(Storage(Path(directory) / "test.sqlite3"), "research-agent-1")._status_from_synthesis(
+                {"final_decision": "watching"},
+                requirement,
+                evidence,
+                scores,
+            )
+
+        self.assertEqual(status, RequirementStatus.REJECTED)
+
     def test_rejected_deep_research_has_rejected_recommendation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
@@ -1608,8 +1660,8 @@ class SystemTests(unittest.TestCase):
             )
             now = utc_now()
             for requirement_id, title, task_group_id, status, research_history in [
-                ("req-pets", "Pet owners need medication reminders", pets.task_group_id, RequirementStatus.WATCHING, ["run-pets"]),
-                ("req-sports", "Coaches need player availability tools", sports.task_group_id, RequirementStatus.WATCHING, ["run-sports"]),
+                ("req-pets", "Pet owners need medication reminders", pets.task_group_id, RequirementStatus.VALIDATED, ["run-pets"]),
+                ("req-sports", "Coaches need player availability tools", sports.task_group_id, RequirementStatus.VALIDATED, ["run-sports"]),
                 ("req-queued", "Queued items should stay off page two", pets.task_group_id, RequirementStatus.QUEUED_FOR_RESEARCH, []),
             ]:
                 storage.upsert_requirement(
@@ -1672,6 +1724,60 @@ class SystemTests(unittest.TestCase):
             self.assertNotIn("<h2>Sports</h2>", html)
             self.assertNotIn("Coaches need player availability tools", html)
             self.assertNotIn("Queued items should stay off page two", html)
+
+    def test_possible_requirements_only_show_validated_items(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            now = utc_now()
+            for requirement_id, status in [
+                ("req-validated", RequirementStatus.VALIDATED),
+                ("req-watching", RequirementStatus.WATCHING),
+            ]:
+                storage.upsert_requirement(
+                    RequirementRecord(
+                        requirement_id=requirement_id,
+                        canonical_requirement=requirement_id,
+                        description=requirement_id,
+                        status=status,
+                        first_seen=now,
+                        last_seen=now,
+                        times_detected=1,
+                        evidence_count=3,
+                        subreddit_count=2,
+                        geo_distribution=[],
+                        audience_segments=[],
+                        current_scores={},
+                        previous_scores={},
+                        research_history=[f"run-{requirement_id}"],
+                        decision_history=[],
+                        reopen_events=[],
+                        latest_recommendation="test",
+                    )
+                )
+                storage.upsert_research_run(
+                    ResearchRun(
+                        research_run_id=f"run-{requirement_id}",
+                        requirement_id=requirement_id,
+                        agent_id="research-test",
+                        started_at=now,
+                        completed_at=now,
+                        input_evidence_ids=[],
+                        research_questions=[],
+                        findings={},
+                        scores={},
+                        geo_analysis=[],
+                        market_signal_analysis={},
+                        existing_solution_analysis={},
+                        recommendation="test",
+                        limitations=[],
+                        changed_since_last_run={},
+                    )
+                )
+
+            ids = [item.requirement_id for item in possible_requirements(storage)]
+
+            self.assertEqual(ids, ["req-validated"])
 
     def test_group_summary_shows_generated_and_accepted_counts_separately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

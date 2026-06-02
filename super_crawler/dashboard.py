@@ -1374,7 +1374,7 @@ def pipeline_history_compact(pipelines: list[dict[str, object]], lang: str = "en
 
 def possible_requirements(storage: Storage) -> list[object]:
     return storage.list_requirements_with_research_runs(
-        [RequirementStatus.VALIDATED.value, RequirementStatus.WATCHING.value]
+        [RequirementStatus.VALIDATED.value]
     )
 
 

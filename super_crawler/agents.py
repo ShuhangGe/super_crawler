@@ -1258,6 +1258,13 @@ class DeepResearchAgent(BaseAgent):
         }.get(decision, self._status_from_scores(scores))
         if not evidence:
             return RequirementStatus.REJECTED
+        if (
+            status == RequirementStatus.WATCHING
+            and scores.get("overall_score", 0) < 45
+            and (requirement.evidence_count < 2 or requirement.subreddit_count < 2)
+            and not find_payment_signals(evidence)
+        ):
+            return RequirementStatus.REJECTED
         if status == RequirementStatus.VALIDATED and (requirement.evidence_count < 3 or requirement.subreddit_count < 2):
             return RequirementStatus.WATCHING
         if status == RequirementStatus.REJECTED and (scores.get("overall_score", 0) >= 72 or find_payment_signals(evidence)):
