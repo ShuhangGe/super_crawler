@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from statistics import mean
 from typing import Any
@@ -351,6 +352,116 @@ def search_relevance_check(item: dict[str, Any]) -> dict[str, Any]:
     if query_terms and any(term in haystack for term in query_terms[:8]):
         return {"is_relevant": True, "reason": "Post matches the search query terms."}
     return {"is_relevant": True, "reason": "No strict relevance gate applies to this search context."}
+
+
+def deep_research_relevance_check(requirement: RequirementRecord, item: dict[str, Any]) -> dict[str, Any]:
+    title = str(item.get("title") or "")
+    body = str(item.get("body") or "")
+    query = str(item.get("search_query") or item.get("collection_query") or "")
+    source = str(item.get("search_source") or item.get("source") or "")
+    haystack = f"{title}\n{body}"
+    requirement_terms = meaningful_search_terms(f"{requirement.canonical_requirement} {requirement.description}")
+    query_terms = meaningful_search_terms(query)
+    haystack_terms = meaningful_search_terms(haystack)
+    must_match = (query_terms[:8] or requirement_terms[:8])
+    overlap = sorted(set(must_match) & set(haystack_terms))
+    if source in {"youtube", "product_reviews", "google_web_opencli", "youtube_opencli", "amazon_opencli"} and overlap:
+        return {"is_relevant": True, "reason": "Result overlaps with the planned deep research query.", "overlap": overlap}
+    if len(overlap) >= 2:
+        return {"is_relevant": True, "reason": "Result matches multiple deep research query terms.", "overlap": overlap}
+    if overlap and any(term in haystack_terms for term in requirement_terms[:10]):
+        return {"is_relevant": True, "reason": "Result matches the query and requirement context.", "overlap": overlap}
+    return {
+        "is_relevant": False,
+        "reason": "预过滤拒绝：搜索结果与该需求或本次 deep research query 的关键词重合不足。",
+        "overlap": overlap,
+    }
+
+
+def meaningful_search_terms(text: str) -> list[str]:
+    lowered = text.lower()
+    ascii_terms = re.findall(r"[a-z0-9][a-z0-9+#.-]{2,}", lowered)
+    chinese_terms = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+    stopwords = {
+        "users",
+        "need",
+        "better",
+        "problem",
+        "pain",
+        "workaround",
+        "alternative",
+        "solution",
+        "review",
+        "reviews",
+        "best",
+        "with",
+        "for",
+        "from",
+        "that",
+        "this",
+        "what",
+        "when",
+        "where",
+        "how",
+        "the",
+        "and",
+        "app",
+        "tool",
+        "user",
+        "issue",
+        "issues",
+        "recommendation",
+        "recommend",
+        "search",
+        "query",
+        "source",
+    }
+    terms = [term.strip(".-") for term in ascii_terms if term.strip(".-") not in stopwords]
+    terms.extend(term for term in chinese_terms if term not in {"用户", "需求", "问题", "解决方案", "是否", "更多"})
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        if term and term not in seen:
+            deduped.append(term)
+            seen.add(term)
+    return deduped
+
+
+def prune_deep_research_plan(
+    requirement: RequirementRecord,
+    plan_payload: dict[str, Any],
+    fallback: list[dict[str, str]],
+) -> dict[str, Any]:
+    requirement_terms = set(meaningful_search_terms(f"{requirement.canonical_requirement} {requirement.description}"))
+    kept: list[dict[str, str]] = []
+    seen_queries: set[str] = set()
+    original_tracks = plan_payload.get("search_tracks", [])
+    for task in original_tracks:
+        if not isinstance(task, dict):
+            continue
+        query = str(task.get("query") or "").strip()
+        if not query:
+            continue
+        query_key = query.lower()
+        if query_key in seen_queries:
+            continue
+        query_terms = set(meaningful_search_terms(query))
+        if requirement_terms and query_terms and not (requirement_terms & query_terms):
+            continue
+        kept.append({key: str(value) for key, value in task.items()})
+        seen_queries.add(query_key)
+        if len(kept) >= 5:
+            break
+    if not kept:
+        kept = fallback[:5]
+    return {
+        **plan_payload,
+        "search_tracks": kept,
+        "noise_filter": {
+            "max_tracks": 5,
+            "dropped_tracks": max(len(original_tracks) - len(kept), 0) if isinstance(original_tracks, list) else 0,
+        },
+    }
 
 
 def compact_evidence_payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -1408,7 +1519,7 @@ class DeepResearchAgent(BaseAgent):
             },
         ]
         if not llm.available():
-            return normalize_deep_research_plan({}, fallback)
+            return prune_deep_research_plan(requirement, normalize_deep_research_plan({}, fallback), fallback)
         system = (
             "You are a senior market and user-research planner. Build a comprehensive cross-source research plan "
             "for validating whether a user requirement is real. Do not limit the plan to Reddit. Include sources "
@@ -1454,8 +1565,8 @@ class DeepResearchAgent(BaseAgent):
         try:
             parsed = llm.json_chat(model_name, system, user)
         except Exception as exc:  # noqa: BLE001 - fallback plan keeps the research agent usable.
-            return {**normalize_deep_research_plan({}, fallback), "planning_error": str(exc)}
-        return normalize_deep_research_plan(parsed, fallback)
+            return {**prune_deep_research_plan(requirement, normalize_deep_research_plan({}, fallback), fallback), "planning_error": str(exc)}
+        return prune_deep_research_plan(requirement, normalize_deep_research_plan(parsed, fallback), fallback)
 
     def _analyze_research_item(
         self,
@@ -1469,6 +1580,19 @@ class DeepResearchAgent(BaseAgent):
         text = f"{title}\n{body}"
         matched = matched_signal_patterns(text)
         relevance = search_relevance_check(item)
+        deep_relevance = deep_research_relevance_check(requirement, item)
+        if not relevance["is_relevant"] or not deep_relevance["is_relevant"]:
+            return {
+                "is_relevant_evidence": False,
+                "evidence_type": "noise",
+                "analysis_summary": str(deep_relevance["reason"] if not deep_relevance["is_relevant"] else relevance["reason"]),
+                "signals": matched,
+                "country_area_hints": infer_geo(text, str(item.get("subreddit", ""))),
+                "existing_solutions": [],
+                "confidence": 0.15,
+                "prefiltered": True,
+                "prefilter_overlap": deep_relevance.get("overlap", []),
+            }
         analysis: dict[str, Any] | None = None
         if llm.available():
             system = (

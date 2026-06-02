@@ -1001,6 +1001,115 @@ class SystemTests(unittest.TestCase):
             self.assertEqual(plan["planning_method"], "llm")
             self.assertIn("product_reviews", {item["source"] for item in plan["search_tracks"]})
 
+    def test_deep_research_prefilters_unrelated_items_before_llm_analysis(self) -> None:
+        class CountingLLM(FakeDeepResearchLLM):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def json_chat(self, model: str, system: str, user: str) -> dict[str, object]:
+                self.calls += 1
+                return super().json_chat(model, system, user)
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            task_group = storage.create_task_group("Camera", TaskGroupType.DOMAIN, "camera", str(Path(directory) / "camera"))
+            requirement = RequirementRecord(
+                requirement_id="req-camera-noise",
+                canonical_requirement="Users need better low light webcam autofocus",
+                description="Camera users complain about noise and drifting autofocus in low light.",
+                status=RequirementStatus.RESEARCHING,
+                first_seen=utc_now(),
+                last_seen=utc_now(),
+                times_detected=1,
+                evidence_count=1,
+                subreddit_count=1,
+                geo_distribution=[],
+                audience_segments=[],
+                current_scores={},
+                previous_scores={},
+                research_history=[],
+                decision_history=[],
+                reopen_events=[],
+                latest_recommendation=None,
+                task_group_ids=[task_group.task_group_id],
+            )
+            llm = CountingLLM()
+            agent = DeepResearchAgent(storage, "research-agent-1", llm_client=llm)
+
+            analysis = agent._analyze_research_item(
+                requirement,
+                {
+                    "title": "I think my sister ruined our dad's engagement",
+                    "body": "This is a family conflict story with no product discussion.",
+                    "subreddit": "BestofRedditorUpdates",
+                    "source_url": "https://reddit.com/unrelated",
+                    "search_query": "webcam low light noise focus drift",
+                    "search_source": "reddit",
+                },
+                "deepseek-v4-flash",
+                llm,
+            )
+
+            self.assertFalse(analysis["is_relevant_evidence"])
+            self.assertTrue(analysis["prefiltered"])
+            self.assertEqual(llm.calls, 0)
+
+    def test_deep_research_plan_prunes_generic_unrelated_queries(self) -> None:
+        class NoisyPlannerLLM:
+            def available(self) -> bool:
+                return True
+
+            def json_chat(self, model: str, system: str, user: str) -> dict[str, object]:
+                return {
+                    "requirement_rewrite": "验证低光摄像头对焦需求",
+                    "target_users": ["streamers"],
+                    "hypotheses": ["低光环境下摄像头对焦漂移"],
+                    "search_tracks": [
+                        {"track": "noise", "source": "reddit", "queries": ["relationship advice family conflict"], "question": "noise"},
+                        {"track": "pain_validation", "source": "reddit", "queries": ["webcam low light autofocus drift noise"], "question": "pain"},
+                        {"track": "noise", "source": "forums", "queries": ["football transfer latest news"], "question": "noise"},
+                        {"track": "solution", "source": "youtube", "queries": ["low light webcam autofocus fix"], "question": "solution"},
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            storage.migrate()
+            requirement = RequirementRecord(
+                requirement_id="req-camera-plan",
+                canonical_requirement="Users need better low light webcam autofocus",
+                description="Camera users complain about noise and drifting autofocus in low light.",
+                status=RequirementStatus.QUEUED_FOR_RESEARCH,
+                first_seen=utc_now(),
+                last_seen=utc_now(),
+                times_detected=1,
+                evidence_count=0,
+                subreddit_count=0,
+                geo_distribution=[],
+                audience_segments=[],
+                current_scores={},
+                previous_scores={},
+                research_history=[],
+                decision_history=[],
+                reopen_events=[],
+                latest_recommendation=None,
+            )
+
+            plan = DeepResearchAgent(storage, "research-agent-1", llm_client=NoisyPlannerLLM())._plan_active_research(
+                requirement,
+                "deepseek-v4-flash",
+                NoisyPlannerLLM(),
+            )
+
+            queries = [item["query"] for item in plan["search_tracks"]]
+            self.assertIn("webcam low light autofocus drift noise", queries)
+            self.assertIn("low light webcam autofocus fix", queries)
+            self.assertNotIn("relationship advice family conflict", queries)
+            self.assertNotIn("football transfer latest news", queries)
+            self.assertEqual(plan["noise_filter"]["dropped_tracks"], 2)
+
     def test_rejected_deep_research_has_rejected_recommendation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "test.sqlite3"
