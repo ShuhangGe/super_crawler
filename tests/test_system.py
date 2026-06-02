@@ -1832,7 +1832,7 @@ class SystemTests(unittest.TestCase):
             self.assertNotIn("Coaches need player availability tools", html)
             self.assertNotIn("Queued items should stay off page two", html)
 
-    def test_possible_requirements_only_show_validated_items(self) -> None:
+    def test_possible_requirements_show_researched_possible_items(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             storage.migrate()
@@ -1884,7 +1884,7 @@ class SystemTests(unittest.TestCase):
 
             ids = [item.requirement_id for item in possible_requirements(storage)]
 
-            self.assertEqual(ids, ["req-validated"])
+            self.assertEqual(ids, ["req-validated", "req-watching"])
 
     def test_group_summary_shows_generated_and_accepted_counts_separately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
