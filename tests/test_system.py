@@ -1374,6 +1374,7 @@ class SystemTests(unittest.TestCase):
 
             possible_html = grouped_requirement_lineage(storage, storage.list_requirements())
             self.assertIn("Move to todo list", possible_html)
+            self.assertIn("Move to rejected", possible_html)
 
             storage.add_todo_job(requirement.requirement_id, "Prepare follow-up validation")
             todo_html = todo_page(storage)
@@ -1383,6 +1384,13 @@ class SystemTests(unittest.TestCase):
             self.assertIn(requirement.canonical_requirement, todo_html)
             self.assertIn("Prepare follow-up validation", todo_html)
             self.assertIn("Todo: open", possible_html)
+            self.assertIn("Move to rejected", possible_html)
+
+            storage.dequeue_research(requirement.requirement_id)
+            storage.update_requirement_status(requirement.requirement_id, RequirementStatus.REJECTED, "human rejected as noise")
+            rejected_requirement = storage.get_requirement(requirement.requirement_id)
+
+            self.assertEqual(rejected_requirement.status, RequirementStatus.REJECTED)
 
     def test_runtime_saves_lightweight_pipeline_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

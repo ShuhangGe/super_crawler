@@ -165,6 +165,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     "no_saved_snapshot": {"en": "No saved snapshot yet", "zh": "尚无保存的快照"},
     "pipeline_snapshot_link": {"en": "Pipeline Run", "zh": "管道运行"},
     "move_to_todo": {"en": "Move to todo list", "zh": "移至待办"},
+    "move_to_rejected": {"en": "Move to rejected", "zh": "移至已拒绝"},
     "todo_status": {"en": "Todo", "zh": "待办"},
     # -- todo page --
     "todo_jobs_title": {"en": "Todo Jobs", "zh": "待办事项"},
@@ -1585,12 +1586,16 @@ def rejection_summary_html(requirement: object, latest_run: object | None, lang:
 
 def todo_action_for_requirement(storage: Storage, requirement: object, lang: str = "en") -> str:
     todo = storage.get_todo_job(requirement.requirement_id)
+    reject = ""
+    if requirement.status != RequirementStatus.REJECTED:
+        reject = f"<a class='agent-chip' href='/action?type=reject&id={html.escape(requirement.requirement_id)}'>{t('move_to_rejected', lang)}</a>"
     if todo:
         return (
             f"<a class='agent-chip' href='/todo'>{t('todo_status', lang)}: {html.escape(str(todo['status']))}</a>"
             f"<div class='summary'>{html.escape(str(todo['updated_at']))}</div>"
+            f"{reject}"
         )
-    return f"<a class='agent-chip' href='/todo-action?action=add&id={html.escape(requirement.requirement_id)}'>{t('move_to_todo', lang)}</a>"
+    return f"<a class='agent-chip' href='/todo-action?action=add&id={html.escape(requirement.requirement_id)}'>{t('move_to_todo', lang)}</a>{reject}"
 
 
 def task_create_panel(lang: str = "en") -> str:
